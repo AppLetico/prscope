@@ -2,6 +2,14 @@
 
 Thanks for contributing to Prscope.
 
+## Pull Request Workflow
+
+1. Create a focused branch from `main`.
+2. Keep PRs small and scoped to one logical change when possible.
+3. Open a PR early if you want design feedback before polishing.
+4. Ensure all required CI checks pass before requesting final review.
+5. Do not merge with unresolved review comments or failing checks.
+
 ## Development Setup
 
 ```bash
@@ -14,6 +22,24 @@ Run checks before opening a PR:
 ruff check .
 pytest
 ```
+
+Frontend changes should also pass:
+
+```bash
+cd prscope/web/frontend
+npm ci
+npm run lint
+npm run build
+```
+
+## CI Expectations
+
+The repository uses GitHub Actions CI on pushes and PRs to `main`.
+
+- **Python Checks**: dependency install, `ruff check .`, `pytest`
+- **Frontend Checks**: `npm ci`, `npm run lint`, `npm run build`
+
+If your PR touches runtime, API, store, or frontend code, CI must be green before merge.
 
 ## Performance Benchmark Policy (Required)
 
@@ -65,6 +91,7 @@ If a change intentionally trades speed for quality (or vice versa), call it out 
 ## PR Checklist
 
 - [ ] Code is tested and linted
+- [ ] CI is green for Python + frontend checks
 - [ ] Benchmark run executed (if performance-sensitive)
 - [ ] Benchmark artifact linked in PR
 - [ ] Baseline comparison included

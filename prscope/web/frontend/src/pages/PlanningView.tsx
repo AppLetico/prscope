@@ -40,8 +40,14 @@ export function PlanningViewPage() {
   const [contextUsageRatio, setContextUsageRatio] = useState<number | null>(null);
   const [contextCompactionEnabled, setContextCompactionEnabled] = useState<boolean>(false);
   const [pendingClarification, setPendingClarification] = useState<ClarificationPrompt | null>(null);
-  const lastEventAtMs = useRef<number>(Date.now());
+  const lastEventAtMs = useRef<number>(0);
   const lastRefetchAtMs = useRef<number>(0);
+
+  useEffect(() => {
+    if (lastEventAtMs.current === 0) {
+      lastEventAtMs.current = Date.now();
+    }
+  }, []);
 
   const sessionQuery = useQuery({
     queryKey: ["session", id],
@@ -53,19 +59,19 @@ export function PlanningViewPage() {
     queryFn: listModels,
     staleTime: 60_000,
   });
-
-  useEffect(() => {
-    const session = sessionQuery.data?.session;
-    const items = modelQuery.data?.items;
-    if (!session || !items || items.length === 0) return;
-    const stored = getStoredModelSelection(session.repo_name);
-    const available = items.filter((item) => item.available);
-    const fallbackModel = available[0]?.model_id || items[0]?.model_id || "";
-    const nextAuthor = session.author_model || stored.author_model || fallbackModel;
-    const nextCritic = session.critic_model || stored.critic_model || fallbackModel;
-    if (nextAuthor && nextAuthor !== authorModel) setAuthorModel(nextAuthor);
-    if (nextCritic && nextCritic !== criticModel) setCriticModel(nextCritic);
-  }, [modelQuery.data?.items, sessionQuery.data?.session, authorModel, criticModel]);
+  const session = sessionQuery.data?.session;
+  const turns = sessionQuery.data?.conversation ?? [];
+  const modelItems = modelQuery.data?.items ?? [];
+  const availableModelItems = modelItems.filter((item) => item.available);
+  const fallbackModel = availableModelItems[0]?.model_id || modelItems[0]?.model_id || "";
+  const storedModels = useMemo(
+    () => getStoredModelSelection(session?.repo_name),
+    [session?.repo_name],
+  );
+  const selectedAuthorModel =
+    authorModel || session?.author_model || storedModels.author_model || fallbackModel;
+  const selectedCriticModel =
+    criticModel || session?.critic_model || storedModels.critic_model || fallbackModel;
 
   const handleEvent = useCallback((event: UIEvent) => {
     lastEventAtMs.current = Date.now();
@@ -171,7 +177,7 @@ export function PlanningViewPage() {
         source: event.source,
       });
     }
-  }, [activeToolCalls, id, maxPromptTokens, sessionCostUsd, sessionQuery]);
+  }, [activeToolCalls, maxPromptTokens, sessionCostUsd, sessionQuery]);
 
   useSessionEvents(id, handleEvent);
 
@@ -200,8 +206,8 @@ export function PlanningViewPage() {
       setError(null);
       const status = sessionQuery.data?.session.status;
       const models = {
-        author_model: authorModel || undefined,
-        critic_model: criticModel || undefined,
+        author_model: selectedAuthorModel || undefined,
+        critic_model: selectedCriticModel || undefined,
       };
       if (status === "discovering" || status === "discovery") {
         const response = await sendDiscoveryMessage(id, text, models);
@@ -241,8 +247,8 @@ export function PlanningViewPage() {
     try {
       setError(null);
       await runRound(id, undefined, {
-        author_model: authorModel || undefined,
-        critic_model: criticModel || undefined,
+        author_model: selectedAuthorModel || undefined,
+        critic_model: selectedCriticModel || undefined,
       });
       await sessionQuery.refetch();
     } catch (err) {
@@ -281,8 +287,6 @@ export function PlanningViewPage() {
     setShowDiff((v) => !v);
   };
 
-  const session = sessionQuery.data?.session;
-  const turns = sessionQuery.data?.conversation ?? [];
   const contextPercent = contextUsageRatio !== null ? contextUsageRatio * 100 : null;
   const planContent = useMemo(() => {
     if (showDiff) return diff;
@@ -319,14 +323,14 @@ export function PlanningViewPage() {
             onExport={() => void onExport()}
             onToggleDiff={() => void onToggleDiff()}
             isDiffMode={showDiff}
-            authorModel={authorModel}
-            criticModel={criticModel}
-            modelOptions={modelQuery.data?.items ?? []}
+            authorModel={selectedAuthorModel}
+            criticModel={selectedCriticModel}
+            modelOptions={modelItems}
             onAuthorModelChange={(modelId) => {
               setAuthorModel(modelId);
               if (session.repo_name) {
                 setStoredModelSelection(
-                  { author_model: modelId, critic_model: criticModel || undefined },
+                  { author_model: modelId, critic_model: selectedCriticModel || undefined },
                   session.repo_name,
                 );
               }
@@ -335,7 +339,7 @@ export function PlanningViewPage() {
               setCriticModel(modelId);
               if (session.repo_name) {
                 setStoredModelSelection(
-                  { author_model: authorModel || undefined, critic_model: modelId },
+                  { author_model: selectedAuthorModel || undefined, critic_model: modelId },
                   session.repo_name,
                 );
               }

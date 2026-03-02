@@ -64,10 +64,10 @@ llm:
     assert config.sync.state == "open"
     assert config.sync.max_prs == 5
     assert config.sync.fetch_files is False
-    assert config.llm.enabled is True
-    assert config.llm.model == "claude-3-opus"
-    assert config.llm.temperature == 0.2
-    assert config.llm.max_tokens == 1500
+    assert config.upstream_eval.enabled is True
+    assert config.upstream_eval.model == "claude-3-opus"
+    assert config.upstream_eval.temperature == 0.2
+    assert config.upstream_eval.max_tokens == 1500
 
 
 def test_config_loads_repos_and_planning_settings(tmp_path):
