@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 from urllib.error import URLError
 from urllib.parse import quote
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 import yaml
 
@@ -55,6 +55,19 @@ GENERIC_MARKERS = [
     "src/path/to/module.py",
 ]
 
+NO_PROXY_OPENER = build_opener(ProxyHandler({}))
+
+
+def _redact_home_path(raw_path: str | Path) -> str:
+    raw = str(raw_path)
+    home = str(Path.home().resolve())
+    if raw == home:
+        return "~"
+    prefix = f"{home}/"
+    if raw.startswith(prefix):
+        return f"~/{raw[len(prefix):]}"
+    return raw
+
 
 @dataclass
 class PromptRun:
@@ -63,6 +76,10 @@ class PromptRun:
     session_id: str
     create_elapsed_s: float
     time_to_plan_s: int | None
+    server_initial_draft_elapsed_s: float | None
+    server_first_plan_elapsed_s: float | None
+    client_detect_gap_s: float | None
+    client_detect_gap_from_server_first_plan_s: float | None
     timed_out: bool
     fallback: bool
     status: str
@@ -75,6 +92,15 @@ class PromptRun:
     poll_timeouts: int
     avg_poll_latency_ms: float | None
     max_poll_latency_ms: float | None
+    poll_transport_latency_ms_total: float
+    server_llm_calls_total: int
+    server_llm_latency_ms_total: float
+    server_tool_calls_total: int
+    server_tool_exec_latency_ms_total: float
+    author_call_timeouts: int
+    author_fallback_warnings: int
+    runtime_warnings_total: int
+    runtime_errors_total: int
     error: str | None
 
 
@@ -84,9 +110,9 @@ def _http_json(method: str, url: str, body: dict[str, Any] | None = None, timeou
         url,
         data=raw,
         method=method,
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", "Connection": "close"},
     )
-    with urlopen(request, timeout=timeout) as response:
+    with NO_PROXY_OPENER.open(request, timeout=timeout) as response:
         return json.loads(response.read().decode("utf-8"))
 
 
@@ -102,8 +128,9 @@ def _safe_delete_session(base_url: str, repo: str, session_id: str, timeout: int
         request = Request(
             f"{base_url}/api/sessions/{session_id}?repo={quote(repo)}",
             method="DELETE",
+            headers={"Connection": "close"},
         )
-        with urlopen(request, timeout=timeout):
+        with NO_PROXY_OPENER.open(request, timeout=timeout):
             return True, "deleted"
     except Exception as exc:  # noqa: BLE001
         return False, f"{type(exc).__name__}: {exc}"
@@ -166,12 +193,16 @@ def _load_prompts(path: Path | None) -> list[str]:
 def _load_config_metadata(config_root: Path) -> dict[str, Any]:
     path = config_root / "prscope.yml"
     if not path.exists():
-        return {"config_root": str(config_root), "config_path": str(path), "found": False}
+        return {
+            "config_root": _redact_home_path(config_root),
+            "config_path": _redact_home_path(path),
+            "found": False,
+        }
     data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     planning = data.get("planning", {}) if isinstance(data, dict) else {}
     return {
-        "config_root": str(config_root),
-        "config_path": str(path),
+        "config_root": _redact_home_path(config_root),
+        "config_path": _redact_home_path(path),
         "found": True,
         "scanner": planning.get("scanner", "grep"),
         "author_model": planning.get("author_model"),
@@ -186,6 +217,14 @@ def _summary(results: list[PromptRun]) -> dict[str, Any]:
     avg_quality = statistics.mean(r.quality_score for r in results) if results else None
     avg_poll_latency_ms = statistics.mean(
         r.avg_poll_latency_ms for r in results if r.avg_poll_latency_ms is not None
+    ) if results else None
+    avg_server_draft_elapsed_s = statistics.mean(
+        r.server_initial_draft_elapsed_s
+        for r in results
+        if r.server_initial_draft_elapsed_s is not None
+    ) if results else None
+    avg_client_detect_gap_s = statistics.mean(
+        r.client_detect_gap_s for r in results if r.client_detect_gap_s is not None
     ) if results else None
     slowest = max(
         (r for r in finished),
@@ -203,7 +242,54 @@ def _summary(results: list[PromptRun]) -> dict[str, Any]:
         "max_time_to_plan_s": max((r.time_to_plan_s for r in finished), default=None),
         "avg_quality_score": round(avg_quality, 4) if avg_quality is not None else None,
         "total_poll_timeouts": sum(r.poll_timeouts for r in results),
+        "total_author_call_timeouts": sum(r.author_call_timeouts for r in results),
+        "total_author_fallback_warnings": sum(r.author_fallback_warnings for r in results),
+        "total_runtime_warnings": sum(r.runtime_warnings_total for r in results),
+        "total_runtime_errors": sum(r.runtime_errors_total for r in results),
+        "runs_with_author_timeouts": sum(1 for r in results if r.author_call_timeouts > 0),
+        "total_poll_transport_latency_ms": round(
+            sum(r.poll_transport_latency_ms_total for r in results),
+            2,
+        ),
+        "total_server_llm_calls": sum(r.server_llm_calls_total for r in results),
+        "total_server_llm_latency_ms": round(
+            sum(r.server_llm_latency_ms_total for r in results),
+            2,
+        ),
+        "total_server_tool_calls": sum(r.server_tool_calls_total for r in results),
+        "total_server_tool_exec_latency_ms": round(
+            sum(r.server_tool_exec_latency_ms_total for r in results),
+            2,
+        ),
         "avg_poll_latency_ms": round(avg_poll_latency_ms, 2) if avg_poll_latency_ms is not None else None,
+        "avg_server_initial_draft_elapsed_s": (
+            round(avg_server_draft_elapsed_s, 3) if avg_server_draft_elapsed_s is not None else None
+        ),
+        "avg_server_first_plan_elapsed_s": (
+            round(
+                statistics.mean(
+                    r.server_first_plan_elapsed_s
+                    for r in results
+                    if r.server_first_plan_elapsed_s is not None
+                ),
+                3,
+            )
+            if any(r.server_first_plan_elapsed_s is not None for r in results)
+            else None
+        ),
+        "avg_client_detect_gap_s": round(avg_client_detect_gap_s, 3) if avg_client_detect_gap_s is not None else None,
+        "avg_client_detect_gap_from_server_first_plan_s": (
+            round(
+                statistics.mean(
+                    r.client_detect_gap_from_server_first_plan_s
+                    for r in results
+                    if r.client_detect_gap_from_server_first_plan_s is not None
+                ),
+                3,
+            )
+            if any(r.client_detect_gap_from_server_first_plan_s is not None for r in results)
+            else None
+        ),
         "slowest_prompt_index": slowest.prompt_index if slowest is not None else None,
         "slowest_prompt_time_to_plan_s": slowest.time_to_plan_s if slowest is not None else None,
     }
@@ -293,6 +379,7 @@ def run_benchmark(
     poll_timeout_seconds: int,
     poll_request_timeout_seconds: int,
     max_consecutive_poll_timeouts: int,
+    poll_unhealthy_window_seconds: int,
     max_consecutive_create_failures: int,
     stop_on_first_problem: bool,
     max_suite_seconds: int | None,
@@ -375,6 +462,10 @@ def run_benchmark(
                     session_id="",
                     create_elapsed_s=round(create_elapsed, 3),
                     time_to_plan_s=None,
+                    server_initial_draft_elapsed_s=None,
+                    server_first_plan_elapsed_s=None,
+                    client_detect_gap_s=None,
+                    client_detect_gap_from_server_first_plan_s=None,
                     timed_out=False,
                     fallback=False,
                     status="create_failed",
@@ -387,6 +478,15 @@ def run_benchmark(
                     poll_timeouts=0,
                     avg_poll_latency_ms=None,
                     max_poll_latency_ms=None,
+                    poll_transport_latency_ms_total=0.0,
+                    server_llm_calls_total=0,
+                    server_llm_latency_ms_total=0.0,
+                    server_tool_calls_total=0,
+                    server_tool_exec_latency_ms_total=0.0,
+                    author_call_timeouts=0,
+                    author_fallback_warnings=0,
+                    runtime_warnings_total=0,
+                    runtime_errors_total=0,
                     error=f"{type(exc).__name__}: {exc}",
                 )
             )
@@ -435,6 +535,19 @@ def run_benchmark(
         consecutive_poll_timeouts = 0
         poll_latencies_ms: list[float] = []
         prompt_error: str | None = None
+        last_successful_poll_at = time.time()
+        server_initial_draft_elapsed_s: float | None = None
+        server_first_plan_saved_at_unix_s: float | None = None
+        server_initial_draft_started_at_unix_s: float | None = None
+        found_at_unix_s: float | None = None
+        author_call_timeouts = 0
+        author_fallback_warnings = 0
+        runtime_warnings_total = 0
+        runtime_errors_total = 0
+        server_llm_calls_total = 0
+        server_llm_latency_ms_total = 0.0
+        server_tool_calls_total = 0
+        server_tool_exec_latency_ms_total = 0.0
 
         while time.time() < deadline:
             if max_suite_seconds is not None:
@@ -460,15 +573,74 @@ def run_benchmark(
             try:
                 state = _http_json(
                     "GET",
-                    f"{base_url}/api/sessions/{session_id}?repo={quote(repo)}",
+                    f"{base_url}/api/sessions/{session_id}?repo={quote(repo)}&lightweight=true",
                     timeout=per_request_timeout,
                 )
                 poll_latency_ms = (time.time() - poll_t0) * 1000.0
                 poll_latencies_ms.append(poll_latency_ms)
                 consecutive_poll_timeouts = 0
+                last_successful_poll_at = time.time()
                 status = str(state.get("session", {}).get("status", "unknown"))
                 current_plan = state.get("current_plan") or {}
                 content = str(current_plan.get("plan_content", "") or "").strip()
+                draft_timing = state.get("draft_timing") or {}
+                if isinstance(draft_timing, dict):
+                    started_value = draft_timing.get("initial_draft_started_at_unix_s")
+                    if started_value is not None:
+                        try:
+                            server_initial_draft_started_at_unix_s = float(started_value)
+                        except (TypeError, ValueError):
+                            pass
+                    elapsed_value = draft_timing.get("initial_draft_elapsed_s")
+                    if elapsed_value is not None:
+                        try:
+                            server_initial_draft_elapsed_s = float(elapsed_value)
+                        except (TypeError, ValueError):
+                            pass
+                    saved_at_value = draft_timing.get("first_plan_saved_at_unix_s")
+                    if saved_at_value is not None:
+                        try:
+                            server_first_plan_saved_at_unix_s = float(saved_at_value)
+                        except (TypeError, ValueError):
+                            pass
+                    try:
+                        author_call_timeouts = int(draft_timing.get("author_call_timeouts", 0) or 0)
+                    except (TypeError, ValueError):
+                        author_call_timeouts = 0
+                    try:
+                        author_fallback_warnings = int(
+                            draft_timing.get("author_fallback_warnings", 0) or 0
+                        )
+                    except (TypeError, ValueError):
+                        author_fallback_warnings = 0
+                    try:
+                        runtime_warnings_total = int(draft_timing.get("warnings_total", 0) or 0)
+                    except (TypeError, ValueError):
+                        runtime_warnings_total = 0
+                    try:
+                        runtime_errors_total = int(draft_timing.get("errors_total", 0) or 0)
+                    except (TypeError, ValueError):
+                        runtime_errors_total = 0
+                    try:
+                        server_llm_calls_total = int(draft_timing.get("llm_calls_total", 0) or 0)
+                    except (TypeError, ValueError):
+                        server_llm_calls_total = 0
+                    try:
+                        server_llm_latency_ms_total = float(
+                            draft_timing.get("llm_call_latency_ms_total", 0.0) or 0.0
+                        )
+                    except (TypeError, ValueError):
+                        server_llm_latency_ms_total = 0.0
+                    try:
+                        server_tool_calls_total = int(draft_timing.get("tool_calls_total", 0) or 0)
+                    except (TypeError, ValueError):
+                        server_tool_calls_total = 0
+                    try:
+                        server_tool_exec_latency_ms_total = float(
+                            draft_timing.get("tool_exec_latency_ms_total", 0.0) or 0.0
+                        )
+                    except (TypeError, ValueError):
+                        server_tool_exec_latency_ms_total = 0.0
                 _log_line(
                     log_path,
                     {
@@ -479,13 +651,113 @@ def run_benchmark(
                         "latency_ms": round(poll_latency_ms, 2),
                         "status": status,
                         "has_plan": bool(content),
+                        "author_call_timeouts": author_call_timeouts,
                     },
                 )
                 if content:
                     found_after = int(time.time() - started)
+                    found_at_unix_s = time.time()
                     break
             except (TimeoutError, URLError, OSError):
-                # API may stall briefly under heavy model/tool load; keep polling.
+                # Retry once with a short timeout so transport hiccups do not add
+                # multi-second blocking to first-plan detection.
+                recovered = False
+                retry_timeout = max(2, min(4, per_request_timeout))
+                try:
+                    retry_t0 = time.time()
+                    state = _http_json(
+                        "GET",
+                        f"{base_url}/api/sessions/{session_id}?repo={quote(repo)}&lightweight=true",
+                        timeout=retry_timeout,
+                    )
+                    poll_latency_ms = (time.time() - retry_t0) * 1000.0
+                    poll_latencies_ms.append(poll_latency_ms)
+                    consecutive_poll_timeouts = 0
+                    last_successful_poll_at = time.time()
+                    status = str(state.get("session", {}).get("status", "unknown"))
+                    current_plan = state.get("current_plan") or {}
+                    content = str(current_plan.get("plan_content", "") or "").strip()
+                    draft_timing = state.get("draft_timing") or {}
+                    if isinstance(draft_timing, dict):
+                        started_value = draft_timing.get("initial_draft_started_at_unix_s")
+                        if started_value is not None:
+                            try:
+                                server_initial_draft_started_at_unix_s = float(started_value)
+                            except (TypeError, ValueError):
+                                pass
+                        elapsed_value = draft_timing.get("initial_draft_elapsed_s")
+                        if elapsed_value is not None:
+                            try:
+                                server_initial_draft_elapsed_s = float(elapsed_value)
+                            except (TypeError, ValueError):
+                                pass
+                        saved_at_value = draft_timing.get("first_plan_saved_at_unix_s")
+                        if saved_at_value is not None:
+                            try:
+                                server_first_plan_saved_at_unix_s = float(saved_at_value)
+                            except (TypeError, ValueError):
+                                pass
+                        try:
+                            author_call_timeouts = int(draft_timing.get("author_call_timeouts", 0) or 0)
+                        except (TypeError, ValueError):
+                            author_call_timeouts = 0
+                        try:
+                            author_fallback_warnings = int(
+                                draft_timing.get("author_fallback_warnings", 0) or 0
+                            )
+                        except (TypeError, ValueError):
+                            author_fallback_warnings = 0
+                        try:
+                            runtime_warnings_total = int(draft_timing.get("warnings_total", 0) or 0)
+                        except (TypeError, ValueError):
+                            runtime_warnings_total = 0
+                        try:
+                            runtime_errors_total = int(draft_timing.get("errors_total", 0) or 0)
+                        except (TypeError, ValueError):
+                            runtime_errors_total = 0
+                        try:
+                            server_llm_calls_total = int(draft_timing.get("llm_calls_total", 0) or 0)
+                        except (TypeError, ValueError):
+                            server_llm_calls_total = 0
+                        try:
+                            server_llm_latency_ms_total = float(
+                                draft_timing.get("llm_call_latency_ms_total", 0.0) or 0.0
+                            )
+                        except (TypeError, ValueError):
+                            server_llm_latency_ms_total = 0.0
+                        try:
+                            server_tool_calls_total = int(draft_timing.get("tool_calls_total", 0) or 0)
+                        except (TypeError, ValueError):
+                            server_tool_calls_total = 0
+                        try:
+                            server_tool_exec_latency_ms_total = float(
+                                draft_timing.get("tool_exec_latency_ms_total", 0.0) or 0.0
+                            )
+                        except (TypeError, ValueError):
+                            server_tool_exec_latency_ms_total = 0.0
+                    _log_line(
+                        log_path,
+                        {
+                            "event": "prompt_poll_recovered",
+                            "prompt_index": idx,
+                            "session_id": session_id,
+                            "attempt": poll_attempts,
+                            "retry_timeout_seconds": retry_timeout,
+                            "latency_ms": round(poll_latency_ms, 2),
+                            "status": status,
+                            "has_plan": bool(content),
+                            "author_call_timeouts": author_call_timeouts,
+                        },
+                    )
+                    if content:
+                        found_after = int(time.time() - started)
+                        found_at_unix_s = time.time()
+                        break
+                    recovered = True
+                except (TimeoutError, URLError, OSError):
+                    recovered = False
+                if recovered:
+                    continue
                 poll_timeouts += 1
                 consecutive_poll_timeouts += 1
                 _log_line(
@@ -496,14 +768,14 @@ def run_benchmark(
                         "session_id": session_id,
                         "attempt": poll_attempts,
                         "elapsed_s": round(time.time() - started, 3),
+                        "request_timeout_seconds": per_request_timeout,
+                        "retry_timeout_seconds": retry_timeout,
                     },
                 )
                 if consecutive_poll_timeouts >= max(1, int(max_consecutive_poll_timeouts)):
-                    prompt_error = (
-                        "poll_unhealthy: "
-                        f"{consecutive_poll_timeouts} consecutive poll timeouts "
-                        f"(request_timeout={poll_request_timeout_seconds}s)"
-                    )
+                    unhealthy_window = time.time() - last_successful_poll_at
+                    if unhealthy_window < max(1, int(poll_unhealthy_window_seconds)):
+                        continue
                     _log_line(
                         log_path,
                         {
@@ -512,10 +784,15 @@ def run_benchmark(
                             "session_id": session_id,
                             "consecutive_poll_timeouts": consecutive_poll_timeouts,
                             "request_timeout_seconds": poll_request_timeout_seconds,
+                            "unhealthy_window_seconds": round(unhealthy_window, 3),
+                            "required_window_seconds": poll_unhealthy_window_seconds,
                         },
                     )
-                    break
-            time.sleep(1)
+                    # Do not abort early here; keep polling until poll_timeout_seconds.
+                    # This avoids false "halted" runs when the server is slow but still progressing.
+                    continue
+            # Keep detect-latency low while drafting; back off slightly once refining.
+            time.sleep(0.25 if status in {"drafting", "discovering", "discovery"} else 0.5)
 
         lower = content.lower()
         fallback = "fallback plan because the authoring model was unavailable" in lower
@@ -539,6 +816,31 @@ def run_benchmark(
             session_id=session_id,
             create_elapsed_s=round(create_elapsed, 3),
             time_to_plan_s=found_after,
+            server_initial_draft_elapsed_s=server_initial_draft_elapsed_s,
+            server_first_plan_elapsed_s=(
+                round(
+                    max(
+                        0.0,
+                        server_first_plan_saved_at_unix_s - server_initial_draft_started_at_unix_s,
+                    ),
+                    3,
+                )
+                if (
+                    server_first_plan_saved_at_unix_s is not None
+                    and server_initial_draft_started_at_unix_s is not None
+                )
+                else None
+            ),
+            client_detect_gap_s=(
+                round(max(0.0, found_after - server_initial_draft_elapsed_s), 3)
+                if found_after is not None and server_initial_draft_elapsed_s is not None
+                else None
+            ),
+            client_detect_gap_from_server_first_plan_s=(
+                round(max(0.0, found_at_unix_s - server_first_plan_saved_at_unix_s), 3)
+                if found_at_unix_s is not None and server_first_plan_saved_at_unix_s is not None
+                else None
+            ),
             timed_out=timed_out,
             fallback=fallback,
             status=status,
@@ -551,6 +853,15 @@ def run_benchmark(
             poll_timeouts=poll_timeouts,
             avg_poll_latency_ms=round(statistics.mean(poll_latencies_ms), 2) if poll_latencies_ms else None,
             max_poll_latency_ms=round(max(poll_latencies_ms), 2) if poll_latencies_ms else None,
+            poll_transport_latency_ms_total=round(sum(poll_latencies_ms), 2),
+            server_llm_calls_total=server_llm_calls_total,
+            server_llm_latency_ms_total=round(server_llm_latency_ms_total, 2),
+            server_tool_calls_total=server_tool_calls_total,
+            server_tool_exec_latency_ms_total=round(server_tool_exec_latency_ms_total, 2),
+            author_call_timeouts=author_call_timeouts,
+            author_fallback_warnings=author_fallback_warnings,
+            runtime_warnings_total=runtime_warnings_total,
+            runtime_errors_total=runtime_errors_total,
             error=prompt_error,
         )
         _log_line(
@@ -560,11 +871,26 @@ def run_benchmark(
                 "prompt_index": idx,
                 "session_id": session_id,
                 "time_to_plan_s": run.time_to_plan_s,
+                "server_initial_draft_elapsed_s": run.server_initial_draft_elapsed_s,
+                "server_first_plan_elapsed_s": run.server_first_plan_elapsed_s,
+                "client_detect_gap_s": run.client_detect_gap_s,
+                "client_detect_gap_from_server_first_plan_s": (
+                    run.client_detect_gap_from_server_first_plan_s
+                ),
                 "timed_out": run.timed_out,
                 "fallback": run.fallback,
                 "quality_score": run.quality_score,
                 "poll_attempts": run.poll_attempts,
                 "poll_timeouts": run.poll_timeouts,
+                "author_call_timeouts": run.author_call_timeouts,
+                "author_fallback_warnings": run.author_fallback_warnings,
+                "runtime_warnings_total": run.runtime_warnings_total,
+                "runtime_errors_total": run.runtime_errors_total,
+                "poll_transport_latency_ms_total": run.poll_transport_latency_ms_total,
+                "server_llm_calls_total": run.server_llm_calls_total,
+                "server_llm_latency_ms_total": run.server_llm_latency_ms_total,
+                "server_tool_calls_total": run.server_tool_calls_total,
+                "server_tool_exec_latency_ms_total": run.server_tool_exec_latency_ms_total,
             },
         )
         runs.append(run)
@@ -621,7 +947,7 @@ def main() -> None:
     parser.add_argument(
         "--poll-request-timeout-seconds",
         type=int,
-        default=5,
+        default=3,
         help="HTTP timeout for each polling request.",
     )
     parser.add_argument(
@@ -629,6 +955,12 @@ def main() -> None:
         type=int,
         default=3,
         help="Mark prompt unhealthy after this many consecutive poll timeouts.",
+    )
+    parser.add_argument(
+        "--poll-unhealthy-window-seconds",
+        type=int,
+        default=20,
+        help="Require this sustained timeout window before marking poll unhealthy.",
     )
     parser.add_argument(
         "--max-consecutive-create-failures",
@@ -681,6 +1013,7 @@ def main() -> None:
             "poll_timeout_seconds": args.poll_timeout_seconds,
             "poll_request_timeout_seconds": args.poll_request_timeout_seconds,
             "max_consecutive_poll_timeouts": args.max_consecutive_poll_timeouts,
+            "poll_unhealthy_window_seconds": args.poll_unhealthy_window_seconds,
             "max_consecutive_create_failures": args.max_consecutive_create_failures,
             "stop_on_first_problem": args.stop_on_first_problem,
             "health_check_only": args.health_check_only,
@@ -710,6 +1043,8 @@ def main() -> None:
                 "error_runs": 0,
                 "avg_create_elapsed_s": None,
                 "avg_time_to_plan_s": None,
+                "avg_server_initial_draft_elapsed_s": None,
+                "avg_client_detect_gap_s": None,
                 "max_time_to_plan_s": None,
                 "avg_quality_score": None,
                 "total_poll_timeouts": 0,
@@ -717,16 +1052,16 @@ def main() -> None:
                 "slowest_prompt_index": None,
                 "slowest_prompt_time_to_plan_s": None,
             },
-            "log_file": str(log_file),
+            "log_file": _redact_home_path(log_file),
         }
         run_file = history_dir / f"run-{stamp}.json"
         run_file.write_text(json.dumps(payload, indent=2), encoding="utf-8")
         print(
             json.dumps(
                 {
-                    "run_file": str(run_file),
-                    "log_file": str(log_file),
-                    "best_file": str(best_file),
+                    "run_file": _redact_home_path(run_file),
+                    "log_file": _redact_home_path(log_file),
+                    "best_file": _redact_home_path(best_file),
                     "best_updated": False,
                 },
                 indent=2,
@@ -744,6 +1079,7 @@ def main() -> None:
         poll_timeout_seconds=args.poll_timeout_seconds,
         poll_request_timeout_seconds=args.poll_request_timeout_seconds,
         max_consecutive_poll_timeouts=args.max_consecutive_poll_timeouts,
+        poll_unhealthy_window_seconds=args.poll_unhealthy_window_seconds,
         max_consecutive_create_failures=args.max_consecutive_create_failures,
         stop_on_first_problem=args.stop_on_first_problem,
         max_suite_seconds=(None if args.max_suite_seconds <= 0 else args.max_suite_seconds),
@@ -758,7 +1094,7 @@ def main() -> None:
         "prompts": prompts,
         "results": [asdict(run) for run in runs],
         "summary": _summary(runs),
-        "log_file": str(log_file),
+        "log_file": _redact_home_path(log_file),
     }
 
     run_file = history_dir / f"run-{stamp}.json"
@@ -780,9 +1116,9 @@ def main() -> None:
     print(
         json.dumps(
             {
-                "run_file": str(run_file),
-                "log_file": str(log_file),
-                "best_file": str(best_file),
+                "run_file": _redact_home_path(run_file),
+                "log_file": _redact_home_path(log_file),
+                "best_file": _redact_home_path(best_file),
                 "best_updated": best_updated,
             },
             indent=2,
