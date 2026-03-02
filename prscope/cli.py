@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
 import sys
+import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -41,6 +44,7 @@ from .profile import build_profile, hash_profile
 from .github import GitHubClient, sync_repo_prs, GitHubAPIError
 from .scoring import evaluate_pr
 from .planning.runtime import PlanningRuntime
+from .web.server import DEFAULT_HOST, DEFAULT_PORT, ensure_server_running
 
 
 # Sample configuration files
@@ -78,11 +82,11 @@ scoring:
   keyword_weight: 0.4    # Weight for keyword matching
   path_weight: 0.6       # Weight for path matching
 
-# LLM configuration (RECOMMENDED for high-quality, noise-free results)
-# Without LLM, you only get rule-based matching (more noise)
+# Upstream PR semantic evaluation (RECOMMENDED for high-quality, noise-free results)
+# Without this, only rule-based keyword/path matching is used (more noise)
 # API keys are read from environment (OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.)
 # See: https://docs.litellm.ai/docs/providers
-llm:
+upstream_eval:
   enabled: true          # Enable for production use
   model: gpt-4o          # LiteLLM model string
   # model: claude-3-opus # Anthropic
@@ -493,8 +497,8 @@ def evaluate(
         click.echo(f"🔍 Evaluating PRs")
         click.echo(f"{'═' * 60}")
         click.echo(f"  Profile: {local_profile_sha[:8]}")
-        if config.llm.enabled:
-            click.echo(f"  LLM: {config.llm.model}")
+        if config.upstream_eval.enabled:
+            click.echo(f"  Upstream eval LLM: {config.upstream_eval.model}")
             click.echo(f"  Mode: semantic + AI analysis (3-stage pipeline)")
             click.echo(f"  Batch limit: {batch_size} PRs")
         else:
@@ -535,7 +539,7 @@ def evaluate(
     batch_limited = 0
     
     # Load full profile data for LLM
-    profile_data = profile.profile_data if config.llm.enabled else None
+    profile_data = profile.profile_data if config.upstream_eval.enabled else None
     
     for i, pr in enumerate(pending_prs[:batch_size], 1):
         if not as_json:
@@ -831,14 +835,9 @@ def _format_age(path: Path) -> str:
     return f"{days}d ago"
 
 
-def _run_tui(runtime: PlanningRuntime, session_id: str) -> None:
-    try:
-        from .tui import PlanningTUI
-    except Exception as exc:  # pragma: no cover
-        raise click.ClickException(
-            "Textual UI is unavailable. Install planning dependencies and retry."
-        ) from exc
-    PlanningTUI(runtime, session_id).run()
+def _open_web_session(session_id: str, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
+    _, base_url = ensure_server_running(host=host, port=port, open_browser=False)
+    webbrowser.open(f"{base_url}/sessions/{session_id}")
 
 
 @main.group(name="repos")
@@ -871,13 +870,13 @@ def plan_group() -> None:
 @click.argument("requirements", required=False)
 @click.option("--repo", "repo_name", help="Repo profile name")
 @click.option("--from-pr", "from_pr", nargs=2, type=str, help="Seed from upstream repo + PR number")
-@click.option("--no-tui", is_flag=True, help="Do not launch the interactive TUI")
+@click.option("--no-open", is_flag=True, help="Do not open browser after creating session")
 @click.option("--rebuild-memory", is_flag=True, help="Force memory rebuild")
 def plan_start(
     requirements: str | None,
     repo_name: str | None,
     from_pr: tuple[str, str] | None,
-    no_tui: bool,
+    no_open: bool,
     rebuild_memory: bool,
 ) -> None:
     """Start a planning session from requirements, PR seed, or discovery chat."""
@@ -904,38 +903,156 @@ def plan_start(
         click.echo(opening)
 
     click.echo(f"Created planning session: {session.id}")
-    if not no_tui:
-        _run_tui(runtime, session.id)
+    if not no_open:
+        _open_web_session(session.id)
 
 
 @plan_group.command("chat")
 @click.option("--repo", "repo_name", help="Repo profile name")
-@click.option("--no-tui", is_flag=True, help="Do not launch the interactive TUI")
+@click.option("--no-open", is_flag=True, help="Do not open browser after creating session")
 @click.option("--rebuild-memory", is_flag=True, help="Force memory rebuild")
-def plan_chat(repo_name: str | None, no_tui: bool, rebuild_memory: bool) -> None:
+def plan_chat(repo_name: str | None, no_open: bool, rebuild_memory: bool) -> None:
     """Start chat-first discovery mode."""
     _, _, runtime = _load_planning_runtime(repo_name)
     session, opening = asyncio.run(runtime.start_from_chat(rebuild_memory=rebuild_memory))
     click.echo(opening)
     click.echo(f"Created planning session: {session.id}")
-    if not no_tui:
-        _run_tui(runtime, session.id)
+    if not no_open:
+        _open_web_session(session.id)
 
 
 @plan_group.command("resume")
 @click.argument("session_id")
 @click.option("--repo", "repo_name", help="Optional override for repo profile")
 def plan_resume(session_id: str, repo_name: str | None) -> None:
-    """Resume an existing planning session in the TUI."""
-    config = PrscopeConfig.load(get_repo_root())
+    """Resume an existing planning session in the browser UI."""
     store = Store()
     session = store.get_planning_session(session_id)
     if session is None:
         raise click.ClickException(f"Session not found: {session_id}")
-    effective_repo = repo_name or session.repo_name
-    repo_profile = config.resolve_repo(effective_repo, cwd=Path.cwd())
-    runtime = PlanningRuntime(store=store, config=config, repo=repo_profile)
-    _run_tui(runtime, session_id)
+    _open_web_session(session_id)
+
+
+@plan_group.command("round")
+@click.argument("session_id")
+@click.option("--repo", "repo_name", help="Repo profile name")
+@click.option("--input", "user_input", default=None, help="Optional user input for this round")
+def plan_round(session_id: str, repo_name: str | None, user_input: str | None) -> None:
+    """Run one adversarial refinement round in the CLI."""
+    _, store, runtime = _load_planning_runtime(repo_name)
+    session = store.get_planning_session(session_id)
+    if session is None:
+        raise click.ClickException(f"Session not found: {session_id}")
+
+    async def _run() -> None:
+        running_cost = float(session.session_total_cost_usd or 0.0)
+        rendered_progress = False
+        round_label = f"[Round {session.current_round + 1}/{runtime.planning_config.max_adversarial_rounds}]"
+
+        async def on_event(event: dict[str, object]) -> None:
+            nonlocal running_cost, rendered_progress
+            event_type = str(event.get("type", ""))
+            if event_type == "token_usage":
+                running_cost = float(event.get("session_total_usd", running_cost) or running_cost)
+                click.echo(f"\r{round_label} Refining plan... ${running_cost:.4f}", nl=False)
+                rendered_progress = True
+                return
+            if event_type == "clarification_needed":
+                question = str(event.get("question", "")).strip() or "Clarification needed"
+                click.echo()
+                click.echo(f"[?] {question}")
+                answer = click.prompt("Your answer", type=str)
+                runtime.provide_clarification(session_id, [answer])
+                return
+            if event_type == "warning":
+                click.echo()
+                click.echo(f"[warning] {event.get('message', '')}")
+
+        critic, author, convergence = await runtime.run_adversarial_round(
+            session_id=session_id,
+            user_input=user_input,
+            event_callback=on_event,
+        )
+        if rendered_progress:
+            click.echo()
+        click.echo(
+            "Round complete: "
+            f"{critic.major_issues_remaining} major / {critic.minor_issues_remaining} minor remaining, "
+            f"cost ${running_cost:.4f}, converged={convergence.converged}"
+        )
+        click.echo(f"Updated plan length: {len(author.plan)} chars")
+
+    asyncio.run(_run())
+
+
+@main.command("web")
+@click.option("--dev", is_flag=True, help="Run frontend Vite dev server with backend")
+@click.option("--host", default=DEFAULT_HOST, show_default=True)
+@click.option("--port", default=DEFAULT_PORT, show_default=True, type=int)
+@click.option("--resume", "resume_session_id", default=None, help="Open specific session ID")
+@click.option("--repo", "repo_name", default=None, help="Repo profile name for web UI context")
+@click.option("--repo-root", "repo_root", default=None, help="Directory containing prscope.yml")
+@click.option("--background", "-b", is_flag=True, help="Detach server to background")
+def run_web(
+    dev: bool,
+    host: str,
+    port: int,
+    resume_session_id: str | None,
+    repo_name: str | None,
+    repo_root: str | None,
+    background: bool,
+) -> None:
+    """Run prscope web UI server (foreground by default, -b for background)."""
+    from .web.server import run_server, is_port_open
+
+    if repo_root:
+        os.environ["PRSCOPE_CONFIG_ROOT"] = str(Path(repo_root).expanduser().resolve())
+
+    base_url = f"http://{host}:{port}"
+    repo_query = f"?repo={repo_name}" if repo_name else ""
+
+    if dev:
+        _, base_url = ensure_server_running(host=host, port=port, open_browser=False)
+        frontend_dir = Path(__file__).parent / "web" / "frontend"
+        if not frontend_dir.exists():
+            raise click.ClickException(f"Frontend directory not found: {frontend_dir}")
+        click.echo(f"Backend running at {base_url}")
+        click.echo("Starting Vite dev server...")
+        subprocess.run(["npm", "run", "dev"], cwd=frontend_dir, check=True)
+        return
+
+    if background:
+        _, base_url = ensure_server_running(host=host, port=port, open_browser=False)
+        if resume_session_id:
+            webbrowser.open(f"{base_url}/sessions/{resume_session_id}{repo_query}")
+        else:
+            webbrowser.open(f"{base_url}/{repo_query}")
+        click.echo(f"Web UI available at {base_url}")
+        click.echo("Server logs: ~/.prscope/server.log")
+        return
+
+    if is_port_open(host, port):
+        click.echo(f"Server already running at {base_url}")
+        if resume_session_id:
+            webbrowser.open(f"{base_url}/sessions/{resume_session_id}{repo_query}")
+        else:
+            webbrowser.open(f"{base_url}/{repo_query}")
+        return
+
+    import threading
+    def _open_browser() -> None:
+        import time as _time
+        _time.sleep(1.5)
+        target = (
+            f"{base_url}/sessions/{resume_session_id}{repo_query}"
+            if resume_session_id
+            else f"{base_url}/{repo_query}"
+        )
+        webbrowser.open(target)
+
+    threading.Thread(target=_open_browser, daemon=True).start()
+    click.echo(f"Starting prscope server at {base_url} (Ctrl+C to stop)")
+    run_server(host=host, port=port)
 
 
 @plan_group.command("list")
@@ -1016,7 +1133,11 @@ def plan_validate(session_id: str, repo_name: str | None) -> None:
     session = store.get_planning_session(session_id)
     if session is None:
         raise click.ClickException(f"Session not found: {session_id}")
-    result = asyncio.run(runtime.validate_session(session_id))
+    try:
+        result = asyncio.run(runtime.validate_session(session_id))
+    except Exception as exc:
+        click.echo(f"FAILED: strict validation error: {exc}")
+        sys.exit(2)
     hard_count = len(result.hard_constraint_violations)
     major = result.major_issues_remaining
     if hard_count > 0 and major == 0:
@@ -1074,8 +1195,247 @@ def plan_status(session_id: str, repo_name: str | None, pr_number: int | None) -
     click.echo(f"Unplanned changes: {drift['unplanned_count']} files")
     for item in drift["unplanned"][:20]:
         click.echo(f"  - {item}")
+    if drift.get("session_cost_usd") is not None:
+        click.echo(f"Session cost: ${float(drift['session_cost_usd']):.4f}")
+    if drift.get("max_prompt_tokens") is not None:
+        click.echo(f"Max prompt tokens: {int(drift['max_prompt_tokens'])}")
+    if drift.get("confidence_trend") is not None:
+        click.echo(f"Confidence trend: {float(drift['confidence_trend']):+.3f}")
+    click.echo(f"Converged early: {'yes' if drift.get('converged_early') else 'no'}")
     if drift["missing_count"] > 0:
         sys.exit(1)
+
+
+@plan_group.command("abort")
+@click.argument("session_id")
+@click.option("--repo", "repo_name", help="Repo profile name")
+def plan_abort(session_id: str, repo_name: str | None) -> None:
+    """Abort an active clarification wait for a session."""
+    _, store, runtime = _load_planning_runtime(repo_name)
+    session = store.get_planning_session(session_id)
+    if session is None:
+        raise click.ClickException(f"Session not found: {session_id}")
+    runtime.abort_clarification(session_id)
+    click.echo(f"Aborted clarification wait for session {session_id[:8]}.")
+
+
+@plan_group.command("clarify")
+@click.argument("session_id")
+@click.option("--repo", "repo_name", help="Repo profile name")
+@click.option("--answer", "answers", multiple=True, help="Clarification answer (repeatable)")
+def plan_clarify(session_id: str, repo_name: str | None, answers: tuple[str, ...]) -> None:
+    """Provide clarification answers for a paused session."""
+    _, store, runtime = _load_planning_runtime(repo_name)
+    session = store.get_planning_session(session_id)
+    if session is None:
+        raise click.ClickException(f"Session not found: {session_id}")
+    if answers:
+        payload = list(answers)
+    else:
+        payload = [click.prompt("Your answer", type=str)]
+    runtime.provide_clarification(session_id, payload)
+    click.echo(f"Submitted {len(payload)} clarification answer(s) for {session_id[:8]}.")
+
+
+@plan_group.command("delete")
+@click.argument("session_id", required=False)
+@click.option("--all", "delete_all", is_flag=True, help="Delete all sessions")
+@click.option("--repo", "repo_name", help="Limit --all to a specific repo profile")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt")
+def plan_delete(
+    session_id: str | None,
+    delete_all: bool,
+    repo_name: str | None,
+    yes: bool,
+) -> None:
+    """Delete one or all planning sessions (including turns and plan versions)."""
+    store = Store()
+
+    if delete_all:
+        sessions = store.list_planning_sessions(repo_name=repo_name)
+        if not sessions:
+            click.echo("No sessions to delete.")
+            return
+        scope = f"repo '{repo_name}'" if repo_name else "ALL repos"
+        click.echo(f"This will delete {len(sessions)} session(s) from {scope}:")
+        for s in sessions[:10]:
+            click.echo(f"  {s.id[:8]}  [{s.status}]  {s.title}")
+        if len(sessions) > 10:
+            click.echo(f"  ... and {len(sessions) - 10} more")
+        if not yes:
+            click.confirm("Delete all?", abort=True)
+        count = store.delete_all_planning_sessions(repo_name=repo_name)
+        click.echo(f"Deleted {count} session(s).")
+        return
+
+    if not session_id:
+        raise click.UsageError("Provide SESSION_ID or use --all.")
+
+    session = store.get_planning_session(session_id)
+    if session is None:
+        raise click.ClickException(f"Session not found: {session_id}")
+
+    if not yes:
+        click.confirm(
+            f"Delete session '{session.title}' ({session_id[:8]})?", abort=True
+        )
+    store.delete_planning_session(session_id)
+    click.echo(f"Deleted session {session_id[:8]}.")
+
+
+@main.command("scanners")
+def list_scanners_cmd() -> None:
+    """Show available codebase scanner backends and their status."""
+    from .planning.scanners import list_scanners
+
+    backends = list_scanners()
+    click.echo("\nCODEBASE SCANNER BACKENDS\n")
+    click.echo(f"  {'NAME':<12} {'STATUS':<14} DESCRIPTION")
+    click.echo("  " + "-" * 60)
+
+    descriptions = {
+        "grep":    "Default — no extra deps, file-tree + README",
+        "repomap": "tree-sitter symbol map (pip install aider-chat)",
+        "repomix": "full repo pack (npm install -g repomix)",
+    }
+    for b in backends:
+        name = str(b["name"])
+        status = click.style("available", fg="green") if b["available"] else click.style("not installed", fg="yellow")
+        desc = descriptions.get(name, "")
+        click.echo(f"  {name:<12} {status:<14}  {desc}")
+
+    click.echo()
+    click.echo("Set in prscope.yml:  planning:\n                       scanner: repomap")
+    click.echo()
+
+
+@main.command("analytics")
+@click.option("--repo", "repo_name", default=None, help="Repo profile name")
+def analytics(repo_name: str | None) -> None:
+    """Show planning analytics (cost, confidence, convergence, constraints)."""
+    store = Store()
+    sessions = store.list_planning_sessions(repo_name=repo_name, limit=500)
+    if not sessions:
+        click.echo("No planning sessions found.")
+        return
+
+    total_cost = 0.0
+    costs: list[float] = []
+    confidence_values: list[float] = []
+    confidence_trends: list[float] = []
+    rounds_to_convergence: list[int] = []
+    constraint_counts: dict[str, int] = {}
+    round_total_tokens: list[int] = []
+    clarification_pauses = 0
+    total_rounds = 0
+    model_costs: dict[str, float] = {}
+
+    for session in sessions:
+        cost = float(session.session_total_cost_usd or 0.0)
+        total_cost += cost
+        costs.append(cost)
+        if session.confidence_trend is not None:
+            confidence_trends.append(float(session.confidence_trend))
+
+        metrics = store.get_round_metrics(session.id)
+        if session.status in {"converged", "approved", "exported"}:
+            rounds_to_convergence.append(session.current_round)
+        for metric in metrics:
+            total_rounds += 1
+            if metric.critic_confidence is not None:
+                confidence_values.append(float(metric.critic_confidence))
+            round_total_tokens.append(
+                int(metric.author_prompt_tokens or 0)
+                + int(metric.author_completion_tokens or 0)
+                + int(metric.critic_prompt_tokens or 0)
+                + int(metric.critic_completion_tokens or 0)
+            )
+            if int(metric.clarifications_this_round or 0) > 0:
+                clarification_pauses += 1
+            for cid in metric.constraint_violations:
+                constraint_counts[cid] = constraint_counts.get(cid, 0) + 1
+
+    if repo_name:
+        persisted_stats = store.get_constraint_stats(repo_name)
+        for cid, payload in persisted_stats.items():
+            if isinstance(payload, dict):
+                constraint_counts[cid] = max(
+                    constraint_counts.get(cid, 0), int(payload.get("violations", 0))
+                )
+
+    avg_cost = total_cost / len(sessions) if sessions else 0.0
+    sorted_costs = sorted(costs)
+    p75_cost = sorted_costs[int(0.75 * (len(sorted_costs) - 1))] if sorted_costs else 0.0
+    avg_conf = (sum(confidence_values) / len(confidence_values)) if confidence_values else 0.0
+    avg_rounds = (
+        sum(rounds_to_convergence) / len(rounds_to_convergence)
+        if rounds_to_convergence
+        else 0.0
+    )
+    avg_conf_trend = (
+        sum(confidence_trends) / len(confidence_trends) if confidence_trends else 0.0
+    )
+    sorted_round_tokens = sorted(round_total_tokens)
+    p75_round_tokens = (
+        sorted_round_tokens[int(0.75 * (len(sorted_round_tokens) - 1))]
+        if sorted_round_tokens
+        else 0
+    )
+    clarification_rate = (
+        (clarification_pauses / total_rounds) * 100.0 if total_rounds else 0.0
+    )
+    top_expensive_sessions = sorted(
+        sessions,
+        key=lambda item: float(item.session_total_cost_usd or 0.0),
+        reverse=True,
+    )[:5]
+
+    repo_names = sorted({session.repo_name for session in sessions})
+    for candidate_repo in repo_names:
+        rounds_log = Path.home() / ".prscope" / "repos" / candidate_repo / "rounds.jsonl"
+        if not rounds_log.exists():
+            continue
+        try:
+            for line in rounds_log.read_text(encoding="utf-8").splitlines():
+                if not line.strip():
+                    continue
+                payload = json.loads(line)
+                per_model = payload.get("model_costs", {})
+                if not isinstance(per_model, dict):
+                    continue
+                for model, value in per_model.items():
+                    try:
+                        model_costs[str(model)] = model_costs.get(str(model), 0.0) + float(value)
+                    except (TypeError, ValueError):
+                        continue
+        except (OSError, json.JSONDecodeError):
+            continue
+
+    click.echo("Planning Analytics")
+    click.echo(f"Sessions: {len(sessions)}")
+    click.echo(f"Total spend: ${total_cost:.4f}")
+    click.echo(f"Average session cost: ${avg_cost:.4f}")
+    click.echo(f"p75 session cost: ${p75_cost:.4f}")
+    click.echo(f"Average critic confidence: {avg_conf:.3f}")
+    click.echo(f"Average confidence trend/session: {avg_conf_trend:+.3f}")
+    click.echo(f"Average rounds-to-convergence: {avg_rounds:.2f}")
+    click.echo(f"p75 tokens/round: {p75_round_tokens}")
+    click.echo(f"Clarification pause frequency: {clarification_rate:.1f}% of rounds")
+    click.echo("Most expensive sessions:")
+    for item in top_expensive_sessions:
+        click.echo(f"  - {item.id[:8]} [{item.repo_name}] ${float(item.session_total_cost_usd or 0.0):.4f}")
+    click.echo("Cost by model:")
+    if not model_costs:
+        click.echo("  - unavailable (no rounds.jsonl model_costs data yet)")
+    else:
+        for model, cost in sorted(model_costs.items(), key=lambda entry: entry[1], reverse=True):
+            click.echo(f"  - {model}: ${cost:.4f}")
+    click.echo("Top hard-constraint violations:")
+    if not constraint_counts:
+        click.echo("  - none")
+    else:
+        for cid, count in sorted(constraint_counts.items(), key=lambda item: item[1], reverse=True)[:10]:
+            click.echo(f"  - {cid}: {count}")
 
 
 if __name__ == "__main__":

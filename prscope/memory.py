@@ -15,6 +15,7 @@ from typing import Any
 import yaml
 
 from .config import PlanningConfig, RepoProfile
+from .planning.scanners import ScannerBackend, get_scanner
 
 logger = logging.getLogger(__name__)
 
@@ -59,12 +60,18 @@ class ParsedConstraint:
 class MemoryStore:
     """Builds and loads structured memory blocks for planning."""
 
-    def __init__(self, repo: RepoProfile, config: PlanningConfig):
+    def __init__(
+        self,
+        repo: RepoProfile,
+        config: PlanningConfig,
+        scanner: ScannerBackend | None = None,
+    ):
         self.repo = repo
         self.config = config
         self.memory_dir = repo.memory_dir
         self.meta_path = self.memory_dir / "_meta.json"
         self.manifesto_path = repo.resolved_manifesto
+        self._scanner: ScannerBackend = scanner or get_scanner(config.scanner)
 
     def ensure_manifesto(self) -> Path:
         self.manifesto_path.parent.mkdir(parents=True, exist_ok=True)
@@ -78,13 +85,15 @@ class MemoryStore:
         return self.manifesto_path.read_text(encoding="utf-8")
 
     def load_block(self, name: str) -> str:
+        if name == "context":
+            context_path = self.memory_dir / "context.md"
+            if not context_path.exists():
+                return ""
+            return context_path.read_text(encoding="utf-8")
         path = self.memory_dir / f"{name}.md"
         if not path.exists():
             return ""
         return path.read_text(encoding="utf-8")
-
-    def load_all_blocks(self) -> dict[str, str]:
-        return {name: self.load_block(name) for name in MEMORY_BLOCKS}
 
     def load_constraints(self, manifesto_path: Path | None = None) -> list[ParsedConstraint]:
         path = manifesto_path or self.manifesto_path
@@ -210,8 +219,33 @@ class MemoryStore:
 
     async def build_all_blocks(self, profile: dict[str, Any]) -> None:
         self.memory_dir.mkdir(parents=True, exist_ok=True)
+
+        scanner_name = getattr(self._scanner, "name", "grep")
+
+        if scanner_name in ("repomap", "repomix"):
+            # Non-grep backends produce a single rich context string directly —
+            # no LLM call needed.  Write it as a single "context" block and
+            # create lightweight stubs for the other expected blocks so the
+            # rest of the system keeps working.
+            context = await asyncio.to_thread(
+                self._scanner.build_context, self.repo.resolved_path, profile
+            )
+            (self.memory_dir / "context.md").write_text(context, encoding="utf-8")
+            # Stubs so load_block() never returns empty string for expected blocks
+            stub = f"*See context.md for full {scanner_name} output.*"
+            for block in MEMORY_BLOCKS:
+                block_path = self.memory_dir / f"{block}.md"
+                if not block_path.exists():
+                    block_path.write_text(stub, encoding="utf-8")
+            return
+
+        # Default grep path: scanner builds a text profile, then LLM summarises
+        # it into structured memory blocks.
+        scanner_context = await asyncio.to_thread(
+            self._scanner.build_context, self.repo.resolved_path, profile
+        )
         semaphore = asyncio.Semaphore(max(self.config.memory_concurrency, 1))
-        prompts = self._build_prompts(profile)
+        prompts = self._build_prompts(profile, scanner_context=scanner_context)
 
         async def build_one(block_name: str, prompt: str) -> None:
             async with semaphore:
@@ -220,23 +254,38 @@ class MemoryStore:
 
         await asyncio.gather(*(build_one(name, prompt) for name, prompt in prompts.items()))
 
-    def _build_prompts(self, profile: dict[str, Any]) -> dict[str, str]:
+    def load_all_blocks(self) -> dict[str, str]:
+        scanner_name = getattr(self._scanner, "name", "grep")
+        if scanner_name in ("repomap", "repomix"):
+            # Return the single rich context block for non-grep backends
+            context_path = self.memory_dir / "context.md"
+            if context_path.exists():
+                return {"context": context_path.read_text(encoding="utf-8")}
+        return {name: self.load_block(name) for name in MEMORY_BLOCKS}
+
+    def _build_prompts(
+        self, profile: dict[str, Any], scanner_context: str | None = None
+    ) -> dict[str, str]:
         files = profile.get("file_tree", {}).get("files", [])
         dirs = profile.get("file_tree", {}).get("directories", [])
         extensions = profile.get("file_tree", {}).get("extensions", {})
         readme = profile.get("readme") or ""
         import_stats = profile.get("import_stats", {})
 
-        summary = (
-            f"Repo: {self.repo.name}\n"
-            f"Path: {self.repo.resolved_path}\n"
-            f"Total files: {profile.get('file_tree', {}).get('total_files', 0)}\n"
-            f"Extensions: {json.dumps(extensions, indent=2)}\n"
-            f"Import stats: {json.dumps(import_stats, indent=2)}\n"
-            f"Directories sample: {dirs[:100]}\n"
-            f"Files sample: {files[:200]}\n"
-            f"README:\n{readme[:3000]}\n"
-        )
+        if scanner_context:
+            # Use the rich scanner output as the base for LLM prompts
+            summary = scanner_context
+        else:
+            summary = (
+                f"Repo: {self.repo.name}\n"
+                f"Path: {self.repo.resolved_path}\n"
+                f"Total files: {profile.get('file_tree', {}).get('total_files', 0)}\n"
+                f"Extensions: {json.dumps(extensions, indent=2)}\n"
+                f"Import stats: {json.dumps(import_stats, indent=2)}\n"
+                f"Directories sample: {dirs[:100]}\n"
+                f"Files sample: {files[:200]}\n"
+                f"README:\n{readme[:3000]}\n"
+            )
 
         return {
             "architecture": (

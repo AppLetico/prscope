@@ -1,0 +1,59 @@
+{"event": "suite_start", "started_at": "2026-03-02T05:16:30.955445+00:00", "base_url": "http://127.0.0.1:8451", "repo": "clasper-core", "prompt_count": 10, "poll_timeout_seconds": 45, "poll_request_timeout_seconds": 3, "max_consecutive_poll_timeouts": 2, "max_suite_seconds": 90}
+{"event": "prompt_start", "prompt_index": 1, "prompt_total": 10, "prompt": "Add a lightweight /health endpoint and tests for it."}
+{"event": "prompt_created", "prompt_index": 1, "prompt_total": 10, "session_id": "fc684fe2-0271-4763-b1e2-b40eab34f6f8", "create_elapsed_s": 0.558}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "fc684fe2-0271-4763-b1e2-b40eab34f6f8", "attempt": 1, "latency_ms": 877.75, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "fc684fe2-0271-4763-b1e2-b40eab34f6f8", "attempt": 2, "latency_ms": 14.07, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "fc684fe2-0271-4763-b1e2-b40eab34f6f8", "attempt": 3, "latency_ms": 97.82, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "fc684fe2-0271-4763-b1e2-b40eab34f6f8", "attempt": 4, "latency_ms": 13.83, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "fc684fe2-0271-4763-b1e2-b40eab34f6f8", "attempt": 5, "latency_ms": 4.21, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "fc684fe2-0271-4763-b1e2-b40eab34f6f8", "attempt": 6, "latency_ms": 11.81, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "fc684fe2-0271-4763-b1e2-b40eab34f6f8", "attempt": 7, "latency_ms": 7.28, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "fc684fe2-0271-4763-b1e2-b40eab34f6f8", "attempt": 8, "latency_ms": 5.04, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "fc684fe2-0271-4763-b1e2-b40eab34f6f8", "attempt": 9, "latency_ms": 9.83, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "fc684fe2-0271-4763-b1e2-b40eab34f6f8", "attempt": 10, "latency_ms": 14.28, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "fc684fe2-0271-4763-b1e2-b40eab34f6f8", "attempt": 11, "latency_ms": 12.34, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "fc684fe2-0271-4763-b1e2-b40eab34f6f8", "attempt": 12, "latency_ms": 7.06, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "fc684fe2-0271-4763-b1e2-b40eab34f6f8", "attempt": 13, "latency_ms": 15.99, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "fc684fe2-0271-4763-b1e2-b40eab34f6f8", "attempt": 14, "latency_ms": 15.94, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "fc684fe2-0271-4763-b1e2-b40eab34f6f8", "attempt": 15, "latency_ms": 14.6, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "fc684fe2-0271-4763-b1e2-b40eab34f6f8", "attempt": 16, "latency_ms": 9.23, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "fc684fe2-0271-4763-b1e2-b40eab34f6f8", "attempt": 17, "latency_ms": 11.39, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "fc684fe2-0271-4763-b1e2-b40eab34f6f8", "attempt": 18, "latency_ms": 15.5, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll_timeout", "prompt_index": 1, "session_id": "fc684fe2-0271-4763-b1e2-b40eab34f6f8", "attempt": 19, "elapsed_s": 22.242}
+{"event": "prompt_poll_timeout", "prompt_index": 1, "session_id": "fc684fe2-0271-4763-b1e2-b40eab34f6f8", "attempt": 20, "elapsed_s": 26.256}
+{"event": "prompt_poll_unhealthy", "prompt_index": 1, "session_id": "fc684fe2-0271-4763-b1e2-b40eab34f6f8", "consecutive_poll_timeouts": 2, "request_timeout_seconds": 3}
+{"event": "prompt_timeout", "prompt_index": 1, "session_id": "fc684fe2-0271-4763-b1e2-b40eab34f6f8", "poll_timeout_seconds": 45, "status": "drafting", "poll_attempts": 20, "poll_timeouts": 2}
+{"event": "prompt_complete", "prompt_index": 1, "session_id": "fc684fe2-0271-4763-b1e2-b40eab34f6f8", "time_to_plan_s": null, "timed_out": true, "fallback": false, "quality_score": 0.0, "poll_attempts": 20, "poll_timeouts": 2}
+{"event": "prompt_start", "prompt_index": 2, "prompt_total": 10, "prompt": "Add request ID propagation in server middleware and include it in structured logs, with tests."}
+{"event": "prompt_created", "prompt_index": 2, "prompt_total": 10, "session_id": "eecd7fde-7ed7-439b-9d51-c0765e3dbca6", "create_elapsed_s": 26.761}
+{"event": "prompt_poll", "prompt_index": 2, "session_id": "eecd7fde-7ed7-439b-9d51-c0765e3dbca6", "attempt": 1, "latency_ms": 8.09, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 2, "session_id": "eecd7fde-7ed7-439b-9d51-c0765e3dbca6", "attempt": 2, "latency_ms": 15.18, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 2, "session_id": "eecd7fde-7ed7-439b-9d51-c0765e3dbca6", "attempt": 3, "latency_ms": 79.84, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 2, "session_id": "eecd7fde-7ed7-439b-9d51-c0765e3dbca6", "attempt": 4, "latency_ms": 13.75, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 2, "session_id": "eecd7fde-7ed7-439b-9d51-c0765e3dbca6", "attempt": 5, "latency_ms": 14.46, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 2, "session_id": "eecd7fde-7ed7-439b-9d51-c0765e3dbca6", "attempt": 6, "latency_ms": 14.87, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 2, "session_id": "eecd7fde-7ed7-439b-9d51-c0765e3dbca6", "attempt": 7, "latency_ms": 12.52, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 2, "session_id": "eecd7fde-7ed7-439b-9d51-c0765e3dbca6", "attempt": 8, "latency_ms": 14.77, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 2, "session_id": "eecd7fde-7ed7-439b-9d51-c0765e3dbca6", "attempt": 9, "latency_ms": 14.97, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 2, "session_id": "eecd7fde-7ed7-439b-9d51-c0765e3dbca6", "attempt": 10, "latency_ms": 15.29, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 2, "session_id": "eecd7fde-7ed7-439b-9d51-c0765e3dbca6", "attempt": 11, "latency_ms": 16.4, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 2, "session_id": "eecd7fde-7ed7-439b-9d51-c0765e3dbca6", "attempt": 12, "latency_ms": 9.78, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 2, "session_id": "eecd7fde-7ed7-439b-9d51-c0765e3dbca6", "attempt": 13, "latency_ms": 15.69, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 2, "session_id": "eecd7fde-7ed7-439b-9d51-c0765e3dbca6", "attempt": 14, "latency_ms": 4.29, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 2, "session_id": "eecd7fde-7ed7-439b-9d51-c0765e3dbca6", "attempt": 15, "latency_ms": 15.92, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 2, "session_id": "eecd7fde-7ed7-439b-9d51-c0765e3dbca6", "attempt": 16, "latency_ms": 8.42, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 2, "session_id": "eecd7fde-7ed7-439b-9d51-c0765e3dbca6", "attempt": 17, "latency_ms": 11.64, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 2, "session_id": "eecd7fde-7ed7-439b-9d51-c0765e3dbca6", "attempt": 18, "latency_ms": 15.77, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 2, "session_id": "eecd7fde-7ed7-439b-9d51-c0765e3dbca6", "attempt": 19, "latency_ms": 15.44, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 2, "session_id": "eecd7fde-7ed7-439b-9d51-c0765e3dbca6", "attempt": 20, "latency_ms": 15.81, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 2, "session_id": "eecd7fde-7ed7-439b-9d51-c0765e3dbca6", "attempt": 21, "latency_ms": 15.56, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 2, "session_id": "eecd7fde-7ed7-439b-9d51-c0765e3dbca6", "attempt": 22, "latency_ms": 13.3, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll_timeout", "prompt_index": 2, "session_id": "eecd7fde-7ed7-439b-9d51-c0765e3dbca6", "attempt": 23, "elapsed_s": 25.471}
+{"event": "prompt_poll_timeout", "prompt_index": 2, "session_id": "eecd7fde-7ed7-439b-9d51-c0765e3dbca6", "attempt": 24, "elapsed_s": 29.475}
+{"event": "prompt_poll_unhealthy", "prompt_index": 2, "session_id": "eecd7fde-7ed7-439b-9d51-c0765e3dbca6", "consecutive_poll_timeouts": 2, "request_timeout_seconds": 3}
+{"event": "prompt_timeout", "prompt_index": 2, "session_id": "eecd7fde-7ed7-439b-9d51-c0765e3dbca6", "poll_timeout_seconds": 45, "status": "drafting", "poll_attempts": 24, "poll_timeouts": 2}
+{"event": "prompt_complete", "prompt_index": 2, "session_id": "eecd7fde-7ed7-439b-9d51-c0765e3dbca6", "time_to_plan_s": null, "timed_out": true, "fallback": false, "quality_score": 0.0, "poll_attempts": 24, "poll_timeouts": 2}
+{"event": "prompt_start", "prompt_index": 3, "prompt_total": 10, "prompt": "Add rate limiting for auth endpoints with config knobs and observability metrics."}
+{"event": "prompt_create_failed", "prompt_index": 3, "prompt_total": 10, "create_elapsed_s": 30.002, "error": "timeout: timed out"}
+{"event": "suite_timeout", "prompt_index": 4, "prompt_total": 10, "elapsed_s": 113.059, "max_suite_seconds": 90}
+{"event": "suite_complete", "executed_prompts": 3, "requested_prompts": 10, "elapsed_s": 113.059}

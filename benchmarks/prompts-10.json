@@ -1,0 +1,12 @@
+[
+  "Add a lightweight /health endpoint and tests for it.",
+  "Add request ID propagation in server middleware and include it in structured logs, with tests.",
+  "Add rate limiting for auth endpoints with config knobs and observability metrics.",
+  "Refactor env/config loading to validate required vars at startup and fail fast with clear errors.",
+  "Add a new admin-only diagnostics endpoint and ensure role checks plus negative-path tests.",
+  "Introduce idempotency-key support for create APIs and add integration tests for duplicate submissions.",
+  "Add audit logging for permission changes with actor, target, timestamp, and reason fields.",
+  "Implement optimistic concurrency control for profile updates using a version field and conflict handling.",
+  "Add a feature flag for experimental planner mode with safe default-off behavior and rollback guidance.",
+  "Improve startup observability: emit structured boot metrics and add alerts for slow initialization."
+]

@@ -1,0 +1,34 @@
+{"event": "suite_start", "started_at": "2026-03-02T05:31:28.479920+00:00", "base_url": "http://127.0.0.1:8454", "repo": "clasper-core", "prompt_count": 5, "create_timeout_seconds": 10, "poll_timeout_seconds": 90, "poll_request_timeout_seconds": 3, "max_consecutive_poll_timeouts": 2, "max_suite_seconds": 420}
+{"event": "prompt_start", "prompt_index": 1, "prompt_total": 5, "prompt": "Add a lightweight /health endpoint and tests for it."}
+{"event": "prompt_created", "prompt_index": 1, "prompt_total": 5, "session_id": "22969268-0611-4b4d-97c6-547352e2fbb2", "create_elapsed_s": 0.004}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "22969268-0611-4b4d-97c6-547352e2fbb2", "attempt": 1, "latency_ms": 561.08, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "22969268-0611-4b4d-97c6-547352e2fbb2", "attempt": 2, "latency_ms": 7.32, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "22969268-0611-4b4d-97c6-547352e2fbb2", "attempt": 3, "latency_ms": 9.41, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "22969268-0611-4b4d-97c6-547352e2fbb2", "attempt": 4, "latency_ms": 6.6, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "22969268-0611-4b4d-97c6-547352e2fbb2", "attempt": 5, "latency_ms": 15.69, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "22969268-0611-4b4d-97c6-547352e2fbb2", "attempt": 6, "latency_ms": 10.69, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "22969268-0611-4b4d-97c6-547352e2fbb2", "attempt": 7, "latency_ms": 15.81, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "22969268-0611-4b4d-97c6-547352e2fbb2", "attempt": 8, "latency_ms": 5.11, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "22969268-0611-4b4d-97c6-547352e2fbb2", "attempt": 9, "latency_ms": 12.66, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "22969268-0611-4b4d-97c6-547352e2fbb2", "attempt": 10, "latency_ms": 10.31, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "22969268-0611-4b4d-97c6-547352e2fbb2", "attempt": 11, "latency_ms": 6.97, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "22969268-0611-4b4d-97c6-547352e2fbb2", "attempt": 12, "latency_ms": 13.92, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "22969268-0611-4b4d-97c6-547352e2fbb2", "attempt": 13, "latency_ms": 12.63, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "22969268-0611-4b4d-97c6-547352e2fbb2", "attempt": 14, "latency_ms": 7.1, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "22969268-0611-4b4d-97c6-547352e2fbb2", "attempt": 15, "latency_ms": 8.23, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "22969268-0611-4b4d-97c6-547352e2fbb2", "attempt": 16, "latency_ms": 14.24, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll", "prompt_index": 1, "session_id": "22969268-0611-4b4d-97c6-547352e2fbb2", "attempt": 17, "latency_ms": 15.1, "status": "drafting", "has_plan": false}
+{"event": "prompt_poll_timeout", "prompt_index": 1, "session_id": "22969268-0611-4b4d-97c6-547352e2fbb2", "attempt": 18, "elapsed_s": 20.81}
+{"event": "prompt_poll_timeout", "prompt_index": 1, "session_id": "22969268-0611-4b4d-97c6-547352e2fbb2", "attempt": 19, "elapsed_s": 24.817}
+{"event": "prompt_poll_unhealthy", "prompt_index": 1, "session_id": "22969268-0611-4b4d-97c6-547352e2fbb2", "consecutive_poll_timeouts": 2, "request_timeout_seconds": 3}
+{"event": "prompt_timeout", "prompt_index": 1, "session_id": "22969268-0611-4b4d-97c6-547352e2fbb2", "poll_timeout_seconds": 90, "status": "drafting", "poll_attempts": 19, "poll_timeouts": 2}
+{"event": "prompt_complete", "prompt_index": 1, "session_id": "22969268-0611-4b4d-97c6-547352e2fbb2", "time_to_plan_s": null, "timed_out": true, "fallback": false, "quality_score": 0.0, "poll_attempts": 19, "poll_timeouts": 2}
+{"event": "prompt_start", "prompt_index": 2, "prompt_total": 5, "prompt": "Add request ID propagation in server middleware and include it in structured logs, with tests."}
+{"event": "prompt_create_failed", "prompt_index": 2, "prompt_total": 5, "create_elapsed_s": 10.002, "error": "timeout: timed out"}
+{"event": "prompt_start", "prompt_index": 3, "prompt_total": 5, "prompt": "Add rate limiting for auth endpoints with config knobs and observability metrics."}
+{"event": "prompt_create_failed", "prompt_index": 3, "prompt_total": 5, "create_elapsed_s": 10.001, "error": "timeout: timed out"}
+{"event": "prompt_start", "prompt_index": 4, "prompt_total": 5, "prompt": "Refactor env/config loading to validate required vars at startup and fail fast with clear errors."}
+{"event": "prompt_create_failed", "prompt_index": 4, "prompt_total": 5, "create_elapsed_s": 10.002, "error": "timeout: timed out"}
+{"event": "prompt_start", "prompt_index": 5, "prompt_total": 5, "prompt": "Add a new admin-only diagnostics endpoint and ensure role checks plus negative-path tests."}
+{"event": "prompt_create_failed", "prompt_index": 5, "prompt_total": 5, "create_elapsed_s": 10.002, "error": "timeout: timed out"}
+{"event": "suite_complete", "executed_prompts": 5, "requested_prompts": 5, "elapsed_s": 64.838}

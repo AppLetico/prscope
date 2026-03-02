@@ -32,9 +32,9 @@ scoring:
   path_weight: 0.6
 
 # LLM configuration (RECOMMENDED for high-quality results)
-# Without LLM: rule-based only (more noise)
-# With LLM: semantic analysis + "already implemented" detection
-llm:
+# Without upstream_eval: rule-based only (more noise)
+# With upstream_eval: semantic analysis + "already implemented" detection
+upstream_eval:
   enabled: true      # Set to true and add OPENAI_API_KEY to .env
   model: gpt-4o
   temperature: 0.2
@@ -50,3 +50,5 @@ planning:
   convergence_threshold: 0.05
   output_dir: ./plans
   require_verified_file_references: false
+  discovery_tool_rounds: 25        # codebase tool calls during discovery (like Cursor plan mode)
+  author_tool_rounds: 25           # codebase tool calls during plan drafting/refinement

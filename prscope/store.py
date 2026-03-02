@@ -13,6 +13,7 @@ Schema:
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -25,8 +26,13 @@ from .config import get_prscope_dir
 
 
 DB_FILENAME = "prscope.db"
+CURRENT_SCHEMA_VERSION = 7
 
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS schema_version (
+    version INTEGER NOT NULL
+);
+
 -- Repo profile snapshots keyed by git HEAD SHA
 CREATE TABLE IF NOT EXISTS repo_profiles (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -110,6 +116,11 @@ CREATE TABLE IF NOT EXISTS planning_sessions (
     seed_type TEXT NOT NULL,
     seed_ref TEXT,
     current_round INTEGER NOT NULL DEFAULT 0,
+    session_total_cost_usd REAL,
+    max_prompt_tokens INTEGER,
+    confidence_trend REAL,
+    converged_early INTEGER,
+    clarifications_log_json TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -136,7 +147,47 @@ CREATE TABLE IF NOT EXISTS plan_versions (
     round INTEGER NOT NULL,
     plan_content TEXT NOT NULL,
     plan_sha TEXT NOT NULL,
+    diff_from_previous TEXT,
+    convergence_score REAL,
     created_at TEXT NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES planning_sessions(id)
+);
+
+-- Round-level planning metrics
+CREATE TABLE IF NOT EXISTS planning_round_metrics (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    round INTEGER NOT NULL,
+    timestamp TEXT NOT NULL,
+    author_prompt_tokens INTEGER,
+    author_completion_tokens INTEGER,
+    critic_prompt_tokens INTEGER,
+    critic_completion_tokens INTEGER,
+    max_prompt_tokens INTEGER,
+    major_issues INTEGER,
+    minor_issues INTEGER,
+    critic_confidence REAL,
+    vagueness_score REAL,
+    citation_count INTEGER,
+    constraint_violations_json TEXT,
+    resolved_since_last_round_json TEXT,
+    clarifications_this_round INTEGER,
+    call_cost_usd REAL,
+    issues_resolved INTEGER,
+    issues_introduced INTEGER,
+    net_improvement INTEGER,
+    time_to_first_tool_call INTEGER,
+    grounding_ratio REAL,
+    static_injection_tokens_pct REAL,
+    rejected_for_no_discovery INTEGER,
+    rejected_for_grounding INTEGER,
+    rejected_for_budget INTEGER,
+    average_read_depth_per_round REAL,
+    time_between_tool_calls REAL,
+    rejection_reasons_json TEXT,
+    plan_quality_score REAL,
+    unsupported_claims_count INTEGER,
+    missing_evidence_count INTEGER,
     FOREIGN KEY (session_id) REFERENCES planning_sessions(id)
 );
 
@@ -150,6 +201,7 @@ CREATE INDEX IF NOT EXISTS idx_turns_session_round ON planning_turns(session_id,
 CREATE INDEX IF NOT EXISTS idx_versions_session_round ON plan_versions(session_id, round);
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON planning_sessions(status);
 CREATE INDEX IF NOT EXISTS idx_sessions_repo ON planning_sessions(repo_name);
+CREATE INDEX IF NOT EXISTS idx_round_metrics_session_round ON planning_round_metrics(session_id, round);
 """
 
 
@@ -261,6 +313,23 @@ class PlanningSession:
     current_round: int
     created_at: str
     updated_at: str
+    session_total_cost_usd: float | None = None
+    max_prompt_tokens: int | None = None
+    confidence_trend: float | None = None
+    converged_early: int | None = None
+    clarifications_log_json: str | None = None
+
+    @property
+    def clarifications_log(self) -> list[dict[str, Any]]:
+        if not self.clarifications_log_json:
+            return []
+        try:
+            parsed = json.loads(self.clarifications_log_json)
+        except json.JSONDecodeError:
+            return []
+        if isinstance(parsed, list):
+            return [item for item in parsed if isinstance(item, dict)]
+        return []
 
 
 @dataclass
@@ -289,6 +358,57 @@ class PlanVersion:
     plan_content: str
     plan_sha: str
     created_at: str
+    diff_from_previous: str | None = None
+    convergence_score: float | None = None
+
+
+@dataclass
+class PlanningRoundMetrics:
+    id: int | None
+    session_id: str
+    round: int
+    timestamp: str
+    author_prompt_tokens: int | None = None
+    author_completion_tokens: int | None = None
+    critic_prompt_tokens: int | None = None
+    critic_completion_tokens: int | None = None
+    max_prompt_tokens: int | None = None
+    major_issues: int | None = None
+    minor_issues: int | None = None
+    critic_confidence: float | None = None
+    vagueness_score: float | None = None
+    citation_count: int | None = None
+    constraint_violations_json: str | None = None
+    resolved_since_last_round_json: str | None = None
+    clarifications_this_round: int | None = None
+    call_cost_usd: float | None = None
+    issues_resolved: int | None = None
+    issues_introduced: int | None = None
+    net_improvement: int | None = None
+    time_to_first_tool_call: int | None = None
+    grounding_ratio: float | None = None
+    static_injection_tokens_pct: float | None = None
+    rejected_for_no_discovery: int | None = None
+    rejected_for_grounding: int | None = None
+    rejected_for_budget: int | None = None
+    average_read_depth_per_round: float | None = None
+    time_between_tool_calls: float | None = None
+    rejection_reasons_json: str | None = None
+    plan_quality_score: float | None = None
+    unsupported_claims_count: int | None = None
+    missing_evidence_count: int | None = None
+
+    @property
+    def constraint_violations(self) -> list[str]:
+        if not self.constraint_violations_json:
+            return []
+        try:
+            parsed = json.loads(self.constraint_violations_json)
+        except json.JSONDecodeError:
+            return []
+        if isinstance(parsed, list):
+            return [str(item) for item in parsed]
+        return []
 
 
 class Store:
@@ -305,6 +425,126 @@ class Store:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            self._run_migrations(conn)
+
+    def _get_schema_version(self, conn: sqlite3.Connection) -> int:
+        row = conn.execute("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1").fetchone()
+        if row is None:
+            return 0
+        value = row[0]
+        return int(value) if value is not None else 0
+
+    def _set_schema_version(self, conn: sqlite3.Connection, version: int) -> None:
+        conn.execute("DELETE FROM schema_version")
+        conn.execute("INSERT INTO schema_version (version) VALUES (?)", (version,))
+
+    def _column_exists(self, conn: sqlite3.Connection, table: str, column: str) -> bool:
+        rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+        return any(str(row[1]) == column for row in rows)
+
+    def _run_migrations(self, conn: sqlite3.Connection) -> None:
+        current = self._get_schema_version(conn)
+        if current >= CURRENT_SCHEMA_VERSION:
+            return
+
+        # v1 -> v2: persist diff/convergence metadata on plan versions
+        if current < 2:
+            if not self._column_exists(conn, "plan_versions", "diff_from_previous"):
+                conn.execute("ALTER TABLE plan_versions ADD COLUMN diff_from_previous TEXT")
+            if not self._column_exists(conn, "plan_versions", "convergence_score"):
+                conn.execute("ALTER TABLE plan_versions ADD COLUMN convergence_score REAL")
+            current = 2
+
+        # v2 -> v3: session telemetry + round metrics
+        if current < 3:
+            if not self._column_exists(conn, "planning_sessions", "session_total_cost_usd"):
+                conn.execute("ALTER TABLE planning_sessions ADD COLUMN session_total_cost_usd REAL")
+            if not self._column_exists(conn, "planning_sessions", "max_prompt_tokens"):
+                conn.execute("ALTER TABLE planning_sessions ADD COLUMN max_prompt_tokens INTEGER")
+            if not self._column_exists(conn, "planning_sessions", "clarifications_log_json"):
+                conn.execute("ALTER TABLE planning_sessions ADD COLUMN clarifications_log_json TEXT")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS planning_round_metrics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL,
+                    round INTEGER NOT NULL,
+                    timestamp TEXT NOT NULL,
+                    author_prompt_tokens INTEGER,
+                    author_completion_tokens INTEGER,
+                    critic_prompt_tokens INTEGER,
+                    critic_completion_tokens INTEGER,
+                    max_prompt_tokens INTEGER,
+                    major_issues INTEGER,
+                    minor_issues INTEGER,
+                    critic_confidence REAL,
+                    vagueness_score REAL,
+                    citation_count INTEGER,
+                    constraint_violations_json TEXT,
+                    resolved_since_last_round_json TEXT,
+                    clarifications_this_round INTEGER,
+                    call_cost_usd REAL,
+                    issues_resolved INTEGER,
+                    issues_introduced INTEGER,
+                    net_improvement INTEGER,
+                    FOREIGN KEY (session_id) REFERENCES planning_sessions(id)
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_round_metrics_session_round "
+                "ON planning_round_metrics(session_id, round)"
+            )
+            current = 3
+
+        # v3 -> v4: confidence/convergence metadata on sessions
+        if current < 4:
+            if not self._column_exists(conn, "planning_sessions", "confidence_trend"):
+                conn.execute("ALTER TABLE planning_sessions ADD COLUMN confidence_trend REAL")
+            if not self._column_exists(conn, "planning_sessions", "converged_early"):
+                conn.execute("ALTER TABLE planning_sessions ADD COLUMN converged_early INTEGER")
+            current = 4
+
+        # v4 -> v5: additional harness metrics on round metrics
+        if current < 5:
+            additions = (
+                ("planning_round_metrics", "time_to_first_tool_call", "INTEGER"),
+                ("planning_round_metrics", "grounding_ratio", "REAL"),
+                ("planning_round_metrics", "static_injection_tokens_pct", "REAL"),
+                ("planning_round_metrics", "rejected_for_no_discovery", "INTEGER"),
+                ("planning_round_metrics", "rejected_for_grounding", "INTEGER"),
+                ("planning_round_metrics", "rejected_for_budget", "INTEGER"),
+            )
+            for table, column, sql_type in additions:
+                if not self._column_exists(conn, table, column):
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+            current = 5
+
+        # v5 -> v6: deeper exploration and rejection telemetry
+        if current < 6:
+            additions = (
+                ("planning_round_metrics", "average_read_depth_per_round", "REAL"),
+                ("planning_round_metrics", "time_between_tool_calls", "REAL"),
+                ("planning_round_metrics", "rejection_reasons_json", "TEXT"),
+            )
+            for table, column, sql_type in additions:
+                if not self._column_exists(conn, table, column):
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+            current = 6
+
+        # v6 -> v7: plan quality and evidence-gap metrics
+        if current < 7:
+            additions = (
+                ("planning_round_metrics", "plan_quality_score", "REAL"),
+                ("planning_round_metrics", "unsupported_claims_count", "INTEGER"),
+                ("planning_round_metrics", "missing_evidence_count", "INTEGER"),
+            )
+            for table, column, sql_type in additions:
+                if not self._column_exists(conn, table, column):
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+            current = 7
+
+        self._set_schema_version(conn, current)
     
     @contextmanager
     def _connect(self) -> Generator[sqlite3.Connection, None, None]:
@@ -320,6 +560,16 @@ class Store:
     def _now(self) -> str:
         """Get current timestamp in ISO format."""
         return datetime.utcnow().isoformat() + "Z"
+
+    def _repo_stats_path(self, repo_name: str) -> Path:
+        base = Path.home() / ".prscope" / "repos" / repo_name
+        base.mkdir(parents=True, exist_ok=True)
+        return base / "constraint_stats.json"
+
+    def _rounds_log_path(self, repo_name: str) -> Path:
+        base = Path.home() / ".prscope" / "repos" / repo_name
+        base.mkdir(parents=True, exist_ok=True)
+        return base / "rounds.jsonl"
     
     # =========================================================================
     # Repo Profiles
@@ -695,10 +945,28 @@ class Store:
                 """
                 INSERT INTO planning_sessions
                     (id, repo_name, title, requirements, status, seed_type, seed_ref,
-                     current_round, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     current_round, session_total_cost_usd, max_prompt_tokens, confidence_trend,
+                     converged_early,
+                     clarifications_log_json, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (sid, repo_name, title, requirements, status, seed_type, seed_ref, 0, now, now),
+                (
+                    sid,
+                    repo_name,
+                    title,
+                    requirements,
+                    status,
+                    seed_type,
+                    seed_ref,
+                    0,
+                    0.0,
+                    0,
+                    0.0,
+                    0,
+                    "[]",
+                    now,
+                    now,
+                ),
             )
             row = conn.execute(
                 "SELECT * FROM planning_sessions WHERE id = ?",
@@ -714,6 +982,45 @@ class Store:
                 (session_id,),
             ).fetchone()
             return PlanningSession(**dict(row)) if row else None
+
+    def delete_planning_session(self, session_id: str) -> bool:
+        """Delete a session and all its turns and plan versions. Returns True if found."""
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT id FROM planning_sessions WHERE id = ?", (session_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            conn.execute("DELETE FROM planning_turns WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM plan_versions WHERE session_id = ?", (session_id,))
+            conn.execute("DELETE FROM planning_sessions WHERE id = ?", (session_id,))
+            return True
+
+    def delete_all_planning_sessions(self, repo_name: str | None = None) -> int:
+        """Delete all sessions (optionally filtered by repo). Returns count deleted."""
+        with self._connect() as conn:
+            if repo_name:
+                ids = [
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT id FROM planning_sessions WHERE repo_name = ?", (repo_name,)
+                    ).fetchall()
+                ]
+            else:
+                ids = [
+                    row[0]
+                    for row in conn.execute("SELECT id FROM planning_sessions").fetchall()
+                ]
+            for sid in ids:
+                conn.execute("DELETE FROM planning_turns WHERE session_id = ?", (sid,))
+                conn.execute("DELETE FROM plan_versions WHERE session_id = ?", (sid,))
+            if repo_name:
+                conn.execute(
+                    "DELETE FROM planning_sessions WHERE repo_name = ?", (repo_name,)
+                )
+            else:
+                conn.execute("DELETE FROM planning_sessions")
+            return len(ids)
 
     def list_planning_sessions(
         self,
@@ -745,6 +1052,11 @@ class Store:
         requirements: str | None = None,
         current_round: int | None = None,
         seed_ref: str | None = None,
+        session_total_cost_usd: float | None = None,
+        max_prompt_tokens: int | None = None,
+        confidence_trend: float | None = None,
+        converged_early: int | None = None,
+        clarifications_log_json: str | None = None,
     ) -> PlanningSession:
         """Update mutable fields on a planning session."""
         updates: list[str] = []
@@ -761,6 +1073,21 @@ class Store:
         if seed_ref is not None:
             updates.append("seed_ref = ?")
             params.append(seed_ref)
+        if session_total_cost_usd is not None:
+            updates.append("session_total_cost_usd = ?")
+            params.append(session_total_cost_usd)
+        if max_prompt_tokens is not None:
+            updates.append("max_prompt_tokens = ?")
+            params.append(max_prompt_tokens)
+        if confidence_trend is not None:
+            updates.append("confidence_trend = ?")
+            params.append(confidence_trend)
+        if converged_early is not None:
+            updates.append("converged_early = ?")
+            params.append(converged_early)
+        if clarifications_log_json is not None:
+            updates.append("clarifications_log_json = ?")
+            params.append(clarifications_log_json)
 
         updates.append("updated_at = ?")
         params.append(self._now())
@@ -778,6 +1105,191 @@ class Store:
             if row is None:
                 raise ValueError(f"Planning session not found: {session_id}")
             return PlanningSession(**dict(row))
+
+    def add_round_metrics(
+        self,
+        *,
+        session_id: str,
+        repo_name: str | None = None,
+        round_number: int,
+        author_prompt_tokens: int | None,
+        author_completion_tokens: int | None,
+        critic_prompt_tokens: int | None,
+        critic_completion_tokens: int | None,
+        max_prompt_tokens: int | None,
+        major_issues: int | None,
+        minor_issues: int | None,
+        critic_confidence: float | None,
+        vagueness_score: float | None,
+        citation_count: int | None,
+        constraint_violations: list[str] | None,
+        resolved_since_last_round: list[str] | None,
+        clarifications_this_round: int | None,
+        call_cost_usd: float | None,
+        issues_resolved: int | None = None,
+        issues_introduced: int | None = None,
+        net_improvement: int | None = None,
+        model_costs: dict[str, float] | None = None,
+        time_to_first_tool_call: int | None = None,
+        grounding_ratio: float | None = None,
+        static_injection_tokens_pct: float | None = None,
+        rejected_for_no_discovery: int | None = None,
+        rejected_for_grounding: int | None = None,
+        rejected_for_budget: int | None = None,
+        average_read_depth_per_round: float | None = None,
+        time_between_tool_calls: float | None = None,
+        rejection_reasons: list[dict[str, str]] | None = None,
+        plan_quality_score: float | None = None,
+        unsupported_claims_count: int | None = None,
+        missing_evidence_count: int | None = None,
+    ) -> PlanningRoundMetrics:
+        stamp = self._now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO planning_round_metrics (
+                    session_id, round, timestamp,
+                    author_prompt_tokens, author_completion_tokens,
+                    critic_prompt_tokens, critic_completion_tokens,
+                    max_prompt_tokens, major_issues, minor_issues,
+                    critic_confidence, vagueness_score, citation_count,
+                    constraint_violations_json, resolved_since_last_round_json,
+                    clarifications_this_round, call_cost_usd,
+                    issues_resolved, issues_introduced, net_improvement,
+                    time_to_first_tool_call, grounding_ratio, static_injection_tokens_pct,
+                    rejected_for_no_discovery, rejected_for_grounding, rejected_for_budget,
+                    average_read_depth_per_round, time_between_tool_calls, rejection_reasons_json,
+                    plan_quality_score, unsupported_claims_count, missing_evidence_count
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    round_number,
+                    stamp,
+                    author_prompt_tokens,
+                    author_completion_tokens,
+                    critic_prompt_tokens,
+                    critic_completion_tokens,
+                    max_prompt_tokens,
+                    major_issues,
+                    minor_issues,
+                    critic_confidence,
+                    vagueness_score,
+                    citation_count,
+                    json.dumps(constraint_violations or []),
+                    json.dumps(resolved_since_last_round or []),
+                    clarifications_this_round,
+                    call_cost_usd,
+                    issues_resolved,
+                    issues_introduced,
+                    net_improvement,
+                    time_to_first_tool_call,
+                    grounding_ratio,
+                    static_injection_tokens_pct,
+                    rejected_for_no_discovery,
+                    rejected_for_grounding,
+                    rejected_for_budget,
+                    average_read_depth_per_round,
+                    time_between_tool_calls,
+                    json.dumps(rejection_reasons or []),
+                    plan_quality_score,
+                    unsupported_claims_count,
+                    missing_evidence_count,
+                ),
+            )
+            row = conn.execute(
+                "SELECT * FROM planning_round_metrics WHERE id = last_insert_rowid()"
+            ).fetchone()
+            metrics = PlanningRoundMetrics(**dict(row))
+        if repo_name:
+            # Atomic append for per-round analytics log.
+            log_path = self._rounds_log_path(repo_name)
+            line = json.dumps(
+                {
+                    "session_id": session_id,
+                    "round": round_number,
+                    "timestamp": stamp,
+                    "author_prompt_tokens": author_prompt_tokens,
+                    "author_completion_tokens": author_completion_tokens,
+                    "critic_prompt_tokens": critic_prompt_tokens,
+                    "critic_completion_tokens": critic_completion_tokens,
+                    "max_prompt_tokens": max_prompt_tokens,
+                    "major_issues": major_issues,
+                    "minor_issues": minor_issues,
+                    "critic_confidence": critic_confidence,
+                    "vagueness_score": vagueness_score,
+                    "citation_count": citation_count,
+                    "constraint_violations": constraint_violations or [],
+                    "resolved_since_last_round": resolved_since_last_round or [],
+                    "clarifications_this_round": clarifications_this_round,
+                    "call_cost_usd": call_cost_usd,
+                    "issues_resolved": issues_resolved,
+                    "issues_introduced": issues_introduced,
+                    "net_improvement": net_improvement,
+                    "model_costs": model_costs or {},
+                    "time_to_first_tool_call": time_to_first_tool_call,
+                    "grounding_ratio": grounding_ratio,
+                    "static_injection_tokens_pct": static_injection_tokens_pct,
+                    "rejected_for_no_discovery": rejected_for_no_discovery,
+                    "rejected_for_grounding": rejected_for_grounding,
+                    "rejected_for_budget": rejected_for_budget,
+                    "average_read_depth_per_round": average_read_depth_per_round,
+                    "time_between_tool_calls": time_between_tool_calls,
+                    "rejection_reasons": rejection_reasons or [],
+                    "plan_quality_score": plan_quality_score,
+                    "unsupported_claims_count": unsupported_claims_count,
+                    "missing_evidence_count": missing_evidence_count,
+                }
+            ) + "\n"
+            fd = os.open(log_path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644)
+            try:
+                os.write(fd, line.encode("utf-8"))
+            finally:
+                os.close(fd)
+        return metrics
+
+    def get_round_metrics(self, session_id: str) -> list[PlanningRoundMetrics]:
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM planning_round_metrics WHERE session_id = ? ORDER BY round ASC, id ASC",
+                (session_id,),
+            ).fetchall()
+            return [PlanningRoundMetrics(**dict(row)) for row in rows]
+
+    def update_constraint_stats(
+        self, repo_name: str, constraint_ids: list[str], session_id: str
+    ) -> None:
+        path = self._repo_stats_path(repo_name)
+        data: dict[str, Any] = {}
+        if path.exists():
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                data = {}
+        stamp = datetime.utcnow().strftime("%Y-%m-%d")
+        for cid in constraint_ids:
+            current = data.get(cid, {"violations": 0, "last_seen": stamp, "sessions": []})
+            current["violations"] = int(current.get("violations", 0)) + 1
+            current["last_seen"] = stamp
+            sessions = current.get("sessions", [])
+            if session_id not in sessions:
+                sessions.append(session_id)
+            current["sessions"] = sessions
+            data[cid] = current
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        tmp.replace(path)
+
+    def get_constraint_stats(self, repo_name: str) -> dict[str, Any]:
+        path = self._repo_stats_path(repo_name)
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {}
+        return data if isinstance(data, dict) else {}
 
     def add_planning_turn(
         self,
@@ -858,15 +1370,26 @@ class Store:
         round_number: int,
         plan_content: str,
         plan_sha: str,
+        diff_from_previous: str | None = None,
+        convergence_score: float | None = None,
     ) -> PlanVersion:
         """Persist a plan snapshot."""
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO plan_versions (session_id, round, plan_content, plan_sha, created_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO plan_versions
+                    (session_id, round, plan_content, plan_sha, diff_from_previous, convergence_score, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (session_id, round_number, plan_content, plan_sha, self._now()),
+                (
+                    session_id,
+                    round_number,
+                    plan_content,
+                    plan_sha,
+                    diff_from_previous,
+                    convergence_score,
+                    self._now(),
+                ),
             )
             row = conn.execute("SELECT * FROM plan_versions WHERE id = last_insert_rowid()").fetchone()
             return PlanVersion(**dict(row))

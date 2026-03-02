@@ -279,7 +279,7 @@ def run_llm_analysis(
     """
     from .llm import get_llm_client, LLMAnalysisResult
     
-    llm = get_llm_client(config.llm)
+    llm = get_llm_client(config.upstream_eval)
     if not llm.enabled:
         return LLMAnalysisResult.skip("LLM not enabled").to_dict()
     
@@ -415,7 +415,7 @@ def score_pr(
         similarity_results = []
     
     # Stage 3: LLM analysis (if enabled)
-    if run_llm and config.llm.enabled and local_profile:
+    if run_llm and config.upstream_eval.enabled and local_profile:
         llm_result = run_llm_analysis(
             pr=pr,
             files=files,
@@ -483,8 +483,8 @@ def evaluate_pr(
         config=config,
         local_profile=local_profile,
         local_repo_path=local_repo_path,
-        run_semantic=config.llm.enabled,  # Only run semantic if LLM enabled
-        run_llm=config.llm.enabled,
+        run_semantic=config.upstream_eval.enabled,
+        run_llm=config.upstream_eval.enabled,
     )
     
     # Save evaluation

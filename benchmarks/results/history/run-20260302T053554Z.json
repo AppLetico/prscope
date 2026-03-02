@@ -1,0 +1,52 @@
+{
+  "started_at": "2026-03-02T05:35:54.942889+00:00",
+  "base_url": "http://127.0.0.1:8454",
+  "repo": "clasper-core",
+  "mode": "health_check_only",
+  "config": {
+    "config_root": "~/workspace/clasper-core",
+    "config_path": "~/workspace/clasper-core/prscope.yml",
+    "found": true,
+    "scanner": "repomap",
+    "author_model": "gpt-5.3-codex",
+    "critic_model": "gpt-5.2"
+  },
+  "health": {
+    "ok": true,
+    "checks": [
+      {
+        "check": "list_sessions",
+        "ok": true,
+        "elapsed_s": 0.004
+      },
+      {
+        "check": "create_chat_session",
+        "ok": true,
+        "elapsed_s": 0.614,
+        "session_id": "872544f7-4b34-458a-ac95-1f25ffe8b8f6"
+      },
+      {
+        "check": "delete_chat_session",
+        "ok": true,
+        "detail": "deleted"
+      }
+    ]
+  },
+  "results": [],
+  "summary": {
+    "runs": 0,
+    "non_fallback_runs": 0,
+    "fallback_runs": 0,
+    "timed_out_runs": 0,
+    "error_runs": 0,
+    "avg_create_elapsed_s": null,
+    "avg_time_to_plan_s": null,
+    "max_time_to_plan_s": null,
+    "avg_quality_score": null,
+    "total_poll_timeouts": 0,
+    "avg_poll_latency_ms": null,
+    "slowest_prompt_index": null,
+    "slowest_prompt_time_to_plan_s": null
+  },
+  "log_file": "~/workspace/prscope/benchmarks/results/history/run-20260302T053554Z.log"
+}

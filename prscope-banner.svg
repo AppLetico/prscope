@@ -1,0 +1,23 @@
+<svg width="800" height="240" viewBox="0 0 800 240" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="800" height="240" rx="24" fill="#09090b"/>
+  <rect width="800" height="240" rx="24" fill="url(#paint0_linear)"/>
+  
+  <g transform="translate(140, 60) scale(0.234375)">
+    <rect width="512" height="512" rx="120" fill="#4F46E5"/>
+    <circle cx="236" cy="236" r="96" stroke="white" stroke-width="36"/>
+    <path d="M304 304L416 416" stroke="white" stroke-width="40" stroke-linecap="round"/>
+    <circle cx="236" cy="236" r="28" fill="white"/>
+    <path d="M236 236L140 140" stroke="white" stroke-width="32" stroke-linecap="round"/>
+    <circle cx="140" cy="140" r="28" fill="white"/>
+  </g>
+  
+  <text x="300" y="135" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="64" font-weight="bold" fill="#f4f4f5" letter-spacing="-0.02em">prscope</text>
+  <text x="305" y="175" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="20" font-weight="normal" fill="#a1a1aa" letter-spacing="0.01em">Interactive Planning for Engineering Teams</text>
+
+  <defs>
+    <linearGradient id="paint0_linear" x1="0" y1="0" x2="800" y2="240" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#4F46E5" stop-opacity="0.15"/>
+      <stop offset="1" stop-color="#09090b" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+</svg>

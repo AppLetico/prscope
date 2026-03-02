@@ -1,0 +1,7 @@
+[
+  "Add a lightweight /health endpoint and tests for it.",
+  "Add request ID propagation in server middleware and include it in structured logs, with tests.",
+  "Add rate limiting for auth endpoints with config knobs and observability metrics.",
+  "Refactor env/config loading to validate required vars at startup and fail fast with clear errors.",
+  "Add a new admin-only diagnostics endpoint and ensure role checks plus negative-path tests."
+]

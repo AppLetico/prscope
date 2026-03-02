@@ -31,8 +31,11 @@ dependencies = [
     "litellm>=1.0",
     "python-dotenv>=1.0",
     "numpy>=1.24",
-    "textual>=0.50",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "sse-starlette>=2.1",
     "rich>=13.0",
+    "loguru>=0.7.0",
 ]
 
 [project.optional-dependencies]
@@ -44,6 +47,7 @@ dev = [
 
 [project.scripts]
 prscope = "prscope.cli:main"
+prscope-benchmark = "prscope.benchmark:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["prscope"]

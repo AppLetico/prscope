@@ -50,13 +50,17 @@ class SyncConfig:
 
 
 @dataclass
-class LLMConfig:
-    """LLM configuration using LiteLLM."""
+class UpstreamEvalConfig:
+    """LLM configuration for upstream PR semantic scoring."""
 
     enabled: bool = False
     model: str = "gpt-4o"
     temperature: float = 0.3
     max_tokens: int = 2000
+
+
+# Backwards-compatible alias
+LLMConfig = UpstreamEvalConfig
 
 
 @dataclass
@@ -71,10 +75,22 @@ class PlanningConfig:
     scan_depth: int = 3
     memory_concurrency: int = 2
     discovery_max_turns: int = 5
+    discovery_tool_rounds: int = 25  # max codebase tool calls per discovery turn (like Cursor plan mode)
+    author_tool_rounds: int = 25     # max codebase tool calls per author draft/refinement round
     seed_token_budget: int = 4000
     require_verified_file_references: bool = False
     validate_temperature: float = 0.0
     validate_audit_log: bool = True
+    # Codebase scanner backend: "grep" (default, no deps) | "repomap" (aider tree-sitter) | "repomix" (repomix CLI)
+    scanner: str = "grep"
+    memory_block_max_chars: dict[str, int] = field(
+        default_factory=lambda: {
+            "architecture": 3000,
+            "modules": 2000,
+            "manifesto": 1500,
+        }
+    )
+    clarification_timeout_seconds: int = 600
 
 
 @dataclass
@@ -104,6 +120,7 @@ class RepoProfile:
     upstream: list[UpstreamRepo] = field(default_factory=list)
     manifesto_file: str | None = None
     output_dir: str | None = None
+    memory_block_max_chars: dict[str, int] | None = None
 
     @property
     def resolved_path(self) -> Path:
@@ -134,7 +151,7 @@ class PrscopeConfig:
     upstream: list[UpstreamRepo] = field(default_factory=list)
     sync: SyncConfig = field(default_factory=SyncConfig)
     scoring: ScoringConfig = field(default_factory=ScoringConfig)
-    llm: LLMConfig = field(default_factory=LLMConfig)
+    upstream_eval: UpstreamEvalConfig = field(default_factory=UpstreamEvalConfig)
     planning: PlanningConfig = field(default_factory=PlanningConfig)
     features: list[Feature] = field(default_factory=list)
     repo_root: Path | None = None
@@ -168,7 +185,12 @@ class PrscopeConfig:
     def resolve_repo(self, name: str | None = None, cwd: Path | None = None) -> RepoProfile:
         """Resolve active repo from explicit name or cwd."""
         if name:
-            return self.get_repo(name)
+            if name in self.repos:
+                return self.repos[name]
+            fallback = self._fallback_repo()
+            if fallback and name in {fallback.name, fallback.path, str(fallback.resolved_path)}:
+                return fallback
+            raise ValueError(f"Repo '{name}' not found. Run: prscope repos list")
 
         if cwd is None:
             cwd = get_repo_root()
@@ -259,15 +281,22 @@ class PrscopeConfig:
             eval_batch_size=sync_data.get("eval_batch_size", 25),
         )
 
-        llm_data = data.get("llm", {})
-        config.llm = LLMConfig(
-            enabled=llm_data.get("enabled", False),
-            model=llm_data.get("model", "gpt-4o"),
-            temperature=llm_data.get("temperature", 0.3),
-            max_tokens=llm_data.get("max_tokens", 2000),
+        # Accept both "upstream_eval:" (new) and "llm:" (backwards compat)
+        upstream_eval_data = data.get("upstream_eval") or data.get("llm") or {}
+        config.upstream_eval = UpstreamEvalConfig(
+            enabled=upstream_eval_data.get("enabled", False),
+            model=upstream_eval_data.get("model", "gpt-4o"),
+            temperature=upstream_eval_data.get("temperature", 0.3),
+            max_tokens=upstream_eval_data.get("max_tokens", 2000),
         )
 
         planning_data = data.get("planning", {})
+        memory_caps_raw = planning_data.get("memory_block_max_chars", {})
+        memory_caps = {
+            "architecture": int(memory_caps_raw.get("architecture", 3000)),
+            "modules": int(memory_caps_raw.get("modules", 2000)),
+            "manifesto": int(memory_caps_raw.get("manifesto", 1500)),
+        }
         config.planning = PlanningConfig(
             author_model=planning_data.get("author_model", "gpt-4o"),
             critic_model=planning_data.get("critic_model", "claude-3-5-sonnet-20241022"),
@@ -284,6 +313,13 @@ class PrscopeConfig:
             ),
             validate_temperature=planning_data.get("validate_temperature", 0.0),
             validate_audit_log=planning_data.get("validate_audit_log", True),
+            discovery_tool_rounds=planning_data.get("discovery_tool_rounds", 25),
+            author_tool_rounds=planning_data.get("author_tool_rounds", 25),
+            scanner=planning_data.get("scanner", "grep"),
+            memory_block_max_chars=memory_caps,
+            clarification_timeout_seconds=int(
+                planning_data.get("clarification_timeout_seconds", 600)
+            ),
         )
 
         repos_data = data.get("repos", {})
@@ -302,6 +338,23 @@ class PrscopeConfig:
                     upstream=cls._parse_upstream_repos(repo_data.get("upstream", [])),
                     manifesto_file=repo_data.get("manifesto_file"),
                     output_dir=repo_data.get("output_dir"),
+                    memory_block_max_chars={
+                        "architecture": int(
+                            repo_data.get("memory_block_max_chars", {}).get(
+                                "architecture", memory_caps["architecture"]
+                            )
+                        ),
+                        "modules": int(
+                            repo_data.get("memory_block_max_chars", {}).get(
+                                "modules", memory_caps["modules"]
+                            )
+                        ),
+                        "manifesto": int(
+                            repo_data.get("memory_block_max_chars", {}).get(
+                                "manifesto", memory_caps["manifesto"]
+                            )
+                        ),
+                    },
                 )
                 config.repos[name] = profile
 

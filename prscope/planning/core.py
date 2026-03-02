@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import re
 from dataclasses import dataclass
+import difflib
 from difflib import SequenceMatcher
 
 from ..config import PlanningConfig
@@ -35,13 +36,20 @@ class ApprovalBlockedError(RuntimeError):
     """Raised when approval is blocked by strict verified-reference mode."""
 
 
+class InvalidTransitionError(RuntimeError):
+    """Raised when a state transition is not allowed."""
+
+
 class PlanningCore:
     """Deterministic planning state and convergence logic."""
 
     ALLOWED_TRANSITIONS: dict[str, set[str]] = {
-        "discovery": {"drafting"},
-        "drafting": {"refining", "approved"},
-        "refining": {"approved"},
+        "created": {"discovering"},
+        "discovering": {"drafting"},
+        "discovery": {"drafting"},  # backward-compatible persisted value
+        "drafting": {"refining"},
+        "refining": {"refining", "converged"},
+        "converged": {"approved", "refining"},
         "approved": {"exported"},
         "exported": set(),
     }
@@ -63,11 +71,24 @@ class PlanningCore:
 
     def save_plan_version(self, content: str, round_number: int) -> PlanVersion:
         plan_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        previous = self.store.get_plan_version(self.session_id, max(round_number - 1, 0))
+        diff_from_previous: str | None = None
+        if previous is not None:
+            diff_from_previous = "\n".join(
+                difflib.unified_diff(
+                    previous.plan_content.splitlines(),
+                    content.splitlines(),
+                    fromfile=f"round-{previous.round}",
+                    tofile=f"round-{round_number}",
+                    lineterm="",
+                )
+            )
         version = self.store.save_plan_version(
             session_id=self.session_id,
             round_number=round_number,
             plan_content=content,
             plan_sha=plan_sha,
+            diff_from_previous=diff_from_previous,
         )
         self.store.update_planning_session(self.session_id, current_round=round_number)
         return version
@@ -106,7 +127,7 @@ class PlanningCore:
         session = self.get_session()
         allowed = self.ALLOWED_TRANSITIONS.get(session.status, set())
         if new_status not in allowed and new_status != session.status:
-            raise ValueError(f"Invalid transition {session.status} -> {new_status}")
+            raise InvalidTransitionError(f"Invalid transition {session.status} -> {new_status}")
         self.store.update_planning_session(self.session_id, status=new_status)
 
     def approve(self, unverified_references: set[str] | None = None) -> None:
@@ -117,8 +138,8 @@ class PlanningCore:
                 "Read them first or disable require_verified_file_references."
             )
         session = self.get_session()
-        if session.status not in {"drafting", "refining", "approved"}:
-            raise ValueError(f"Cannot approve from status: {session.status}")
+        if session.status not in {"converged", "approved"}:
+            raise InvalidTransitionError(f"Cannot approve from status: {session.status}")
         self.store.update_planning_session(self.session_id, status="approved")
 
     def mark_exported(self) -> None:

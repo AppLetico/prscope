@@ -1,0 +1,4 @@
+{"event": "suite_start", "started_at": "2026-03-02T05:35:54.942889+00:00", "base_url": "http://127.0.0.1:8454", "repo": "clasper-core", "prompt_count": 5, "create_timeout_seconds": 15, "poll_timeout_seconds": 60, "poll_request_timeout_seconds": 5, "max_consecutive_poll_timeouts": 3, "max_consecutive_create_failures": 1, "stop_on_first_problem": true, "health_check_only": true, "max_suite_seconds": 900}
+{"event": "health_check", "check": "list_sessions", "ok": true}
+{"event": "health_check", "check": "create_chat_session", "ok": true, "elapsed_s": 0.614, "session_id": "872544f7-4b34-458a-ac95-1f25ffe8b8f6"}
+{"event": "health_check", "check": "delete_chat_session", "ok": true, "detail": "deleted", "session_id": "872544f7-4b34-458a-ac95-1f25ffe8b8f6"}

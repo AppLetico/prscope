@@ -1,10 +1,8 @@
 # Prscope
 
 <p align="center">
-  <img src="prscope-banner.png" alt="Prscope" width="720" />
+  <img src="prscope-banner.svg" alt="Prscope" width="800" />
 </p>
-
-<h2 align="center">Interactive Planning for Engineering Teams</h2>
 
 <p align="center">
   <b>PLAN. REFINE. SHIP.</b>
@@ -18,6 +16,12 @@
   <img src="https://img.shields.io/badge/python-3.9+-blue.svg" alt="Python">
   <img src="https://img.shields.io/badge/status-Alpha-yellow.svg" alt="Status">
 </p>
+
+---
+
+## Contributing
+
+See `CONTRIBUTING.md` for development workflow, performance benchmark requirements, and PR checklist.
 
 ---
 
@@ -365,6 +369,9 @@ make run
 
 # Start discovery-mode planning
 make plan-chat
+
+# Run repeatable planning benchmark suite
+prscope-benchmark --base-url http://127.0.0.1:8443 --repo my-repo --config-root /path/to/repo
 ```
 
 ---

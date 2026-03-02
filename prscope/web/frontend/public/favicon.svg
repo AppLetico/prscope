@@ -1,0 +1,13 @@
+<svg width="512" height="512" viewBox="0 0 512 512" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <rect width="512" height="512" rx="120" fill="#4F46E5"/>
+  <!-- Magnifying Glass Circle -->
+  <circle cx="236" cy="236" r="96" stroke="white" stroke-width="36"/>
+  <!-- Handle -->
+  <path d="M304 304L416 416" stroke="white" stroke-width="40" stroke-linecap="round"/>
+  <!-- Center Node -->
+  <circle cx="236" cy="236" r="28" fill="white"/>
+  <!-- Branch Line -->
+  <path d="M236 236L140 140" stroke="white" stroke-width="32" stroke-linecap="round"/>
+  <!-- Branch Node -->
+  <circle cx="140" cy="140" r="28" fill="white"/>
+</svg>
