@@ -467,15 +467,20 @@ class AuthorAgent:
         *,
         allow_tools: bool = True,
         max_output_tokens: int | None = None,
+        model_override: str | None = None,
     ):
         import litellm
 
         litellm.drop_params = True  # gpt-5 models don't support all params (e.g. temperature)
+        # Prevent verbose LiteLLM debug logging from blocking runtime under load.
+        if hasattr(litellm, "set_verbose"):
+            litellm.set_verbose = False
         return await self._safe_completion_call(
             litellm=litellm,
             messages=messages,
             allow_tools=allow_tools,
             max_output_tokens=max_output_tokens,
+            model_override=model_override,
         )
 
     @staticmethod
@@ -595,13 +600,15 @@ class AuthorAgent:
         messages: list[dict[str, Any]],
         allow_tools: bool,
         max_output_tokens: int | None,
+        model_override: str | None,
     ) -> tuple[Any, str]:
         """Call completion with fallback for non-chat model misconfiguration."""
         fallback_model = "gpt-4o"
-        per_call_timeout_seconds = 20
+        per_call_timeout_seconds = max(5, int(self.config.author_call_timeout_seconds))
         output_cap = max(512, min(4000, int(max_output_tokens or 4000)))
-        models_to_try = [self.config.author_model]
-        if fallback_model != self.config.author_model:
+        primary_model = model_override or self.config.author_model
+        models_to_try = [primary_model]
+        if fallback_model != primary_model:
             models_to_try.append(fallback_model)
 
         last_error: Exception | None = None
@@ -619,10 +626,12 @@ class AuthorAgent:
                     if allow_tools:
                         responses_kwargs["tools"] = self._responses_tools()
                         responses_kwargs["tool_choice"] = "auto"
+                    llm_started = asyncio.get_running_loop().time()
                     response = await asyncio.wait_for(
                         asyncio.to_thread(client.responses.create, **responses_kwargs),
                         timeout=per_call_timeout_seconds,
                     )
+                    llm_elapsed_ms = (asyncio.get_running_loop().time() - llm_started) * 1000.0
                     text = self._extract_responses_text(response)
                     tool_calls = self._extract_responses_tool_calls(response)
                     chat_like = _ChatLikeResponse(
@@ -660,6 +669,13 @@ class AuthorAgent:
                             "prompt_tokens": telemetry.usage.prompt_tokens,
                             "completion_tokens": telemetry.usage.completion_tokens,
                             "call_cost_usd": telemetry.cost.total_cost_usd,
+                            "llm_call_latency_ms": round(llm_elapsed_ms, 2),
+                            "context_window_tokens": context_window,
+                            "context_usage_ratio": (
+                                round(float(telemetry.usage.prompt_tokens) / float(context_window), 4)
+                                if context_window and context_window > 0
+                                else None
+                            ),
                         }
                     )
                     if context_window and telemetry.usage.prompt_tokens > int(context_window * 0.75):
@@ -681,10 +697,12 @@ class AuthorAgent:
                 if allow_tools:
                     completion_kwargs["tools"] = CODEBASE_TOOLS
                     completion_kwargs["tool_choice"] = "auto"
+                llm_started = asyncio.get_running_loop().time()
                 response = await asyncio.wait_for(
                     asyncio.to_thread(litellm.completion, **completion_kwargs),
                     timeout=per_call_timeout_seconds,
                 )
+                llm_elapsed_ms = (asyncio.get_running_loop().time() - llm_started) * 1000.0
                 telemetry = completion_telemetry(response, model=model)
                 context_window = MODEL_CONTEXT_WINDOWS.get(model)
                 if model not in MODEL_CONTEXT_WINDOWS:
@@ -709,6 +727,13 @@ class AuthorAgent:
                         "prompt_tokens": telemetry.usage.prompt_tokens,
                         "completion_tokens": telemetry.usage.completion_tokens,
                         "call_cost_usd": telemetry.cost.total_cost_usd,
+                        "llm_call_latency_ms": round(llm_elapsed_ms, 2),
+                        "context_window_tokens": context_window,
+                        "context_usage_ratio": (
+                            round(float(telemetry.usage.prompt_tokens) / float(context_window), 4)
+                            if context_window and context_window > 0
+                            else None
+                        ),
                     }
                 )
                 if context_window and telemetry.usage.prompt_tokens > int(context_window * 0.75):
@@ -770,6 +795,7 @@ class AuthorAgent:
         require_clarification_first: bool = False,
         max_output_tokens: int | None = None,
         quick_start_mode: bool = False,
+        model_override: str | None = None,
     ) -> AuthorResult:
         if max_attempts is None:
             max_attempts = self.config.author_tool_rounds
@@ -842,6 +868,7 @@ class AuthorAgent:
                     conversation,
                     allow_tools=allow_tools,
                     max_output_tokens=max_output_tokens,
+                    model_override=model_override,
                 )
                 message = response.choices[0].message
                 content = str(getattr(message, "content", None) or "")
@@ -930,11 +957,15 @@ class AuthorAgent:
                             parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else {}
                         except json.JSONDecodeError:
                             parsed_args = {}
+                        path_hint = parsed_args.get("path") or parsed_args.get("relative_path")
+                        query_hint = parsed_args.get("query") or parsed_args.get("pattern")
                         await self._emit(
                             {
                                 "type": "tool_call",
                                 "name": tool_name,
                                 "session_stage": "author",
+                                "path": str(path_hint) if isinstance(path_hint, str) else None,
+                                "query": str(query_hint) if isinstance(query_hint, str) else None,
                             }
                         )
                         if tool_name == "ask_clarification":
@@ -948,6 +979,7 @@ class AuthorAgent:
                                 }
                             )
                         try:
+                            tool_started = asyncio.get_running_loop().time()
                             if tool_name == "ask_clarification" and self.clarification_handler is not None:
                                 answers = await self.clarification_handler(
                                     str(parsed_args.get("question", "")),
@@ -964,13 +996,27 @@ class AuthorAgent:
                                     },
                                 }
                             else:
-                                result = self.tool_executor.execute(tc)
+                                # Tool execution can include filesystem/subprocess work.
+                                # Run it off the event loop so API polling stays responsive.
+                                result = await asyncio.to_thread(self.tool_executor.execute, tc)
+                            tool_elapsed_ms = (
+                                asyncio.get_running_loop().time() - tool_started
+                            ) * 1000.0
                         except Exception as exc:  # noqa: BLE001
                             result = {
                                 "tool_call_id": getattr(tc, "id", ""),
                                 "name": getattr(getattr(tc, "function", None), "name", ""),
                                 "result": {"error": str(exc)},
                             }
+                            tool_elapsed_ms = 0.0
+                        await self._emit(
+                            {
+                                "type": "tool_result",
+                                "name": tool_name,
+                                "session_stage": "author",
+                                "duration_ms": round(tool_elapsed_ms, 2),
+                            }
+                        )
                         conversation.append(
                             {
                                 "role": "tool",
@@ -1049,6 +1095,7 @@ class AuthorAgent:
                             conversation,
                             allow_tools=False,
                             max_output_tokens=max_output_tokens,
+                            model_override=model_override,
                         )
                         retry_message = retry_response.choices[0].message
                         retry_content = str(getattr(retry_message, "content", None) or "").strip()
@@ -1239,7 +1286,7 @@ class AuthorAgent:
             )
             await self._emit(
                 {
-                    "type": "error",
+                    "type": "warning",
                     "message": f"Author fallback used: {exc}",
                 }
             )

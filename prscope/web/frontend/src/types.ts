@@ -13,6 +13,8 @@ export interface PlanningSession {
   repo_name: string;
   title: string;
   requirements: string;
+  author_model?: string | null;
+  critic_model?: string | null;
   status: SessionStatus;
   seed_type: string;
   seed_ref: string | null;
@@ -70,9 +72,46 @@ export interface ClarificationPrompt {
   source?: string;
 }
 
+export interface ToolCallEntry {
+  id: number;
+  name: string;
+  sessionStage?: string;
+  path?: string;
+  query?: string;
+  status: "running" | "done";
+  durationMs?: number;
+}
+
+export interface ModelCatalogItem {
+  provider: string;
+  model_id: string;
+  available: boolean;
+  unavailable_reason?: string | null;
+  required_env_keys: string[];
+  context_window_tokens?: number | null;
+}
+
 export type UIEvent =
   | { type: "thinking"; message: string }
-  | { type: "tool_call"; name: string; path?: string; session_stage?: string }
+  | {
+      type: "tool_call";
+      name: string;
+      path?: string;
+      query?: string;
+      session_stage?: string;
+    }
+  | {
+      type: "tool_result";
+      name: string;
+      session_stage?: string;
+      duration_ms?: number;
+    }
+  | {
+      type: "context_compaction";
+      enabled: boolean;
+      reason?: string;
+    }
+  | { type: "plan_ready"; round?: number; saved_at_unix_s?: number }
   | { type: "complete"; message?: string }
   | { type: "error"; message: string }
   | { type: "warning"; message: string }
@@ -84,5 +123,7 @@ export type UIEvent =
       call_cost_usd: number;
       session_total_usd?: number;
       max_prompt_tokens?: number;
+      context_window_tokens?: number;
+      context_usage_ratio?: number;
     }
   | { type: "clarification_needed"; question: string; context?: string; source?: string };

@@ -2,7 +2,7 @@
 # Planning-first workflow with upstream PR inputs
 
 # Local repository to profile and compare against upstream PRs
-local_repo: ~/workspace/clasper
+local_repo: ~/workspace/prscope
 
 # Project context (optional - README is used automatically if not provided)
 # project:
@@ -44,8 +44,7 @@ upstream_eval:
 # Both models can be any LiteLLM-supported model — same provider or different.
 # Only set ANTHROPIC_API_KEY if you use a Claude model here.
 planning:
-  author_model: gpt-4o
-  critic_model: gpt-4o-mini        # or claude-3-5-sonnet-20241022, gemini-1.5-pro, etc.
+  author_call_timeout_seconds: 50
   max_adversarial_rounds: 10
   convergence_threshold: 0.05
   output_dir: ./plans

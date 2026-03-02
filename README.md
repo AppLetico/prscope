@@ -1,23 +1,13 @@
 # Prscope
 
-<p align="center">
-  <img src="prscope-banner.svg" alt="Prscope" width="800" />
-</p>
 
-<p align="center">
-  <b>PLAN. REFINE. SHIP.</b>
-  <br />
-  <i>An adversarial Author/Critic planning engine that turns requirements — or an upstream PR — into high-quality PRD and RFC documents, grounded in your actual codebase.</i>
-</p>
 
-<p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
-  <img src="https://img.shields.io/badge/version-0.1.0-blue.svg" alt="Version">
-  <img src="https://img.shields.io/badge/python-3.9+-blue.svg" alt="Python">
-  <img src="https://img.shields.io/badge/status-Alpha-yellow.svg" alt="Status">
-</p>
+**PLAN. REFINE. SHIP.**  
+*A planning engine that turns requirements (or upstream PR context) into grounded PRD/RFC outputs for real codebases.*
 
----
+
+
+h
 
 ## Contributing
 
@@ -25,16 +15,34 @@ See `CONTRIBUTING.md` for development workflow, performance benchmark requiremen
 
 ---
 
+## Table of Contents
+
+- [What Prscope Does](#what-prscope-does)
+- [Install](#install)
+- [Quickstart](#quickstart)
+- [Three Ways to Start a Plan](#three-ways-to-start-a-plan)
+- [Web UI Workflow](#web-ui-workflow)
+- [Planning Features](#planning-features)
+- [Full Configuration Reference](#full-configuration-reference)
+- [Manifesto Constraints](#manifesto-constraints)
+- [CLI Reference](#cli-reference)
+- [Environment Variables](#environment-variables)
+- [Project Structure](#project-structure)
+- [Benchmark Harness](#benchmark-harness)
+- [Development](#development)
+
+---
+
 ## What Prscope Does
 
-Prscope is a local-first CLI planning tool. You give it requirements (or seed it from an upstream GitHub PR), and it:
+Prscope is a local-first planning system with a CLI + web UI workflow. You give it requirements (or seed it from an upstream GitHub PR), and it:
 
 1. Scans your codebase into structured memory blocks
-2. Opens a terminal TUI where an **Author LLM** drafts the plan
+2. Starts a planning session in the web UI where an **Author LLM** drafts the plan
 3. Runs up to 10 adversarial **Author ↔ Critic** refinement rounds
 4. Exports a final `PRD.md` and `RFC.md` grounded in your actual file paths and constraints
 
-Upstream PR tracking (`sync` / `evaluate`) feeds directly into this planning flow — instead of generating standalone PRDs, relevant PRs become high-signal inputs to planning sessions.
+Upstream PR tracking (`prscope upstream sync` / `prscope upstream evaluate`) feeds directly into this planning flow — instead of generating standalone PRDs, relevant PRs become high-signal inputs to planning sessions.
 
 ---
 
@@ -59,7 +67,7 @@ pip install prscope
 ### 1. Set up environment
 
 ```bash
-cp env.sample .env
+cp env.example .env
 ```
 
 Edit `.env` with your keys:
@@ -121,11 +129,13 @@ Skip this entirely if you don't need governance — it's optional. Edit it later
 # Scan your codebase into structured memory blocks
 prscope profile
 
-# Start an interactive planning session
+# Start an interactive planning session (opens browser UI)
 prscope plan chat
 ```
 
-The TUI opens. The Author LLM asks you clarifying questions, drafts a plan, and you can trigger Critic rounds (`Ctrl+K`) to refine it.
+The web UI opens. The Author LLM asks clarifying questions, drafts a plan, and supports iterative Critic refinement rounds.
+
+> `prscope plan ...` auto-starts the local web server when needed. If you prefer managing it explicitly, run `prscope web` first.
 
 ---
 
@@ -158,32 +168,46 @@ The Author LLM interviews you to define scope before drafting anything.
 
 ---
 
-## TUI Keybindings
+## Web UI Workflow
 
-| Key | Action |
-|-----|--------|
-| `Ctrl+K` | Trigger adversarial Critic round |
-| `Ctrl+D` | Toggle diff view (current vs previous round) |
-| `Ctrl+A` | Approve plan |
-| `Ctrl+E` | Export PRD + RFC |
-| `Ctrl+Q` | Quit (session is saved) |
+```bash
+# Start API + web UI
+prscope web
 
-Status bar format: `[repo: my-repo]  Round: 2/10  REFINING  Δ12%  [Seeded: PR #42]`
+# Start a planning session from requirements
+prscope plan start "Add rate limiting for auth endpoints"
+
+# Resume an existing session in browser UI
+prscope plan resume <session-id>
+```
+
+You can also pass `--no-open` to `plan start` / `plan chat` if you do not want the browser opened automatically.
+For background operation, run `prscope web --background`.
+
+### Model Selection (UI + API)
+
+- The New Session screen includes `Author model` and `Critic model` selectors.
+- The Planning view header keeps these selectors available per interaction, so you can switch model pairs before sending a message or running a critique round.
+- Model availability is key-aware (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`/`GEMINI_API_KEY`) and exposed from `GET /api/models`.
+- The backend validates every selected model at request time; if a model becomes unavailable, the request fails with a clear validation error so the UI can prompt reselection.
+- Last selected model pair is persisted per repo in browser local storage for convenience.
 
 ---
 
 ## Planning Features
 
-| Feature | Description |
-|---------|-------------|
-| **Structured codebase memory** | Auto-generates `architecture.md`, `modules.md`, `patterns.md`, `entrypoints.md` per repo |
-| **Manifesto constraints** | Hard/soft constraints in `.prscope/manifesto.md` enforced by the Critic |
-| **Convergence detection** | Multi-signal: hash equality, diff ratio, structural regression, critic `major_issues_remaining` |
-| **Tool-use enforcement** | Author must verify file paths in the repo before finalizing; accessed paths tracked |
-| **Diff view** | See exactly what the Critic forced to change each round |
-| **CI validation** | `prscope plan validate <session-id>` exits non-zero on constraint violations |
-| **Drift detection** | `prscope plan status` compares planned vs merged files post-implementation |
-| **Multi-repo support** | Named repo profiles each with isolated memory, manifesto, and output dir |
+
+| Feature                        | Description                                                                                     |
+| ------------------------------ | ----------------------------------------------------------------------------------------------- |
+| **Structured codebase memory** | Auto-generates `architecture.md`, `modules.md`, `patterns.md`, `entrypoints.md` per repo        |
+| **Manifesto constraints**      | Hard/soft constraints in `.prscope/manifesto.md` enforced by the Critic                         |
+| **Convergence detection**      | Multi-signal: hash equality, diff ratio, structural regression, critic `major_issues_remaining` |
+| **Tool-use enforcement**       | Author must verify file paths in the repo before finalizing; accessed paths tracked             |
+| **Diff view**                  | See exactly what the Critic forced to change each round                                         |
+| **CI validation**              | `prscope plan validate <session-id>` exits non-zero on constraint violations                    |
+| **Drift detection**            | `prscope plan status` compares planned vs merged files post-implementation                      |
+| **Multi-repo support**         | Named repo profiles each with isolated memory, manifesto, and output dir                        |
+
 
 ---
 
@@ -246,6 +270,7 @@ planning:
 `.prscope/manifesto.md` is created by `prscope init` and is optional. Add a `constraints:` YAML block to define architecture rules the Critic enforces every round. See the [Quickstart](#4-optional-define-your-architecture-constraints) for the format.
 
 Severity levels:
+
 - `hard` — blocks `prscope plan approve` and fails `prscope plan validate` (CI)
 - `soft` — Critic flags but does not block
 - `optional: true` — Critic notes in passing, never a violation
@@ -259,8 +284,12 @@ Edit at any time with `prscope plan manifesto --edit`.
 ### Core
 
 ```
-prscope init            Initialize Prscope in current repo
-prscope profile         Scan and profile local codebase
+prscope init                              Initialize Prscope in current repo
+prscope profile                           Scan and profile local codebase
+prscope web [--background]                Run web UI server
+prscope repos list                        Show configured repo profiles and memory age
+prscope scanners list                     Show scanner backends and status
+prscope analytics [--repo <name>]         Show planning analytics and quality trends
 ```
 
 ### Planning
@@ -269,7 +298,7 @@ prscope profile         Scan and profile local codebase
 prscope plan chat                                  Start chat-first discovery
 prscope plan start "requirements"                  Start from text requirements
 prscope plan start --from-pr owner/repo 42         Seed from upstream PR
-prscope plan resume <session-id>                   Resume in TUI
+prscope plan resume <session-id>                   Resume in browser UI
 prscope plan list [--repo <name>]                  List sessions
 prscope plan diff <session-id> [--round N]         Unified diff to stdout
 prscope plan export <session-id>                   Write PRD.md + RFC.md
@@ -279,19 +308,13 @@ prscope plan memory [--rebuild]                    Build/show memory blocks
 prscope plan manifesto [--edit]                    Create/open manifesto
 ```
 
-### Repos
-
-```
-prscope repos list      Show configured repo profiles and memory age
-```
-
 ### Upstream (PR intelligence input)
 
 ```
-prscope upstream sync                      Fetch upstream PRs
-prscope upstream evaluate [--batch N]      Score PRs for planning relevance
-prscope upstream digest                    Show top relevant PRs
-prscope upstream history [--decision ...]  View evaluation history
+prscope upstream sync                               Fetch upstream PRs
+prscope upstream evaluate [--batch N]               Score PRs for planning relevance
+prscope upstream digest                             Show top relevant PRs
+prscope upstream history [--decision ...]           View evaluation history
 ```
 
 > Legacy top-level commands (`prscope sync`, `prscope evaluate`, etc.) still work but will print a deprecation notice pointing to `prscope upstream ...`.
@@ -300,12 +323,14 @@ prscope upstream history [--decision ...]  View evaluation history
 
 ## Environment Variables
 
-| Variable | Required | Purpose |
-|----------|----------|---------|
-| `GITHUB_TOKEN` | For upstream sync | GitHub personal access token |
-| `OPENAI_API_KEY` | If using OpenAI models | `gpt-4o`, `o1`, etc. |
-| `ANTHROPIC_API_KEY` | Optional — only if using a Claude model | `claude-3-5-sonnet`, etc. |
-| `GOOGLE_API_KEY` | If using Google models | `gemini-pro`, etc. |
+
+| Variable            | Required                                | Purpose                      |
+| ------------------- | --------------------------------------- | ---------------------------- |
+| `GITHUB_TOKEN`      | For upstream sync                       | GitHub personal access token |
+| `OPENAI_API_KEY`    | If using OpenAI models                  | `gpt-4o`, `o1`, etc.         |
+| `ANTHROPIC_API_KEY` | Optional — only if using a Claude model | `claude-3-5-sonnet`, etc.    |
+| `GOOGLE_API_KEY`    | If using Google models                  | `gemini-pro`, etc.           |
+
 
 Prscope uses [LiteLLM](https://docs.litellm.ai/docs/providers) — any provider it supports works as `author_model` or `critic_model`. Ollama local models need no API key.
 
@@ -322,8 +347,12 @@ prscope/
 ├── profile.py                  # Local repo file tree profiling
 ├── scoring.py                  # Upstream PR relevance scoring
 ├── github.py                   # GitHub REST client
-├── tui.py                      # Textual TUI (PlanningTUI)
 ├── planner.py                  # PlanningEngine shim
+├── web/
+│   ├── api.py                  # FastAPI endpoints for planning sessions
+│   ├── server.py               # Web server bootstrap + lifecycle
+│   ├── frontend/               # Vite/React UI source
+│   └── static/                 # Built frontend assets served by backend
 ├── planning/
 │   ├── core.py                 # Pure state machine + convergence logic
 │   ├── render.py               # PRD/RFC Jinja2 rendering
@@ -352,6 +381,33 @@ tests/
 
 ---
 
+## Benchmark Harness
+
+Prscope includes a repeatable benchmark harness for planning speed + quality:
+
+```bash
+prscope-benchmark --base-url http://127.0.0.1:8443 --repo my-repo --config-root /path/to/repo
+```
+
+Artifacts:
+
+- Run history JSON: `benchmarks/results/history/run-<timestamp>.json`
+- Diagnostics log: `benchmarks/results/history/run-<timestamp>.log`
+- Best-known baseline: `benchmarks/results/best_performance.json`
+
+See:
+
+- `benchmarks/README.md` for benchmark flags, quality heuristic, and debugging long runs
+- `CONTRIBUTING.md` for mandatory performance benchmark policy on performance-sensitive PRs
+
+Recommended default for expensive model stacks:
+
+- Use cheap models in a dedicated config for benchmark test loops
+- Run with `--stop-on-first-problem` during diagnostics
+- Use `--health-check-only` before larger suites
+
+---
+
 ## Development
 
 ```bash
@@ -369,10 +425,9 @@ make run
 
 # Start discovery-mode planning
 make plan-chat
-
-# Run repeatable planning benchmark suite
-prscope-benchmark --base-url http://127.0.0.1:8443 --repo my-repo --config-root /path/to/repo
 ```
+
+For performance runs, use the [Benchmark Harness](#benchmark-harness) section above.
 
 ---
 

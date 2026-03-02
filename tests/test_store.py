@@ -52,10 +52,14 @@ def test_planning_session_turn_and_version_persistence(tmp_path):
         repo_name="alpha",
         title="Test Plan",
         requirements="Build planning mode",
+        author_model="gpt-4o-mini",
+        critic_model="gpt-4o-mini",
         seed_type="requirements",
     )
     assert session.repo_name == "alpha"
     assert session.current_round == 0
+    assert session.author_model == "gpt-4o-mini"
+    assert session.critic_model == "gpt-4o-mini"
 
     turn = store.add_planning_turn(
         session_id=session.id,

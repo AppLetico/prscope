@@ -67,8 +67,9 @@ LLMConfig = UpstreamEvalConfig
 class PlanningConfig:
     """Planning mode configuration."""
 
-    author_model: str = "gpt-4o"
-    critic_model: str = "claude-3-5-sonnet-20241022"
+    author_model: str = "gpt-4o-mini"
+    critic_model: str = "gpt-4o-mini"
+    author_call_timeout_seconds: int = 50
     max_adversarial_rounds: int = 10
     convergence_threshold: float = 0.05
     output_dir: str = "./plans"
@@ -298,8 +299,9 @@ class PrscopeConfig:
             "manifesto": int(memory_caps_raw.get("manifesto", 1500)),
         }
         config.planning = PlanningConfig(
-            author_model=planning_data.get("author_model", "gpt-4o"),
-            critic_model=planning_data.get("critic_model", "claude-3-5-sonnet-20241022"),
+            author_model=planning_data.get("author_model", "gpt-4o-mini"),
+            critic_model=planning_data.get("critic_model", "gpt-4o-mini"),
+            author_call_timeout_seconds=int(planning_data.get("author_call_timeout_seconds", 50)),
             max_adversarial_rounds=planning_data.get("max_adversarial_rounds", 10),
             convergence_threshold=planning_data.get("convergence_threshold", 0.05),
             output_dir=planning_data.get("output_dir", "./plans"),

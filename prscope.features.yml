@@ -1,14 +1,13 @@
 # Prscope Feature Definitions
-# Tailored for Clasper - Agent Execution Platform
+# Tailored for Prscope - Planning & PR scope tool
 #
-# Clasper focuses on:
-# - Agent orchestration & execution
-# - LLM provider abstraction
-# - Governance (RBAC, budgets, risk)
-# - Observability & tracing
-# - Skill runtime
+# Prscope focuses on:
+# - Planning (author/critic, discovery, plans)
+# - PR scope evaluation and upstream sync
+# - Benchmarking and repeatable prompts
+# - Agent harness and session/event streaming
 #
-# Clasper does NOT care about:
+# Prscope does NOT focus on:
 # - Messaging channels (Telegram, WhatsApp, Discord, etc.)
 # - Browser automation
 # - Personal assistant features

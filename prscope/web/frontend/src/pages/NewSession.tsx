@@ -1,8 +1,16 @@
 import { useState, useRef, useEffect } from "react";
 import { useNavigate, Link } from "react-router-dom";
-import { createChatSession, createRequirementsSession, getActiveRepoContext } from "../lib/api";
+import {
+  createChatSession,
+  createRequirementsSession,
+  getActiveRepoContext,
+  getStoredModelSelection,
+  listModels,
+  setStoredModelSelection,
+} from "../lib/api";
 import { ArrowLeft, MessageSquare, FileText, Loader2 } from "lucide-react";
 import { clsx } from "clsx";
+import type { ModelCatalogItem } from "../types";
 
 export function NewSessionPage() {
   const navigate = useNavigate();
@@ -11,6 +19,9 @@ export function NewSessionPage() {
   const [requirements, setRequirements] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [models, setModels] = useState<ModelCatalogItem[]>([]);
+  const [authorModel, setAuthorModel] = useState("");
+  const [criticModel, setCriticModel] = useState("");
   const inputRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
@@ -19,18 +30,45 @@ export function NewSessionPage() {
     }
   }, [mode]);
 
+  useEffect(() => {
+    let cancelled = false;
+    void listModels()
+      .then((result) => {
+        if (cancelled) return;
+        const stored = getStoredModelSelection(activeRepo);
+        const available = result.items.filter((item) => item.available);
+        setModels(result.items);
+        setAuthorModel(stored.author_model || available[0]?.model_id || result.items[0]?.model_id || "");
+        setCriticModel(stored.critic_model || available[0]?.model_id || result.items[0]?.model_id || "");
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setError(String(err));
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeRepo]);
+
   const submit = async () => {
     if (mode === "requirements" && !requirements.trim()) return;
     
     try {
       setError(null);
       setSubmitting(true);
+      const modelSelection = {
+        author_model: authorModel || undefined,
+        critic_model: criticModel || undefined,
+      };
       if (mode === "chat") {
-        const result = await createChatSession();
+        const result = await createChatSession(modelSelection);
+        setStoredModelSelection(modelSelection, activeRepo);
         navigate(`/sessions/${result.session.id}`);
         return;
       }
-      const result = await createRequirementsSession(requirements.trim());
+      const result = await createRequirementsSession(requirements.trim(), modelSelection);
+      setStoredModelSelection(modelSelection, activeRepo);
       navigate(`/sessions/${result.session.id}`);
     } catch (err) {
       setError(String(err));
@@ -100,6 +138,47 @@ export function NewSessionPage() {
               From Requirements
             </button>
           </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <label className="flex flex-col gap-1 text-sm text-zinc-300">
+            <span>Author model</span>
+            <select
+              value={authorModel}
+              onChange={(event) => setAuthorModel(event.target.value)}
+              className="h-9 rounded-md border border-zinc-800 bg-zinc-950 px-2 text-zinc-200"
+            >
+              {models.map((model) => (
+                <option
+                  key={`author-${model.model_id}`}
+                  value={model.model_id}
+                  disabled={!model.available}
+                >
+                  {model.provider}: {model.model_id}
+                  {!model.available && model.unavailable_reason ? ` (${model.unavailable_reason})` : ""}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="flex flex-col gap-1 text-sm text-zinc-300">
+            <span>Critic model</span>
+            <select
+              value={criticModel}
+              onChange={(event) => setCriticModel(event.target.value)}
+              className="h-9 rounded-md border border-zinc-800 bg-zinc-950 px-2 text-zinc-200"
+            >
+              {models.map((model) => (
+                <option
+                  key={`critic-${model.model_id}`}
+                  value={model.model_id}
+                  disabled={!model.available}
+                >
+                  {model.provider}: {model.model_id}
+                  {!model.available && model.unavailable_reason ? ` (${model.unavailable_reason})` : ""}
+                </option>
+              ))}
+            </select>
+          </label>
         </div>
 
         <div className="bg-zinc-900/30 border border-zinc-800/50 rounded-xl p-6 shadow-sm">

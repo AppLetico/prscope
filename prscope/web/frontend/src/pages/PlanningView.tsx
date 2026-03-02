@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { ActionBar } from "../components/ActionBar";
 import { ChatPanel } from "../components/ChatPanel";
@@ -10,48 +10,129 @@ import {
   approveSession,
   downloadFile,
   exportSession,
+  getStoredModelSelection,
   getDiff,
+  listModels,
   getSession,
   runRound,
   sendDiscoveryMessage,
+  setStoredModelSelection,
   submitClarification,
 } from "../lib/api";
-import type { ClarificationPrompt, DiscoveryQuestion, UIEvent } from "../types";
+import type { ClarificationPrompt, DiscoveryQuestion, ToolCallEntry, UIEvent } from "../types";
 import { AlertCircle } from "lucide-react";
 
 export function PlanningViewPage() {
   const { id = "" } = useParams();
   const [questions, setQuestions] = useState<DiscoveryQuestion[]>([]);
-  const [toolCalls, setToolCalls] = useState<string[]>([]);
+  const [activeToolCalls, setActiveToolCalls] = useState<ToolCallEntry[]>([]);
+  const [toolCallGroups, setToolCallGroups] = useState<ToolCallEntry[][]>([]);
   const [thinkingMessage, setThinkingMessage] = useState<string | null>(null);
   const [showDiff, setShowDiff] = useState(false);
   const [diff, setDiff] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [warnings, setWarnings] = useState<string[]>([]);
+  const [authorModel, setAuthorModel] = useState("");
+  const [criticModel, setCriticModel] = useState("");
   const [sessionCostUsd, setSessionCostUsd] = useState<number>(0);
   const [maxPromptTokens, setMaxPromptTokens] = useState<number>(0);
+  const [contextWindowTokens, setContextWindowTokens] = useState<number | null>(null);
+  const [contextUsageRatio, setContextUsageRatio] = useState<number | null>(null);
+  const [contextCompactionEnabled, setContextCompactionEnabled] = useState<boolean>(false);
   const [pendingClarification, setPendingClarification] = useState<ClarificationPrompt | null>(null);
+  const lastEventAtMs = useRef<number>(Date.now());
+  const lastRefetchAtMs = useRef<number>(0);
 
   const sessionQuery = useQuery({
     queryKey: ["session", id],
     queryFn: () => getSession(id),
     enabled: Boolean(id),
   });
+  const modelQuery = useQuery({
+    queryKey: ["models"],
+    queryFn: listModels,
+    staleTime: 60_000,
+  });
+
+  useEffect(() => {
+    const session = sessionQuery.data?.session;
+    const items = modelQuery.data?.items;
+    if (!session || !items || items.length === 0) return;
+    const stored = getStoredModelSelection(session.repo_name);
+    const available = items.filter((item) => item.available);
+    const fallbackModel = available[0]?.model_id || items[0]?.model_id || "";
+    const nextAuthor = session.author_model || stored.author_model || fallbackModel;
+    const nextCritic = session.critic_model || stored.critic_model || fallbackModel;
+    if (nextAuthor && nextAuthor !== authorModel) setAuthorModel(nextAuthor);
+    if (nextCritic && nextCritic !== criticModel) setCriticModel(nextCritic);
+  }, [modelQuery.data?.items, sessionQuery.data?.session, authorModel, criticModel]);
 
   const handleEvent = useCallback((event: UIEvent) => {
+    lastEventAtMs.current = Date.now();
     if (event.type === "thinking") {
       setThinkingMessage(event.message);
       return;
     }
     if (event.type === "tool_call") {
-      setToolCalls((prev) => [...prev, `${event.name}${event.path ? ` (${event.path})` : ""}`].slice(-200));
+      setActiveToolCalls((prev) => [
+        ...prev,
+        {
+          id: Date.now() + prev.length,
+          name: event.name,
+          sessionStage: event.session_stage,
+          path: event.path,
+          query: event.query,
+          status: "running" as const,
+        },
+      ].slice(-200));
+      return;
+    }
+    if (event.type === "tool_result") {
+      setActiveToolCalls((prev) => {
+        const updated = [...prev];
+        for (let idx = updated.length - 1; idx >= 0; idx -= 1) {
+          const candidate = updated[idx];
+          const sameName = candidate.name === event.name;
+          const sameStage = (candidate.sessionStage ?? "") === (event.session_stage ?? "");
+          if (candidate.status === "running" && sameName && sameStage) {
+            updated[idx] = {
+              ...candidate,
+              status: "done",
+              durationMs: event.duration_ms,
+            };
+            return updated;
+          }
+        }
+        return [
+          ...updated,
+          {
+            id: Date.now() + updated.length,
+            name: event.name,
+            sessionStage: event.session_stage,
+            status: "done" as const,
+            durationMs: event.duration_ms,
+          },
+        ].slice(-200);
+      });
       return;
     }
     if (event.type === "complete") {
       setThinkingMessage(null);
-      setToolCalls([]);
+      setToolCallGroups((prev) => (activeToolCalls.length > 0 ? [...prev, activeToolCalls] : prev));
+      setActiveToolCalls([]);
       setQuestions([]);
       setPendingClarification(null);
+      setWarnings([]);
+      lastRefetchAtMs.current = Date.now();
       void sessionQuery.refetch();
+      return;
+    }
+    if (event.type === "plan_ready") {
+      const now = Date.now();
+      if (now - lastRefetchAtMs.current >= 800) {
+        lastRefetchAtMs.current = now;
+        void sessionQuery.refetch();
+      }
       return;
     }
     if (event.type === "error") {
@@ -60,12 +141,27 @@ export function PlanningViewPage() {
       return;
     }
     if (event.type === "warning") {
-      setError(event.message);
+      setWarnings((prev) => [...prev, event.message].slice(-12));
+      if (event.message.toLowerCase().includes("context compaction enabled")) {
+        setContextCompactionEnabled(true);
+      }
+      return;
+    }
+    if (event.type === "context_compaction") {
+      setContextCompactionEnabled(event.enabled);
       return;
     }
     if (event.type === "token_usage") {
       setSessionCostUsd(event.session_total_usd ?? sessionCostUsd);
       setMaxPromptTokens(event.max_prompt_tokens ?? maxPromptTokens);
+      if (event.context_window_tokens !== undefined) {
+        setContextWindowTokens(event.context_window_tokens);
+      }
+      if (event.context_usage_ratio !== undefined) {
+        setContextUsageRatio(event.context_usage_ratio);
+      } else if (event.context_window_tokens && event.max_prompt_tokens) {
+        setContextUsageRatio(event.max_prompt_tokens / event.context_window_tokens);
+      }
       return;
     }
     if (event.type === "clarification_needed") {
@@ -75,19 +171,46 @@ export function PlanningViewPage() {
         source: event.source,
       });
     }
-  }, [id, maxPromptTokens, sessionCostUsd, sessionQuery]);
+  }, [activeToolCalls, id, maxPromptTokens, sessionCostUsd, sessionQuery]);
 
   useSessionEvents(id, handleEvent);
+
+  useEffect(() => {
+    const status = sessionQuery.data?.session.status;
+    const isActive = status === "drafting" || status === "discovering" || status === "discovery";
+    if (!isActive) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      const now = Date.now();
+      const eventStale = now - lastEventAtMs.current > 8000;
+      const recentlyRefetched = now - lastRefetchAtMs.current < 4000;
+      if (eventStale && !recentlyRefetched) {
+        lastRefetchAtMs.current = now;
+        void sessionQuery.refetch();
+      }
+    }, 3000);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [sessionQuery, sessionQuery.data?.session.status]);
 
   const submitMessage = async (text: string) => {
     try {
       setError(null);
       const status = sessionQuery.data?.session.status;
+      const models = {
+        author_model: authorModel || undefined,
+        critic_model: criticModel || undefined,
+      };
       if (status === "discovering" || status === "discovery") {
-        const response = await sendDiscoveryMessage(id, text);
+        const response = await sendDiscoveryMessage(id, text, models);
         setQuestions(response.result.questions ?? []);
       } else {
-        await runRound(id, text);
+        await runRound(id, text, models);
+      }
+      if (sessionQuery.data?.session.repo_name) {
+        setStoredModelSelection(models, sessionQuery.data.session.repo_name);
       }
       await sessionQuery.refetch();
     } catch (err) {
@@ -117,7 +240,10 @@ export function PlanningViewPage() {
   const onCritique = async () => {
     try {
       setError(null);
-      await runRound(id);
+      await runRound(id, undefined, {
+        author_model: authorModel || undefined,
+        critic_model: criticModel || undefined,
+      });
       await sessionQuery.refetch();
     } catch (err) {
       setError(String(err));
@@ -157,6 +283,7 @@ export function PlanningViewPage() {
 
   const session = sessionQuery.data?.session;
   const turns = sessionQuery.data?.conversation ?? [];
+  const contextPercent = contextUsageRatio !== null ? contextUsageRatio * 100 : null;
   const planContent = useMemo(() => {
     if (showDiff) return diff;
     return sessionQuery.data?.current_plan?.plan_content ?? "";
@@ -192,6 +319,27 @@ export function PlanningViewPage() {
             onExport={() => void onExport()}
             onToggleDiff={() => void onToggleDiff()}
             isDiffMode={showDiff}
+            authorModel={authorModel}
+            criticModel={criticModel}
+            modelOptions={modelQuery.data?.items ?? []}
+            onAuthorModelChange={(modelId) => {
+              setAuthorModel(modelId);
+              if (session.repo_name) {
+                setStoredModelSelection(
+                  { author_model: modelId, critic_model: criticModel || undefined },
+                  session.repo_name,
+                );
+              }
+            }}
+            onCriticModelChange={(modelId) => {
+              setCriticModel(modelId);
+              if (session.repo_name) {
+                setStoredModelSelection(
+                  { author_model: authorModel || undefined, critic_model: modelId },
+                  session.repo_name,
+                );
+              }
+            }}
           />
           <div className="px-6 py-2 border-b border-zinc-800 text-xs text-zinc-400 flex items-center justify-end gap-4">
             <span
@@ -206,6 +354,24 @@ export function PlanningViewPage() {
               Session cost: ${sessionCostUsd.toFixed(4)}
             </span>
             <span>Max prompt: {maxPromptTokens}</span>
+            <span
+              className={
+                contextPercent !== null && contextPercent >= 85
+                  ? "text-rose-400"
+                  : contextPercent !== null && contextPercent >= 70
+                    ? "text-amber-400"
+                    : "text-zinc-400"
+              }
+            >
+              Context: {maxPromptTokens}
+              {contextWindowTokens ? ` / ${contextWindowTokens}` : ""}
+              {contextPercent !== null ? ` (${contextPercent.toFixed(1)}%)` : ""}
+            </span>
+            {contextCompactionEnabled && (
+              <span className="text-indigo-300">
+                Compaction: on
+              </span>
+            )}
           </div>
           
           {error && (
@@ -223,13 +389,15 @@ export function PlanningViewPage() {
 
           <div className="flex-1 min-h-0 relative">
             <ResizableLayout
-              left={<PlanPanel content={planContent} isDiffMode={showDiff} />}
+              left={<PlanPanel content={planContent} isDiffMode={showDiff} status={session.status} />}
               right={
                 <ChatPanel
                   turns={turns}
                   questions={questions}
-                  toolCalls={toolCalls}
+                  activeToolCalls={activeToolCalls}
+                  toolCallGroups={toolCallGroups}
                   thinkingMessage={thinkingMessage}
+                  warnings={warnings}
                   pendingClarification={pendingClarification}
                   onSubmit={submitMessage}
                   onSelectOption={handleSelectOption}

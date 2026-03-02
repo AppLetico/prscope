@@ -18,6 +18,16 @@ interface ActionBarProps {
   canApprove: boolean;
   canExport: boolean;
   isDiffMode: boolean;
+  authorModel: string;
+  criticModel: string;
+  modelOptions: Array<{
+    model_id: string;
+    provider: string;
+    available: boolean;
+    unavailable_reason?: string | null;
+  }>;
+  onAuthorModelChange: (modelId: string) => void;
+  onCriticModelChange: (modelId: string) => void;
 }
 
 export function ActionBar({
@@ -34,6 +44,11 @@ export function ActionBar({
   canApprove,
   canExport,
   isDiffMode,
+  authorModel,
+  criticModel,
+  modelOptions,
+  onAuthorModelChange,
+  onCriticModelChange,
 }: ActionBarProps) {
   
   const isConverged = status === "converged" || status === "approved" || status === "exported";
@@ -103,6 +118,40 @@ export function ActionBar({
 
       {/* Right: Actions */}
       <div className="flex items-center gap-2">
+        <select
+          value={authorModel}
+          onChange={(event) => onAuthorModelChange(event.target.value)}
+          className="h-8 rounded-md border border-zinc-700 bg-zinc-900 px-2 text-xs text-zinc-200 focus:outline-none"
+          title="Author model"
+        >
+          {modelOptions.map((model) => (
+            <option
+              key={`author-${model.model_id}`}
+              value={model.model_id}
+              disabled={!model.available}
+            >
+              {model.provider}: {model.model_id}
+              {!model.available && model.unavailable_reason ? ` (${model.unavailable_reason})` : ""}
+            </option>
+          ))}
+        </select>
+        <select
+          value={criticModel}
+          onChange={(event) => onCriticModelChange(event.target.value)}
+          className="h-8 rounded-md border border-zinc-700 bg-zinc-900 px-2 text-xs text-zinc-200 focus:outline-none"
+          title="Critic model"
+        >
+          {modelOptions.map((model) => (
+            <option
+              key={`critic-${model.model_id}`}
+              value={model.model_id}
+              disabled={!model.available}
+            >
+              {model.provider}: {model.model_id}
+              {!model.available && model.unavailable_reason ? ` (${model.unavailable_reason})` : ""}
+            </option>
+          ))}
+        </select>
         <Tooltip content="Toggle diff view">
           <button 
             onClick={onToggleDiff}

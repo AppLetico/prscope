@@ -243,12 +243,9 @@ def init(force: bool):
         gitignore_path.write_text(gitignore_entry)
         click.echo(f"  Created: {gitignore_path}")
     
-    # Create env templates if not exists
+    # Create env template if not exists
     env_example_path = repo_root / "env.example"
-    env_sample_path = repo_root / "env.sample"
     if not env_example_path.exists() or force:
-        # Copy from package
-        import importlib.resources
         try:
             # Try to read from installed package
             pkg_env_example = Path(__file__).parent.parent / "env.example"
@@ -257,11 +254,6 @@ def init(force: bool):
                 click.echo(f"  Created: {env_example_path}")
         except Exception:
             pass
-    if not env_sample_path.exists() or force:
-        pkg_env_sample = Path(__file__).parent.parent / "env.sample"
-        if pkg_env_sample.exists():
-            env_sample_path.write_text(pkg_env_sample.read_text())
-            click.echo(f"  Created: {env_sample_path}")
     
     click.echo("\nPrscope initialized! Next steps:")
     click.echo("  1. Edit prscope.yml to add upstream repositories")

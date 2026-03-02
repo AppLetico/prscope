@@ -1,0 +1,11 @@
+local_repo: /Users/jasongelinas/workspace/prscope
+
+planning:
+  author_call_timeout_seconds: 50
+  max_adversarial_rounds: 10
+  convergence_threshold: 0.05
+  output_dir: ./plans
+  require_verified_file_references: false
+  discovery_tool_rounds: 25
+  author_tool_rounds: 25
+  scanner: grep

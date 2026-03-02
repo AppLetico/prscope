@@ -13,6 +13,7 @@ from typing import Any
 
 from ...config import PlanningConfig, PrscopeConfig, RepoProfile
 from ...memory import MemoryStore, ParsedConstraint
+from ...pricing import MODEL_CONTEXT_WINDOWS
 from ..scanners import get_scanner
 from ...profile import build_profile
 from ...store import PlanningSession, PullRequest, Store
@@ -58,7 +59,22 @@ class PlanningRuntime:
         self._session_read_paths: dict[str, set[str]] = {}
         self._clarification_gates: dict[str, ClarificationGate] = {}
         self._clarification_logs: dict[str, list[dict[str, Any]]] = {}
+        self._session_working_summary: dict[str, str] = {}
         self._compressor = CritiqueCompressor()
+
+    def _resolve_author_model(
+        self,
+        session: PlanningSession,
+        author_model_override: str | None,
+    ) -> str:
+        return author_model_override or session.author_model or self.planning_config.author_model
+
+    def _resolve_critic_model(
+        self,
+        session: PlanningSession,
+        critic_model_override: str | None,
+    ) -> str:
+        return critic_model_override or session.critic_model or self.planning_config.critic_model
 
     def _core(self, session_id: str) -> PlanningCore:
         return PlanningCore(self.store, session_id, self.planning_config)
@@ -73,6 +89,7 @@ class PlanningRuntime:
         self._session_read_paths.pop(session_id, None)
         self._clarification_gates.pop(session_id, None)
         self._clarification_logs.pop(session_id, None)
+        self._session_working_summary.pop(session_id, None)
         self.tools.delete_session_artifacts(session_id)
 
     def _session_reads(self, session_id: str) -> set[str]:
@@ -132,6 +149,54 @@ class PlanningRuntime:
 
     def _extract_critic_turns(self, turns: list[Any]) -> list[str]:
         return [t.content for t in turns if t.role == "critic" and t.content]
+
+    @staticmethod
+    def _context_window_limit(config: PlanningConfig) -> int:
+        windows: list[int] = []
+        for model in {config.author_model, config.critic_model}:
+            window = MODEL_CONTEXT_WINDOWS.get(model)
+            if isinstance(window, int) and window > 0:
+                windows.append(window)
+        if windows:
+            return min(windows)
+        return 128_000
+
+    def _should_compact_context(
+        self,
+        *,
+        session_id: str,
+        round_number: int,
+        critic_turns: list[str],
+        current_plan: str,
+    ) -> bool:
+        if round_number < 2:
+            return False
+        if len(critic_turns) >= 4:
+            return True
+        context_window = self._context_window_limit(self.planning_config)
+        recent_peak = int(self._session_max_prompt_tokens.get(session_id, 0) or 0)
+        if recent_peak > int(context_window * 0.65):
+            return True
+        if len(current_plan) >= 14_000:
+            return True
+        return False
+
+    def _build_working_summary(
+        self,
+        *,
+        requirements: str,
+        critic_turns: list[str],
+        current_plan: str,
+    ) -> str:
+        critique_summary = self._compressor.summarize(critic_turns) if critic_turns else "(none yet)"
+        objective = self._single_line(requirements or "Refine plan against critique.", limit=280)
+        summary = (
+            "WORKING SUMMARY (compact prior rounds)\n\n"
+            f"Objective: {objective}\n\n"
+            f"Current plan snapshot (excerpt):\n{current_plan[:1800]}\n\n"
+            f"Prior critique trajectory:\n{critique_summary}"
+        )
+        return summary[:5000]
 
     @staticmethod
     def _single_line(text: str, limit: int = 220) -> str:
@@ -339,6 +404,7 @@ class PlanningRuntime:
         self,
         session_id: str,
         requirements: str,
+        author_model_override: str | None = None,
         event_callback: Any | None = None,
         timeout_seconds: int = INITIAL_DRAFT_TIMEOUT_SECONDS,
         rebuild_memory: bool = False,
@@ -372,7 +438,14 @@ class PlanningRuntime:
             )
             try:
                 author_result = await asyncio.wait_for(
-                    self._run_initial_draft(core, requirements=requirements),
+                    self._run_initial_draft(
+                        core,
+                        requirements=requirements,
+                        author_model_override=self._resolve_author_model(
+                            session,
+                            author_model_override,
+                        ),
+                    ),
                     timeout=timeout_seconds,
                 )
                 plan_content = author_result.plan
@@ -425,6 +498,15 @@ class PlanningRuntime:
                 plan_content = self._initial_draft_fallback(requirements, str(exc))
             core.add_turn("author", self._author_chat_summary(plan_content, 0), round_number=0)
             core.save_plan_version(plan_content, round_number=0)
+            await self._emit_event(
+                event_callback,
+                {
+                    "type": "plan_ready",
+                    "round": 0,
+                    "saved_at_unix_s": time.time(),
+                },
+                session_id,
+            )
             core.transition("refining")
             async def _background_refine_once() -> None:
                 try:
@@ -459,6 +541,8 @@ class PlanningRuntime:
     async def create_requirements_session(
         self,
         requirements: str,
+        author_model: str | None = None,
+        critic_model: str | None = None,
         title: str | None = None,
         rebuild_memory: bool = False,
     ) -> PlanningSession:
@@ -466,6 +550,8 @@ class PlanningRuntime:
             repo_name=self.repo.name,
             title=title or (requirements.splitlines()[0][:80] if requirements.strip() else "New Plan"),
             requirements=requirements,
+            author_model=author_model or self.planning_config.author_model,
+            critic_model=critic_model or self.planning_config.critic_model,
             seed_type="requirements",
             status="drafting",
         )
@@ -475,12 +561,14 @@ class PlanningRuntime:
         self,
         session_id: str,
         requirements: str,
+        author_model_override: str | None = None,
         event_callback: Any | None = None,
         rebuild_memory: bool = False,
     ) -> PlanningSession:
         return await self._continue_initial_draft(
             session_id=session_id,
             requirements=requirements,
+            author_model_override=author_model_override,
             event_callback=event_callback,
             rebuild_memory=rebuild_memory,
         )
@@ -488,18 +576,23 @@ class PlanningRuntime:
     async def start_from_requirements(
         self,
         requirements: str,
+        author_model: str | None = None,
+        critic_model: str | None = None,
         title: str | None = None,
         rebuild_memory: bool = False,
         event_callback: Any | None = None,
     ) -> PlanningSession:
         session = await self.create_requirements_session(
             requirements=requirements,
+            author_model=author_model,
+            critic_model=critic_model,
             title=title,
             rebuild_memory=rebuild_memory,
         )
         return await self._continue_initial_draft(
             session_id=session.id,
             requirements=requirements,
+            author_model_override=author_model,
             event_callback=event_callback,
             rebuild_memory=rebuild_memory,
         )
@@ -539,6 +632,8 @@ class PlanningRuntime:
         self,
         upstream_repo: str,
         pr_number: int,
+        author_model: str | None = None,
+        critic_model: str | None = None,
         rebuild_memory: bool = False,
     ) -> PlanningSession:
         await self._prepare_memory(rebuild_memory=rebuild_memory)
@@ -561,25 +656,38 @@ class PlanningRuntime:
             repo_name=self.repo.name,
             title=f"PR #{pr_number}: {pr.title}",
             requirements=requirements,
+            author_model=author_model or self.planning_config.author_model,
+            critic_model=critic_model or self.planning_config.critic_model,
             seed_type="upstream_pr",
             seed_ref=f"{upstream_repo}#{pr_number}",
             status="drafting",
         )
         core = self._core(session.id)
         self.tools.set_session(session.id)
-        author_result = await self._run_initial_draft(core, requirements=requirements)
+        author_result = await self._run_initial_draft(
+            core,
+            requirements=requirements,
+            author_model_override=self._resolve_author_model(session, author_model),
+        )
         self._record_session_reads(session.id, author_result.accessed_paths)
         core.add_turn("author", self._author_chat_summary(author_result.plan, 0), round_number=0)
         core.save_plan_version(author_result.plan, round_number=0)
         core.transition("refining")
         return self.store.get_planning_session(session.id) or session
 
-    async def start_from_chat(self, rebuild_memory: bool = False) -> tuple[PlanningSession, str]:
+    async def start_from_chat(
+        self,
+        author_model: str | None = None,
+        critic_model: str | None = None,
+        rebuild_memory: bool = False,
+    ) -> tuple[PlanningSession, str]:
         await self._prepare_memory(rebuild_memory=rebuild_memory)
         session = self.store.create_planning_session(
             repo_name=self.repo.name,
             title="New Plan (discovery)",
             requirements="",
+            author_model=author_model or self.planning_config.author_model,
+            critic_model=critic_model or self.planning_config.critic_model,
             seed_type="chat",
             status="discovering",
         )
@@ -591,6 +699,8 @@ class PlanningRuntime:
         self,
         session_id: str,
         user_message: str,
+        author_model_override: str | None = None,
+        critic_model_override: str | None = None,
         event_callback: Any | None = None,
     ) -> DiscoveryTurnResult:
         async with self._session_lock(session_id):
@@ -615,14 +725,22 @@ class PlanningRuntime:
                 for turn in core.get_conversation()
             ]
             try:
-                result = await self.discovery.handle_turn(conversation)
+                selected_author_model = self._resolve_author_model(session, author_model_override)
+                result = await self.discovery.handle_turn(
+                    conversation,
+                    model_override=selected_author_model,
+                )
                 core.add_turn("author", result.reply, round_number=current_round)
 
                 if result.complete:
                     summary = result.summary or user_message
                     self.store.update_planning_session(session_id, requirements=summary)
                     core.transition("drafting")
-                    author_result = await self._run_initial_draft(core, requirements=summary)
+                    author_result = await self._run_initial_draft(
+                        core,
+                        requirements=summary,
+                        author_model_override=selected_author_model,
+                    )
                     self._record_session_reads(session_id, author_result.accessed_paths)
                     core.add_turn(
                         "author",
@@ -645,7 +763,12 @@ class PlanningRuntime:
                         await maybe
                 raise
 
-    async def _run_initial_draft(self, core: PlanningCore, requirements: str) -> AuthorResult:
+    async def _run_initial_draft(
+        self,
+        core: PlanningCore,
+        requirements: str,
+        author_model_override: str | None = None,
+    ) -> AuthorResult:
         blocks = self.memory.load_all_blocks()
         manifesto = self._truncate_memory_block("manifesto", self.memory.load_manifesto())
         manifesto_excerpt = self._excerpt(manifesto, max_lines=40)
@@ -698,6 +821,7 @@ class PlanningRuntime:
             require_clarification_first=require_clarification_first and self.author.clarification_handler is not None,
             max_output_tokens=max_output_tokens,
             quick_start_mode=True,
+            model_override=author_model_override,
         )
         return result
 
@@ -705,6 +829,8 @@ class PlanningRuntime:
         self,
         session_id: str,
         user_input: str | None = None,
+        author_model_override: str | None = None,
+        critic_model_override: str | None = None,
         event_callback: Any | None = None,
     ) -> tuple[CriticResult, AuthorResult, ConvergenceResult]:
         async with self._session_lock(session_id):
@@ -730,6 +856,8 @@ class PlanningRuntime:
                 current = core.get_current_plan()
                 if current is None:
                     raise ValueError("Cannot run adversarial round without initial plan")
+                selected_author_model = self._resolve_author_model(session, author_model_override)
+                selected_critic_model = self._resolve_critic_model(session, critic_model_override)
 
                 round_number = session.current_round + 1
                 blocks = self.memory.load_all_blocks()
@@ -750,6 +878,39 @@ class PlanningRuntime:
                     prior_critique_context = self._compressor.summarize(critic_turns)
                 elif prior_critic_turn is not None:
                     prior_critique_context = prior_critic_turn.content[:5000]
+                compact_mode = bool(self._session_working_summary.get(session_id))
+                if not compact_mode and self._should_compact_context(
+                    session_id=session_id,
+                    round_number=round_number,
+                    critic_turns=critic_turns,
+                    current_plan=current.plan_content,
+                ):
+                    compact_mode = True
+                if compact_mode:
+                    working_summary = self._build_working_summary(
+                        requirements=requirements,
+                        critic_turns=critic_turns,
+                        current_plan=current.plan_content,
+                    )
+                    self._session_working_summary[session_id] = working_summary
+                    prior_critique_context = working_summary
+                    await self._emit_event(
+                        event_callback,
+                        {
+                            "type": "warning",
+                            "message": "Context compaction enabled for this session to stay within token budget.",
+                        },
+                        session_id,
+                    )
+                    await self._emit_event(
+                        event_callback,
+                        {
+                            "type": "context_compaction",
+                            "enabled": True,
+                            "reason": "token_budget",
+                        },
+                        session_id,
+                    )
 
                 round_usage: dict[str, int] = {
                     "author_prompt": 0,
@@ -806,6 +967,14 @@ class PlanningRuntime:
                         },
                         session_id,
                     )
+                    if event_callback is not None:
+                        # In web/API mode we keep the round responsive and let the
+                        # user submit clarifications asynchronously.
+                        self.store.update_planning_session(
+                            session_id,
+                            clarifications_log_json=json.dumps(self._clarification_logs.get(session_id, [])),
+                        )
+                        return []
                     try:
                         answers, timed_out = await gate.wait_for_answer()
                     except ClarificationAborted:
@@ -830,6 +999,7 @@ class PlanningRuntime:
                     architecture=blocks.get("architecture", ""),
                     constraints=constraints,
                     prior_critique=prior_critique_context,
+                    model_override=selected_critic_model,
                 )
                 should_pause_for_clarification = (
                     bool(critic_result.clarification_questions)
@@ -862,6 +1032,36 @@ class PlanningRuntime:
                             },
                             session_id,
                         )
+                    if event_callback is not None:
+                        self.store.update_planning_session(
+                            session_id,
+                            clarifications_log_json=json.dumps(self._clarification_logs.get(session_id, [])),
+                        )
+                        await self._emit_event(
+                            event_callback,
+                            {
+                                "type": "thinking",
+                                "message": "Waiting for clarification before continuing refinement.",
+                            },
+                            session_id,
+                        )
+                        await self._emit_event(
+                            event_callback,
+                            {
+                                "type": "complete",
+                                "message": "Clarification requested",
+                            },
+                            session_id,
+                        )
+                        return (
+                            critic_result,
+                            AuthorResult(
+                                plan=current.plan_content,
+                                unverified_references=set(),
+                                accessed_paths=self._session_reads(session_id).copy(),
+                            ),
+                            core.check_convergence(),
+                        )
                     try:
                         answers, timed_out = await gate.wait_for_answer()
                     except ClarificationAborted:
@@ -886,6 +1086,13 @@ class PlanningRuntime:
                 current_plan_block, used = budget.allocate(current.plan_content, remaining_prompt)
                 remaining_prompt = max(0, remaining_prompt - used)
                 critique_block, _ = budget.allocate(critic_content, remaining_prompt)
+                working_summary_block = ""
+                if compact_mode:
+                    remaining_prompt = max(0, remaining_prompt - estimate_tokens(critique_block))
+                    working_summary_block, _ = budget.allocate(
+                        self._session_working_summary.get(session_id, ""),
+                        remaining_prompt,
+                    )
                 round_anchor = self._round_anchor_block(
                     requirements=requirements,
                     critic=critic_result,
@@ -899,6 +1106,7 @@ class PlanningRuntime:
                     context_index_block,
                     current_plan_block,
                     critique_block,
+                    working_summary_block,
                 ]
                 static_ratio = budget.injection_ratio(injection_blocks)
                 if static_ratio > budget.warn_ratio:
@@ -937,21 +1145,30 @@ class PlanningRuntime:
                 author_messages = [
                     {
                         "role": "user",
-                        "content": (
-                            f"{round_anchor}\n\n"
-                            f"PROJECT MANIFESTO (excerpt):\n{manifesto_block}\n\n"
-                            f"Full manifesto available at: {manifesto_path}\n\n"
-                            f"CONTEXT INDEX:\n{context_index_block}\n\n"
-                            f"Requirements:\n{requirements}\n\n"
-                            f"Current plan:\n{current_plan_block}\n\n"
-                            f"Critique:\n{critique_block}\n\n"
-                            "Refinement requirements:\n"
-                            "1) Every implementation step must include exact file path(s), change type, and rationale.\n"
-                            "2) Update or add a concrete Test Strategy section with specific validations.\n"
-                            "3) Update or add a concrete Rollback Plan section with failure triggers and rollback actions.\n"
-                            "4) Explicitly resolve major critique issues, including failure modes and tradeoff risks.\n"
-                            "5) Keep Cursor-style plan shape with title, summary, changes, files changed, ordered to-dos, "
-                            "example code snippets, and mermaid diagram (or explicit waiver).\n"
+                        "content": "".join(
+                            [
+                                f"{round_anchor}\n\n",
+                                f"PROJECT MANIFESTO (excerpt):\n{manifesto_block}\n\n",
+                                f"Full manifesto available at: {manifesto_path}\n\n",
+                                f"CONTEXT INDEX:\n{context_index_block}\n\n",
+                                f"Requirements:\n{requirements}\n\n",
+                                (
+                                    f"Working summary of prior rounds (compacted):\n{working_summary_block}\n\n"
+                                    if working_summary_block
+                                    else ""
+                                ),
+                                f"Current plan:\n{current_plan_block}\n\n",
+                                f"Critique:\n{critique_block}\n\n",
+                                "Refinement requirements:\n",
+                                "1) Every implementation step must include exact file path(s), change type, and rationale.\n",
+                                "2) Update or add a concrete Test Strategy section with specific validations.\n",
+                                "3) Update or add a concrete Rollback Plan section with failure triggers and rollback actions.\n",
+                                "4) Explicitly resolve major critique issues, including failure modes and tradeoff risks.\n",
+                                (
+                                    "5) Keep Cursor-style plan shape with title, summary, changes, files changed, ordered "
+                                    "to-dos, example code snippets, and mermaid diagram (or explicit waiver).\n"
+                                ),
+                            ]
                         ),
                     }
                 ]
@@ -991,6 +1208,7 @@ class PlanningRuntime:
                     min_grounding_ratio=0.8,
                     grounding_paths=self._session_reads(session_id),
                     draft_phase="refiner",
+                    model_override=selected_author_model,
                 )
                 self._record_session_reads(session_id, author_result.accessed_paths)
                 core.add_turn(
@@ -999,6 +1217,15 @@ class PlanningRuntime:
                     round_number=round_number,
                 )
                 core.save_plan_version(author_result.plan, round_number=round_number)
+                await self._emit_event(
+                    event_callback,
+                    {
+                        "type": "plan_ready",
+                        "round": round_number,
+                        "saved_at_unix_s": time.time(),
+                    },
+                    session_id,
+                )
                 convergence = core.check_convergence()
                 plan_quality_score = self._plan_quality_score(
                     critic=critic_result,

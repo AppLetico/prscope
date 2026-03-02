@@ -20,6 +20,7 @@ from sse_starlette.sse import EventSourceResponse
 from loguru import logger
 
 from ..config import PrscopeConfig, get_repo_root
+from ..model_catalog import get_model, list_models
 from ..planning.core import ApprovalBlockedError, InvalidTransitionError
 from ..planning.runtime import PlanningRuntime
 from ..store import Store
@@ -33,16 +34,22 @@ class StartSessionRequest(BaseModel):
     upstream_repo: Optional[str] = None
     pr_number: Optional[int] = None
     rebuild_memory: bool = False
+    author_model: Optional[str] = None
+    critic_model: Optional[str] = None
 
 
 class MessageRequest(BaseModel):
     message: str
     repo: Optional[str] = None
+    author_model: Optional[str] = None
+    critic_model: Optional[str] = None
 
 
 class RoundRequest(BaseModel):
     user_input: Optional[str] = None
     repo: Optional[str] = None
+    author_model: Optional[str] = None
+    critic_model: Optional[str] = None
 
 
 class ApproveRequest(BaseModel):
@@ -66,9 +73,91 @@ class RuntimeRegistry:
         self._runtimes: dict[str, PlanningRuntime] = {}
         self._stores: dict[str, Store] = {}
         self._emitter = emitter
+        self._session_timing: dict[str, dict[str, Any]] = {}
 
     def _key(self, repo_name: str) -> str:
         return repo_name
+
+    @staticmethod
+    def _default_session_timing() -> dict[str, Any]:
+        return {
+            "initial_draft_started_at_unix_s": None,
+            "initial_draft_elapsed_s": None,
+            "initial_draft_completed_at_unix_s": None,
+            "initial_draft_failed": False,
+            "warnings_total": 0,
+            "errors_total": 0,
+            "author_call_timeouts": 0,
+            "author_fallback_warnings": 0,
+            "llm_calls_total": 0,
+            "llm_call_latency_ms_total": 0.0,
+            "llm_call_latency_ms_max": 0.0,
+            "tool_calls_total": 0,
+            "tool_exec_latency_ms_total": 0.0,
+            "tool_exec_latency_ms_max": 0.0,
+            "first_plan_saved_at_unix_s": None,
+            "first_plan_round": None,
+        }
+
+    def _ensure_session_timing(self, session_id: str) -> dict[str, Any]:
+        timing = self._session_timing.get(session_id)
+        if timing is None:
+            timing = self._default_session_timing()
+            self._session_timing[session_id] = timing
+        return timing
+
+    def note_event(self, session_id: str, event: dict[str, Any]) -> None:
+        etype = str(event.get("type", "")).strip().lower()
+        if not etype:
+            return
+        timing = self._ensure_session_timing(session_id)
+        if etype == "warning":
+            timing["warnings_total"] = int(timing.get("warnings_total", 0)) + 1
+            message = str(event.get("message", "")).lower()
+            if "author call timeout on" in message:
+                timing["author_call_timeouts"] = int(timing.get("author_call_timeouts", 0)) + 1
+            if "trying fallback model" in message or "author fallback used" in message:
+                timing["author_fallback_warnings"] = int(
+                    timing.get("author_fallback_warnings", 0)
+                ) + 1
+            return
+        if etype == "token_usage":
+            timing["llm_calls_total"] = int(timing.get("llm_calls_total", 0)) + 1
+            latency = float(event.get("llm_call_latency_ms", 0.0) or 0.0)
+            timing["llm_call_latency_ms_total"] = float(
+                timing.get("llm_call_latency_ms_total", 0.0)
+            ) + latency
+            timing["llm_call_latency_ms_max"] = max(
+                float(timing.get("llm_call_latency_ms_max", 0.0)),
+                latency,
+            )
+            return
+        if etype == "tool_result":
+            timing["tool_calls_total"] = int(timing.get("tool_calls_total", 0)) + 1
+            latency = float(event.get("duration_ms", 0.0) or 0.0)
+            timing["tool_exec_latency_ms_total"] = float(
+                timing.get("tool_exec_latency_ms_total", 0.0)
+            ) + latency
+            timing["tool_exec_latency_ms_max"] = max(
+                float(timing.get("tool_exec_latency_ms_max", 0.0)),
+                latency,
+            )
+            return
+        if etype == "plan_ready":
+            if timing.get("first_plan_saved_at_unix_s") is None:
+                saved_at = event.get("saved_at_unix_s")
+                try:
+                    saved_at_value = float(saved_at if saved_at is not None else time.time())
+                except (TypeError, ValueError):
+                    saved_at_value = time.time()
+                timing["first_plan_saved_at_unix_s"] = saved_at_value
+                try:
+                    timing["first_plan_round"] = int(event.get("round", 0) or 0)
+                except (TypeError, ValueError):
+                    timing["first_plan_round"] = 0
+            return
+        if etype == "error":
+            timing["errors_total"] = int(timing.get("errors_total", 0)) + 1
 
     def _config_root(self) -> Path:
         forced_root = os.environ.get("PRSCOPE_CONFIG_ROOT")
@@ -91,6 +180,7 @@ class RuntimeRegistry:
 
     def cleanup_session(self, session_id: str) -> None:
         self._emitter.cleanup(session_id)
+        self._session_timing.pop(session_id, None)
         for runtime in self._runtimes.values():
             runtime.cleanup_session_resources(session_id)
 
@@ -126,6 +216,26 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail="session not found")
         return session.repo_name
 
+    def _validated_model_or_400(model_id: Optional[str], role: str) -> Optional[str]:
+        if not model_id:
+            return None
+        model = get_model(model_id)
+        if model is None:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Invalid {role} model '{model_id}'. "
+                    "Pick a model from /api/models."
+                ),
+            )
+        if not bool(model.get("available")):
+            reason = str(model.get("unavailable_reason") or "provider key unavailable")
+            raise HTTPException(
+                status_code=400,
+                detail=f"Selected {role} model '{model_id}' is unavailable: {reason}",
+            )
+        return model_id
+
     app.add_middleware(
         CORSMiddleware,
         allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
@@ -133,6 +243,10 @@ def create_app() -> FastAPI:
         allow_methods=["*"],
         allow_headers=["*"],
     )
+
+    @app.get("/api/models")
+    async def get_models() -> dict[str, Any]:
+        return {"items": list_models()}
 
     @app.get("/api/sessions")
     async def list_sessions(
@@ -155,26 +269,42 @@ def create_app() -> FastAPI:
             runtime_started = time.perf_counter()
             _, _, runtime = _runtime_for(repo_name=payload.repo)
             runtime_elapsed = time.perf_counter() - runtime_started
+            author_model = _validated_model_or_400(payload.author_model, "author")
+            critic_model = _validated_model_or_400(payload.critic_model, "critic")
             if payload.mode == "requirements":
                 if not payload.requirements:
                     raise HTTPException(status_code=400, detail="requirements is required for mode=requirements")
                 create_started = time.perf_counter()
                 session = await runtime.create_requirements_session(
                     requirements=payload.requirements,
+                    author_model=author_model,
+                    critic_model=critic_model,
                     rebuild_memory=payload.rebuild_memory,
                 )
                 create_elapsed = time.perf_counter() - create_started
 
                 async def callback(event: dict[str, Any]) -> None:
+                    registry.note_event(session.id, event)
                     await emitter.emit(session.id, event)
 
                 draft_started = time.perf_counter()
+                draft_started_wall = time.time()
+                timing = registry._ensure_session_timing(session.id)
+                timing.update(
+                    {
+                        "initial_draft_started_at_unix_s": draft_started_wall,
+                        "initial_draft_elapsed_s": None,
+                        "initial_draft_completed_at_unix_s": None,
+                        "initial_draft_failed": False,
+                    }
+                )
 
                 async def _run_initial_draft_task() -> None:
                     try:
                         await runtime.continue_requirements_draft(
                             session_id=session.id,
                             requirements=payload.requirements or "",
+                            author_model_override=author_model,
                             event_callback=callback,
                             rebuild_memory=payload.rebuild_memory,
                         )
@@ -183,12 +313,30 @@ def create_app() -> FastAPI:
                             session.id,
                             time.perf_counter() - draft_started,
                         )
+                        timing = registry._ensure_session_timing(session.id)
+                        timing.update(
+                            {
+                                "initial_draft_started_at_unix_s": draft_started_wall,
+                                "initial_draft_elapsed_s": round(time.perf_counter() - draft_started, 3),
+                                "initial_draft_completed_at_unix_s": time.time(),
+                                "initial_draft_failed": False,
+                            }
+                        )
                     except Exception as exc:  # noqa: BLE001
                         logger.error(
                             "api.sessions draft failed session_id={} elapsed_s={:.3f} error={}",
                             session.id,
                             time.perf_counter() - draft_started,
                             exc,
+                        )
+                        timing = registry._ensure_session_timing(session.id)
+                        timing.update(
+                            {
+                                "initial_draft_started_at_unix_s": draft_started_wall,
+                                "initial_draft_elapsed_s": round(time.perf_counter() - draft_started, 3),
+                                "initial_draft_completed_at_unix_s": time.time(),
+                                "initial_draft_failed": True,
+                            }
                         )
                         raise
 
@@ -213,6 +361,8 @@ def create_app() -> FastAPI:
                 session = await runtime.start_from_pr(
                     upstream_repo=payload.upstream_repo,
                     pr_number=payload.pr_number,
+                    author_model=author_model,
+                    critic_model=critic_model,
                     rebuild_memory=payload.rebuild_memory,
                 )
                 logger.info(
@@ -222,7 +372,11 @@ def create_app() -> FastAPI:
                     time.perf_counter() - request_started,
                 )
                 return {"session": _session_to_dict(session)}
-            session, opening = await runtime.start_from_chat(rebuild_memory=payload.rebuild_memory)
+            session, opening = await runtime.start_from_chat(
+                author_model=author_model,
+                critic_model=critic_model,
+                rebuild_memory=payload.rebuild_memory,
+            )
             logger.info(
                 "api.sessions created mode=chat session_id={} runtime_s={:.3f} total_s={:.3f}",
                 session.id,
@@ -236,7 +390,11 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     @app.get("/api/sessions/{session_id}")
-    async def get_session(session_id: str, repo: Optional[str] = Query(default=None)) -> dict[str, Any]:
+    async def get_session(
+        session_id: str,
+        repo: Optional[str] = Query(default=None),
+        lightweight: bool = Query(default=False),
+    ) -> dict[str, Any]:
         if repo is None:
             store = Store()
         else:
@@ -244,14 +402,22 @@ def create_app() -> FastAPI:
         session = store.get_planning_session(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="session not found")
-        turns = store.get_planning_turns(session_id)
         versions = store.get_plan_versions(session_id, limit=200)
         current_plan = versions[0] if versions else None
+        timing = registry._session_timing.get(session_id)
+        if lightweight:
+            return {
+                "session": _session_to_dict(session),
+                "current_plan": _version_to_dict(current_plan) if current_plan else None,
+                "draft_timing": timing,
+            }
+        turns = store.get_planning_turns(session_id)
         return {
             "session": _session_to_dict(session),
             "conversation": [_turn_to_dict(t) for t in turns],
             "plan_versions": [_version_to_dict(v) for v in versions],
             "current_plan": _version_to_dict(current_plan) if current_plan else None,
+            "draft_timing": timing,
             "tool_summary": {
                 "recent_tool_calls": [
                     t.content[:240]
@@ -278,13 +444,27 @@ def create_app() -> FastAPI:
         try:
             repo_name = _repo_for_session(session_id, payload.repo)
             _, _, runtime = _runtime_for(repo_name=repo_name)
+            session = Store().get_planning_session(session_id)
+            if session is None:
+                raise HTTPException(status_code=404, detail="session not found")
+            author_model = _validated_model_or_400(
+                payload.author_model or session.author_model,
+                "author",
+            )
+            critic_model = _validated_model_or_400(
+                payload.critic_model or session.critic_model,
+                "critic",
+            )
 
             async def callback(event: dict[str, Any]) -> None:
+                registry.note_event(session_id, event)
                 await emitter.emit(session_id, event)
 
             result = await runtime.handle_discovery_turn(
                 session_id=session_id,
                 user_message=payload.message,
+                author_model_override=author_model,
+                critic_model_override=critic_model,
                 event_callback=callback,
             )
             return {"result": asdict(result)}
@@ -297,14 +477,28 @@ def create_app() -> FastAPI:
     async def run_round(session_id: str, payload: RoundRequest) -> dict[str, Any]:
         repo_name = _repo_for_session(session_id, payload.repo)
         _, _, runtime = _runtime_for(repo_name=repo_name)
+        session = Store().get_planning_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        author_model = _validated_model_or_400(
+            payload.author_model or session.author_model,
+            "author",
+        )
+        critic_model = _validated_model_or_400(
+            payload.critic_model or session.critic_model,
+            "critic",
+        )
 
         async def callback(event: dict[str, Any]) -> None:
+            registry.note_event(session_id, event)
             await emitter.emit(session_id, event)
 
         try:
             critic, author, convergence = await runtime.run_adversarial_round(
                 session_id=session_id,
                 user_input=payload.user_input,
+                author_model_override=author_model,
+                critic_model_override=critic_model,
                 event_callback=callback,
             )
         except InvalidTransitionError as exc:

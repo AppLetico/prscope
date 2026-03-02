@@ -196,11 +196,18 @@ class DiscoveryManager:
                 parts.append(f"## {name.title()}\n{block}")
         return "\n\n".join(parts)
 
-    async def _llm_call_with_tools(self, messages: list[dict[str, Any]], max_tool_rounds: int = 6) -> str:
+    async def _llm_call_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        max_tool_rounds: int = 6,
+        model_override: str | None = None,
+    ) -> str:
         """LLM call loop that executes tool calls until LLM produces a text response."""
         import litellm
 
         litellm.drop_params = True
+        if hasattr(litellm, "set_verbose"):
+            litellm.set_verbose = False
         conversation = list(messages)
 
         for _ in range(max_tool_rounds):
@@ -209,6 +216,7 @@ class DiscoveryManager:
                 messages=self._normalize_roles(conversation),
                 tools=CODEBASE_TOOLS,
                 max_tokens=1800,
+                model_override=model_override,
             )
             message = response.choices[0].message
             content = str(getattr(message, "content", None) or "").strip()
@@ -234,17 +242,38 @@ class DiscoveryManager:
                     }
                 )
                 for tc in tool_calls:
+                    tool_name = getattr(getattr(tc, "function", None), "name", "")
+                    raw_args = getattr(getattr(tc, "function", None), "arguments", "{}") or "{}"
+                    try:
+                        parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else {}
+                    except json.JSONDecodeError:
+                        parsed_args = {}
+                    path_hint = parsed_args.get("path") or parsed_args.get("relative_path")
+                    query_hint = parsed_args.get("query") or parsed_args.get("pattern")
                     await self._emit(
                         {
                             "type": "tool_call",
-                            "name": getattr(getattr(tc, "function", None), "name", ""),
+                            "name": tool_name,
                             "session_stage": "discovery",
+                            "path": str(path_hint) if isinstance(path_hint, str) else None,
+                            "query": str(query_hint) if isinstance(query_hint, str) else None,
                         }
                     )
                     try:
-                        result = self.tool_executor.execute(tc)
+                        tool_started = asyncio.get_running_loop().time()
+                        result = await asyncio.to_thread(self.tool_executor.execute, tc)
+                        tool_elapsed_ms = (asyncio.get_running_loop().time() - tool_started) * 1000.0
                     except Exception as exc:  # noqa: BLE001
                         result = {"tool_call_id": getattr(tc, "id", ""), "name": "", "result": {"error": str(exc)}}
+                        tool_elapsed_ms = 0.0
+                    await self._emit(
+                        {
+                            "type": "tool_result",
+                            "name": tool_name,
+                            "session_stage": "discovery",
+                            "duration_ms": round(tool_elapsed_ms, 2),
+                        }
+                    )
                     raw_content = json.dumps(result["result"])
                     conversation.append(
                         {
@@ -260,15 +289,18 @@ class DiscoveryManager:
 
         return "I've scanned the codebase. What aspect of this would you like to focus on first?"
 
-    async def _llm_call(self, messages: list[dict[str, Any]]) -> str:
+    async def _llm_call(self, messages: list[dict[str, Any]], model_override: str | None = None) -> str:
         """Simple LLM call without tools (used for force_summary)."""
         import litellm
 
         litellm.drop_params = True
+        if hasattr(litellm, "set_verbose"):
+            litellm.set_verbose = False
         response = await self._safe_completion_call(
             litellm=litellm,
             messages=self._normalize_roles(messages),
             max_tokens=900,
+            model_override=model_override,
         )
         return str(response.choices[0].message.content or "").strip()
 
@@ -279,6 +311,7 @@ class DiscoveryManager:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None = None,
         max_tokens: int = 1200,
+        model_override: str | None = None,
     ) -> Any:
         """Call chat completion with graceful fallback for non-chat models."""
         kwargs: dict[str, Any] = {
@@ -289,7 +322,7 @@ class DiscoveryManager:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
 
-        primary_model = self.config.author_model
+        primary_model = model_override or self.config.author_model
         fallback_model = "gpt-4o-mini"
         models_to_try = [primary_model]
         if fallback_model != primary_model:
@@ -351,7 +384,11 @@ class DiscoveryManager:
         questions = parse_questions(text)
         return DiscoveryTurnResult(reply=text, complete=False, summary=None, questions=questions)
 
-    async def handle_turn(self, conversation: list[dict[str, Any]]) -> DiscoveryTurnResult:
+    async def handle_turn(
+        self,
+        conversation: list[dict[str, Any]],
+        model_override: str | None = None,
+    ) -> DiscoveryTurnResult:
         self.turn_count += 1
 
         if self.turn_count >= self.config.discovery_max_turns:
@@ -384,10 +421,15 @@ class DiscoveryManager:
         response = await self._llm_call_with_tools(
             messages,
             max_tool_rounds=self.config.discovery_tool_rounds,
+            model_override=model_override,
         )
         return self._try_extract_completion(response)
 
-    async def force_summary(self, conversation: list[dict[str, Any]]) -> str:
+    async def force_summary(
+        self,
+        conversation: list[dict[str, Any]],
+        model_override: str | None = None,
+    ) -> str:
         try:
             import litellm  # noqa: F401
         except ImportError:
@@ -404,4 +446,4 @@ class DiscoveryManager:
             },
             *conversation,
         ]
-        return await self._llm_call(messages)
+        return await self._llm_call(messages, model_override=model_override)

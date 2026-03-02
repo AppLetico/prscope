@@ -2,21 +2,36 @@ import { useState } from "react";
 import ReactMarkdown from "react-markdown";
 import { FileText, Copy, Check } from "lucide-react";
 import { Tooltip } from "./ui/Tooltip";
+import type { SessionStatus } from "../types";
 
 interface PlanPanelProps {
   content: string;
   isDiffMode?: boolean;
+  status?: SessionStatus;
 }
 
-export function PlanPanel({ content, isDiffMode = false }: PlanPanelProps) {
+export function PlanPanel({ content, isDiffMode = false, status }: PlanPanelProps) {
   const [copied, setCopied] = useState(false);
 
   if (!content) {
+    const isInProgress = status === "discovering"
+      || status === "discovery"
+      || status === "drafting"
+      || status === "refining";
     return (
       <div className="h-full flex flex-col items-center justify-center text-zinc-500 bg-zinc-900/10">
         <FileText className="w-12 h-12 mb-4 opacity-20" />
-        <p className="text-sm">No plan generated yet.</p>
-        <p className="text-xs opacity-60 mt-1">Start discovery or provide requirements to begin.</p>
+        {isInProgress ? (
+          <>
+            <p className="text-sm">Generating plan...</p>
+            <p className="text-xs opacity-60 mt-1">Drafting and validation are in progress.</p>
+          </>
+        ) : (
+          <>
+            <p className="text-sm">No plan generated yet.</p>
+            <p className="text-xs opacity-60 mt-1">Start discovery or provide requirements to begin.</p>
+          </>
+        )}
       </div>
     );
   }

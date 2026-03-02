@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from "react";
-import type { ClarificationPrompt, DiscoveryQuestion, PlanningTurn } from "../types";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { ClarificationPrompt, DiscoveryQuestion, PlanningTurn, ToolCallEntry } from "../types";
 import { OptionButtons } from "./OptionButtons";
 import { ToolCallStream } from "./ToolCallStream";
 import { Send, ArrowDown, Bot, User, Sparkles, Copy, Check } from "lucide-react";
@@ -10,19 +10,61 @@ import { Tooltip } from "./ui/Tooltip";
 interface ChatPanelProps {
   turns: PlanningTurn[];
   questions: DiscoveryQuestion[];
-  toolCalls: string[];
+  activeToolCalls: ToolCallEntry[];
+  toolCallGroups: ToolCallEntry[][];
   thinkingMessage: string | null;
+  warnings: string[];
   pendingClarification: ClarificationPrompt | null;
   onSubmit: (text: string) => Promise<void>;
   onSelectOption: (questionIndex: number, optionText: string, isOther: boolean) => Promise<void>;
   onSubmitClarification: (answer: string) => Promise<void>;
 }
 
+function extractFirstJsonObject(raw: string): { parsed: Record<string, unknown>; start: number; end: number } | null {
+  const start = raw.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let idx = start; idx < raw.length; idx += 1) {
+    const ch = raw[idx];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (ch === "\"") {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (ch === "{") depth += 1;
+    if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) {
+        const candidate = raw.slice(start, idx + 1);
+        try {
+          const parsed = JSON.parse(candidate) as Record<string, unknown>;
+          return { parsed, start, end: idx + 1 };
+        } catch {
+          return null;
+        }
+      }
+    }
+  }
+  return null;
+}
+
 export function ChatPanel({
   turns,
   questions,
-  toolCalls,
+  activeToolCalls,
+  toolCallGroups,
   thinkingMessage,
+  warnings,
   pendingClarification,
   onSubmit,
   onSelectOption,
@@ -46,7 +88,7 @@ export function ChatPanel({
     if (autoScroll && scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [turns, toolCalls, thinkingMessage, questions, autoScroll]);
+  }, [turns, activeToolCalls, thinkingMessage, questions, autoScroll]);
 
   // Handle resize events to recalculate scroll anchoring
   useEffect(() => {
@@ -91,13 +133,6 @@ export function ChatPanel({
   const renderTurnContent = (turn: PlanningTurn): string => {
     if (turn.role === "user") return turn.content;
     const raw = turn.content.trim();
-    // Legacy critic messages included raw JSON contract then prose; show prose only.
-    if (turn.role === "critic" && raw.startsWith("{")) {
-      const split = raw.split("\n\n");
-      if (split.length > 1) {
-        return split.slice(1).join("\n\n");
-      }
-    }
     // Avoid duplicating full plan content in chat; plan panel is canonical.
     const looksLikeFullPlan =
       raw.includes("## Goals")
@@ -108,6 +143,35 @@ export function ChatPanel({
     }
     return raw;
   };
+
+  const warningSummary = warnings.reduce<Array<{ message: string; count: number }>>((acc, message) => {
+    const existing = acc.find((item) => item.message === message);
+    if (existing) {
+      existing.count += 1;
+    } else {
+      acc.push({ message, count: 1 });
+    }
+    return acc;
+  }, []);
+
+  const toolCallsByTurnIndex = useMemo(() => {
+    const mapping = new Map<number, ToolCallEntry[]>();
+    const nonUserIndexes = turns
+      .map((turn, idx) => ({ turn, idx }))
+      .filter(({ turn }) => turn.role !== "user")
+      .map(({ idx }) => idx);
+    if (nonUserIndexes.length === 0 || toolCallGroups.length === 0) {
+      return mapping;
+    }
+    const start = Math.max(0, nonUserIndexes.length - toolCallGroups.length);
+    for (let groupIdx = 0; groupIdx < toolCallGroups.length; groupIdx += 1) {
+      const turnIdx = nonUserIndexes[start + groupIdx];
+      if (turnIdx !== undefined) {
+        mapping.set(turnIdx, toolCallGroups[groupIdx]);
+      }
+    }
+    return mapping;
+  }, [toolCallGroups, turns]);
 
   return (
     <div className="h-full flex flex-col bg-zinc-900/30 relative">
@@ -130,6 +194,19 @@ export function ChatPanel({
             const isUser = turn.role === "user";
             const turnKey = `${turn.role}-${idx}`;
             const displayContent = renderTurnContent(turn);
+            const turnToolCalls = toolCallsByTurnIndex.get(idx) ?? [];
+            const criticJson = turn.role === "critic" ? extractFirstJsonObject(turn.content) : null;
+            const criticPrelude = criticJson ? turn.content.slice(0, criticJson.start).trim() : "";
+            const criticPostlude = criticJson ? turn.content.slice(criticJson.end).trim() : "";
+            const majorIssues = typeof criticJson?.parsed.major_issues_remaining === "number"
+              ? criticJson.parsed.major_issues_remaining
+              : null;
+            const minorIssues = typeof criticJson?.parsed.minor_issues_remaining === "number"
+              ? criticJson.parsed.minor_issues_remaining
+              : null;
+            const hardViolations = Array.isArray(criticJson?.parsed.hard_constraint_violations)
+              ? criticJson?.parsed.hard_constraint_violations.map((item) => String(item))
+              : [];
             return (
               <div 
                 key={turnKey}
@@ -153,6 +230,7 @@ export function ChatPanel({
                 <div className={clsx(
                   "relative",
                   "max-w-[85%] rounded-2xl px-4 py-3 text-sm shadow-sm overflow-hidden",
+                  !isUser && "pr-11",
                   isUser 
                     ? "bg-indigo-500/10 border border-indigo-500/20 text-indigo-100 rounded-tr-sm" 
                     : "bg-zinc-800/50 border border-zinc-700/50 text-zinc-200 rounded-tl-sm"
@@ -161,7 +239,7 @@ export function ChatPanel({
                     <Tooltip content={copiedKey === turnKey ? "Copied" : "Copy response"}>
                       <button
                         type="button"
-                        onClick={() => void copyMessage(turnKey, displayContent)}
+                        onClick={() => void copyMessage(turnKey, turn.content)}
                         className="absolute top-2 right-2 p-1 rounded-md text-zinc-500 hover:text-zinc-300 hover:bg-zinc-700/60 transition-colors"
                         aria-label="Copy message"
                       >
@@ -173,15 +251,62 @@ export function ChatPanel({
                       </button>
                     </Tooltip>
                   )}
-                  <div className="chat-message-prose prose prose-invert prose-sm max-w-none">
-                    <ReactMarkdown>{displayContent}</ReactMarkdown>
-                  </div>
+                  {criticJson ? (
+                    <div className="space-y-3">
+                      {criticPrelude && (
+                        <div className="chat-message-prose prose prose-invert prose-sm max-w-none">
+                          <ReactMarkdown>{criticPrelude}</ReactMarkdown>
+                        </div>
+                      )}
+                      <div className="rounded-lg border border-zinc-700/70 bg-zinc-900/40 p-3">
+                        <div className="flex flex-wrap items-center gap-2 text-xs">
+                          {majorIssues !== null ? (
+                            <span className="rounded bg-rose-500/20 px-2 py-1 text-rose-300">
+                              major: {majorIssues}
+                            </span>
+                          ) : null}
+                          {minorIssues !== null ? (
+                            <span className="rounded bg-amber-500/20 px-2 py-1 text-amber-300">
+                              minor: {minorIssues}
+                            </span>
+                          ) : null}
+                          {hardViolations.length > 0 ? (
+                            <span className="rounded bg-violet-500/20 px-2 py-1 text-violet-300">
+                              hard constraints: {hardViolations.join(", ")}
+                            </span>
+                          ) : null}
+                        </div>
+                        <details className="mt-2 text-xs text-zinc-400">
+                          <summary className="cursor-pointer hover:text-zinc-200">
+                            View structured critic payload
+                          </summary>
+                          <pre className="mt-2 overflow-x-auto whitespace-pre-wrap rounded bg-zinc-950/80 p-2 text-[11px] text-zinc-300">
+                            {JSON.stringify(criticJson.parsed, null, 2)}
+                          </pre>
+                        </details>
+                      </div>
+                      {criticPostlude && (
+                        <div className="chat-message-prose prose prose-invert prose-sm max-w-none">
+                          <ReactMarkdown>{criticPostlude}</ReactMarkdown>
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="chat-message-prose prose prose-invert prose-sm max-w-none">
+                      <ReactMarkdown>{displayContent}</ReactMarkdown>
+                    </div>
+                  )}
                 </div>
+                {!isUser && turnToolCalls.length > 0 && (
+                  <div className="pl-12">
+                    <ToolCallStream toolCalls={turnToolCalls} />
+                  </div>
+                )}
               </div>
             );
           })}
 
-          <ToolCallStream toolCalls={toolCalls} />
+          <ToolCallStream toolCalls={activeToolCalls} />
           <OptionButtons questions={questions} onSelect={onSelectOption} />
           {pendingClarification && (
             <div className="rounded-xl border border-indigo-500/30 bg-indigo-500/10 p-4 space-y-3">
@@ -222,23 +347,24 @@ export function ChatPanel({
             </div>
           )}
 
-          {thinkingMessage && (
-            <div className="flex gap-4 animate-in fade-in duration-300">
-              <div className="shrink-0 mt-1">
-                <div className="w-8 h-8 rounded-full bg-zinc-800 border border-zinc-700 flex items-center justify-center">
-                  <Bot className="w-4 h-4 text-zinc-400" />
+          {(warnings.length > 0 || thinkingMessage) && (
+            <div className="space-y-1 animate-in fade-in duration-200">
+              {warningSummary.slice(-4).map((warning, idx) => (
+                <div key={`warning-${idx}`} className="pl-12 text-xs text-amber-300/80">
+                  {warning.message}
+                  {warning.count > 1 ? ` (x${warning.count})` : ""}
                 </div>
-              </div>
-              <div className="flex items-center gap-3 px-4 py-3 rounded-2xl rounded-tl-sm bg-zinc-800/30 border border-zinc-800">
-                <div className="flex gap-1">
-                  <div className="w-1.5 h-1.5 rounded-full bg-zinc-500 animate-bounce [animation-delay:-0.3s]"></div>
-                  <div className="w-1.5 h-1.5 rounded-full bg-zinc-500 animate-bounce [animation-delay:-0.15s]"></div>
-                  <div className="w-1.5 h-1.5 rounded-full bg-zinc-500 animate-bounce"></div>
+              ))}
+              {thinkingMessage && (
+                <div className="pl-12 flex items-center gap-2 text-xs text-zinc-400">
+                  <div className="flex gap-1">
+                    <div className="w-1 h-1 rounded-full bg-zinc-500 animate-bounce [animation-delay:-0.3s]"></div>
+                    <div className="w-1 h-1 rounded-full bg-zinc-500 animate-bounce [animation-delay:-0.15s]"></div>
+                    <div className="w-1 h-1 rounded-full bg-zinc-500 animate-bounce"></div>
+                  </div>
+                  <span>{thinkingMessage}</span>
                 </div>
-                <span className="text-sm font-medium text-transparent bg-clip-text bg-gradient-to-r from-zinc-400 via-zinc-200 to-zinc-400 animate-pulse">
-                  {thinkingMessage}
-                </span>
-              </div>
+              )}
             </div>
           )}
         </div>
@@ -259,7 +385,7 @@ export function ChatPanel({
       )}
 
       {/* Floating Input Area */}
-      <div className="absolute bottom-6 left-6 right-6 max-w-2xl mx-auto w-full">
+      <div className="absolute bottom-6 left-1/2 -translate-x-1/2 w-full max-w-2xl px-6">
         <div className="bg-zinc-800/80 backdrop-blur-xl border border-zinc-700/80 rounded-2xl shadow-2xl p-2 flex items-end focus-within:ring-2 ring-indigo-500/50 focus-within:border-indigo-500/50 transition-all">
           <textarea
             ref={inputRef}

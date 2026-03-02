@@ -10,11 +10,37 @@ function normalizeEvent(rawType: string, rawPayload: Record<string, unknown>): U
       type: "tool_call",
       name: String(rawPayload.name ?? "tool"),
       path: rawPayload.path ? String(rawPayload.path) : undefined,
+      query: rawPayload.query ? String(rawPayload.query) : undefined,
       session_stage: rawPayload.session_stage ? String(rawPayload.session_stage) : undefined,
+    };
+  }
+  if (rawType === "tool_result") {
+    return {
+      type: "tool_result",
+      name: String(rawPayload.name ?? "tool"),
+      session_stage: rawPayload.session_stage ? String(rawPayload.session_stage) : undefined,
+      duration_ms: rawPayload.duration_ms !== undefined ? Number(rawPayload.duration_ms) : undefined,
     };
   }
   if (rawType === "complete") {
     return { type: "complete", message: rawPayload.message ? String(rawPayload.message) : undefined };
+  }
+  if (rawType === "plan_ready") {
+    return {
+      type: "plan_ready",
+      round: rawPayload.round !== undefined ? Number(rawPayload.round) : undefined,
+      saved_at_unix_s:
+        rawPayload.saved_at_unix_s !== undefined
+          ? Number(rawPayload.saved_at_unix_s)
+          : undefined,
+    };
+  }
+  if (rawType === "context_compaction") {
+    return {
+      type: "context_compaction",
+      enabled: Boolean(rawPayload.enabled),
+      reason: rawPayload.reason ? String(rawPayload.reason) : undefined,
+    };
   }
   if (rawType === "error") {
     return { type: "error", message: String(rawPayload.message ?? "Unknown error") };
@@ -36,6 +62,14 @@ function normalizeEvent(rawType: string, rawPayload: Record<string, unknown>): U
       max_prompt_tokens:
         rawPayload.max_prompt_tokens !== undefined
           ? Number(rawPayload.max_prompt_tokens)
+          : undefined,
+      context_window_tokens:
+        rawPayload.context_window_tokens !== undefined
+          ? Number(rawPayload.context_window_tokens)
+          : undefined,
+      context_usage_ratio:
+        rawPayload.context_usage_ratio !== undefined
+          ? Number(rawPayload.context_usage_ratio)
           : undefined,
     };
   }
@@ -72,6 +106,9 @@ export function useSessionEvents(sessionId: string, onEvent: (event: UIEvent) =>
 
     bind("thinking");
     bind("tool_call");
+    bind("tool_result");
+    bind("context_compaction");
+    bind("plan_ready");
     bind("complete");
     bind("error");
     bind("warning");

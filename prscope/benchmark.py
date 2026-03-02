@@ -2,7 +2,7 @@
 Repeatable prompt benchmark runner for planning startup performance/quality.
 
 Usage:
-    python -m prscope.benchmark --base-url http://127.0.0.1:8443 --repo clasper-core
+    python -m prscope.benchmark --base-url http://127.0.0.1:8443 --repo prscope
 """
 
 from __future__ import annotations
@@ -934,8 +934,8 @@ def run_benchmark(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run repeatable planning benchmark suite.")
     parser.add_argument("--base-url", default="http://127.0.0.1:8443")
-    parser.add_argument("--repo", default="clasper-core")
-    parser.add_argument("--config-root", default="~/workspace/clasper-core")
+    parser.add_argument("--repo", default="prscope")
+    parser.add_argument("--config-root", default=".")
     parser.add_argument("--prompts-file", default=None, help="JSON file with prompt array")
     parser.add_argument(
         "--create-timeout-seconds",

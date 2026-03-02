@@ -190,13 +190,21 @@ class CriticAgent:
                 return "\n".join(chunks).strip()
         return ""
 
-    def _llm_call(self, messages: list[dict[str, Any]], temperature: float) -> tuple[str, Any, str]:
+    def _llm_call(
+        self,
+        messages: list[dict[str, Any]],
+        temperature: float,
+        model_override: str | None = None,
+    ) -> tuple[str, Any, str]:
         import litellm
 
         litellm.drop_params = True  # gpt-5 models don't support all params (e.g. temperature)
+        if hasattr(litellm, "set_verbose"):
+            litellm.set_verbose = False
         fallback_model = "gpt-4o-mini"
-        models_to_try = [self.config.critic_model]
-        if fallback_model != self.config.critic_model:
+        primary_model = model_override or self.config.critic_model
+        models_to_try = [primary_model]
+        if fallback_model != primary_model:
             models_to_try.append(fallback_model)
 
         last_error: Exception | None = None
@@ -338,7 +346,12 @@ class CriticAgent:
         violations = [str(v) for v in data["hard_constraint_violations"]]
         unknown = set(violations) - valid_constraint_ids
         if unknown:
-            raise CriticParseError(f"Unknown constraint IDs in violations: {sorted(unknown)}")
+            # If no hard constraints are configured, tolerate invented IDs and
+            # normalize to an empty list instead of degrading the critique flow.
+            if len(valid_constraint_ids) == 0:
+                violations = []
+            else:
+                raise CriticParseError(f"Unknown constraint IDs in violations: {sorted(unknown)}")
 
         optional_values: dict[str, Any] = {}
         for field_name, (expected_type, default_value) in self.schema.optional_fields.items():
@@ -412,6 +425,7 @@ class CriticAgent:
         max_retries: int = 2,
         temperature: float | None = None,
         strict_mode: bool = False,
+        model_override: str | None = None,
     ) -> CriticResult:
         try:
             import litellm  # noqa: F401
@@ -438,6 +452,7 @@ class CriticAgent:
             for c in constraints
             if c.severity == "hard" and not c.optional
         }
+        valid_ids_text = ", ".join(sorted(valid_ids)) if valid_ids else "(none configured)"
         constraints_blob = "\n".join(
             f"- {c.id}: {c.text} (severity={c.severity}, optional={c.optional})"
             for c in constraints
@@ -453,7 +468,11 @@ class CriticAgent:
                     f"## Architecture\n{architecture}\n\n"
                     f"## Requirements\n{requirements}\n\n"
                     f"## Prior Critique (check whether fixes are real)\n{prior_critique_blob}\n\n"
-                    f"## Current Plan\n{plan_content}"
+                    f"## Current Plan\n{plan_content}\n\n"
+                    "## Constraint-ID Rules\n"
+                    f"Valid hard constraint IDs: {valid_ids_text}\n"
+                    "- Use ONLY IDs from the list above.\n"
+                    "- If no valid hard IDs are configured, return hard_constraint_violations as []."
                 ),
             },
         ]
@@ -461,7 +480,11 @@ class CriticAgent:
         temp = 0.0 if temperature is None else temperature
         for attempt in range(max_retries + 1):
             try:
-                raw, response, model = self._llm_call(messages, temperature=temp)
+                raw, response, model = self._llm_call(
+                    messages,
+                    temperature=temp,
+                    model_override=model_override,
+                )
                 telemetry = completion_telemetry(response, model=model)
                 context_window = MODEL_CONTEXT_WINDOWS.get(model)
                 if model not in MODEL_CONTEXT_WINDOWS:

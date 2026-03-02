@@ -1,11 +1,13 @@
 import type {
   DiscoveryTurnResult,
+  ModelCatalogItem,
   PlanVersion,
   PlanningSession,
   PlanningTurn,
 } from "../types";
 
 const REPO_STORAGE_KEY = "prscope.web.repo";
+const MODEL_SELECTION_STORAGE_PREFIX = "prscope.web.models.";
 
 function getRepoContext(): string | null {
   const params = new URLSearchParams(window.location.search);
@@ -19,6 +21,36 @@ function getRepoContext(): string | null {
 
 export function getActiveRepoContext(): string | null {
   return getRepoContext();
+}
+
+function modelSelectionStorageKey(repo: string | null): string {
+  return `${MODEL_SELECTION_STORAGE_PREFIX}${repo ?? "__default__"}`;
+}
+
+export function getStoredModelSelection(repo?: string | null): {
+  author_model?: string;
+  critic_model?: string;
+} {
+  const key = modelSelectionStorageKey(repo ?? getRepoContext());
+  const raw = window.localStorage.getItem(key);
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw) as { author_model?: string; critic_model?: string };
+    return {
+      author_model: parsed.author_model,
+      critic_model: parsed.critic_model,
+    };
+  } catch {
+    return {};
+  }
+}
+
+export function setStoredModelSelection(
+  selection: { author_model?: string; critic_model?: string },
+  repo?: string | null,
+): void {
+  const key = modelSelectionStorageKey(repo ?? getRepoContext());
+  window.localStorage.setItem(key, JSON.stringify(selection));
 }
 
 function withRepoQuery(path: string): string {
@@ -56,17 +88,20 @@ export function listSessions() {
   return request<{ items: PlanningSession[] }>(withRepoQuery("/api/sessions"));
 }
 
-export function createChatSession() {
+export function createChatSession(models?: { author_model?: string; critic_model?: string }) {
   return request<{ session: PlanningSession; opening?: string }>(withRepoQuery("/api/sessions"), {
     method: "POST",
-    body: JSON.stringify(withRepoBody({ mode: "chat" })),
+    body: JSON.stringify(withRepoBody({ mode: "chat", ...models })),
   });
 }
 
-export function createRequirementsSession(requirements: string) {
+export function createRequirementsSession(
+  requirements: string,
+  models?: { author_model?: string; critic_model?: string },
+) {
   return request<{ session: PlanningSession }>(withRepoQuery("/api/sessions"), {
     method: "POST",
-    body: JSON.stringify(withRepoBody({ mode: "requirements", requirements })),
+    body: JSON.stringify(withRepoBody({ mode: "requirements", requirements, ...models })),
   });
 }
 
@@ -80,22 +115,34 @@ export function getSession(sessionId: string) {
   }>(withRepoQuery(`/api/sessions/${sessionId}`));
 }
 
-export function sendDiscoveryMessage(sessionId: string, message: string) {
+export function sendDiscoveryMessage(
+  sessionId: string,
+  message: string,
+  models?: { author_model?: string; critic_model?: string },
+) {
   return request<{ result: DiscoveryTurnResult }>(withRepoQuery(`/api/sessions/${sessionId}/message`), {
     method: "POST",
-    body: JSON.stringify(withRepoBody({ message })),
+    body: JSON.stringify(withRepoBody({ message, ...models })),
   });
 }
 
-export function runRound(sessionId: string, user_input?: string) {
+export function runRound(
+  sessionId: string,
+  user_input?: string,
+  models?: { author_model?: string; critic_model?: string },
+) {
   return request<{
     critic: Record<string, unknown>;
     author: Record<string, unknown>;
     convergence: { converged: boolean; reason: string; change_pct: number };
   }>(withRepoQuery(`/api/sessions/${sessionId}/round`), {
     method: "POST",
-    body: JSON.stringify(withRepoBody({ user_input })),
+    body: JSON.stringify(withRepoBody({ user_input, ...models })),
   });
+}
+
+export function listModels() {
+  return request<{ items: ModelCatalogItem[] }>(withRepoQuery("/api/models"));
 }
 
 export function submitClarification(sessionId: string, answers: string[]) {

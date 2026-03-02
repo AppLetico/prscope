@@ -26,7 +26,7 @@ from .config import get_prscope_dir
 
 
 DB_FILENAME = "prscope.db"
-CURRENT_SCHEMA_VERSION = 7
+CURRENT_SCHEMA_VERSION = 8
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -112,6 +112,8 @@ CREATE TABLE IF NOT EXISTS planning_sessions (
     repo_name TEXT NOT NULL,
     title TEXT NOT NULL,
     requirements TEXT NOT NULL,
+    author_model TEXT,
+    critic_model TEXT,
     status TEXT NOT NULL,
     seed_type TEXT NOT NULL,
     seed_ref TEXT,
@@ -307,6 +309,8 @@ class PlanningSession:
     repo_name: str
     title: str
     requirements: str
+    author_model: str | None
+    critic_model: str | None
     status: str
     seed_type: str
     seed_ref: str | None
@@ -544,13 +548,28 @@ class Store:
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
             current = 7
 
+        # v7 -> v8: persist per-session model defaults
+        if current < 8:
+            additions = (
+                ("planning_sessions", "author_model", "TEXT"),
+                ("planning_sessions", "critic_model", "TEXT"),
+            )
+            for table, column, sql_type in additions:
+                if not self._column_exists(conn, table, column):
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+            current = 8
+
         self._set_schema_version(conn, current)
     
     @contextmanager
     def _connect(self) -> Generator[sqlite3.Connection, None, None]:
         """Context manager for database connection."""
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
+        # Improve concurrent read/write behavior for live API polling during drafting.
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA busy_timeout=30000")
         try:
             yield conn
             conn.commit()
@@ -933,6 +952,8 @@ class Store:
         title: str,
         requirements: str,
         seed_type: str,
+        author_model: str | None = None,
+        critic_model: str | None = None,
         seed_ref: str | None = None,
         status: str = "drafting",
         session_id: str | None = None,
@@ -944,17 +965,19 @@ class Store:
             conn.execute(
                 """
                 INSERT INTO planning_sessions
-                    (id, repo_name, title, requirements, status, seed_type, seed_ref,
+                    (id, repo_name, title, requirements, author_model, critic_model, status, seed_type, seed_ref,
                      current_round, session_total_cost_usd, max_prompt_tokens, confidence_trend,
                      converged_early,
                      clarifications_log_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     sid,
                     repo_name,
                     title,
                     requirements,
+                    author_model,
+                    critic_model,
                     status,
                     seed_type,
                     seed_ref,
@@ -1050,6 +1073,8 @@ class Store:
         *,
         status: str | None = None,
         requirements: str | None = None,
+        author_model: str | None = None,
+        critic_model: str | None = None,
         current_round: int | None = None,
         seed_ref: str | None = None,
         session_total_cost_usd: float | None = None,
@@ -1067,6 +1092,12 @@ class Store:
         if requirements is not None:
             updates.append("requirements = ?")
             params.append(requirements)
+        if author_model is not None:
+            updates.append("author_model = ?")
+            params.append(author_model)
+        if critic_model is not None:
+            updates.append("critic_model = ?")
+            params.append(critic_model)
         if current_round is not None:
             updates.append("current_round = ?")
             params.append(current_round)
