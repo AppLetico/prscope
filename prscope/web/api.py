@@ -248,6 +248,25 @@ def create_app() -> FastAPI:
     async def get_models() -> dict[str, Any]:
         return {"items": list_models()}
 
+    @app.get("/api/repos")
+    async def list_repos() -> dict[str, Any]:
+        config = PrscopeConfig.load(registry._config_root())
+        repos = config.list_repos()
+        cwd_path = Path.cwd()
+        return {
+            "cwd": {
+                "name": cwd_path.name,
+                "path": str(cwd_path),
+            },
+            "items": [
+                {
+                    "name": repo.name,
+                    "path": str(repo.resolved_path),
+                }
+                for repo in repos
+            ]
+        }
+
     @app.get("/api/sessions")
     async def list_sessions(
         repo: Optional[str] = Query(default=None),
@@ -377,6 +396,27 @@ def create_app() -> FastAPI:
                 critic_model=critic_model,
                 rebuild_memory=payload.rebuild_memory,
             )
+            # Chat session starts as "preparing"; memory build runs in background, progress via SSE
+            async def emit_setup_event(event: dict[str, Any]) -> None:
+                registry.note_event(session.id, event)
+                await emitter.emit(session.id, event)
+
+            async def run_chat_setup() -> None:
+                try:
+                    await runtime.continue_chat_setup(
+                        session.id,
+                        rebuild_memory=payload.rebuild_memory,
+                        event_callback=emit_setup_event,
+                    )
+                    logger.info(
+                        "api.sessions chat setup complete session_id=%s",
+                        session.id,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("api.sessions chat setup failed session_id=%s", session.id)
+                    await emit_setup_event({"type": "error", "message": str(exc)})
+
+            asyncio.create_task(run_chat_setup())
             logger.info(
                 "api.sessions created mode=chat session_id={} runtime_s={:.3f} total_s={:.3f}",
                 session.id,
@@ -466,7 +506,42 @@ def create_app() -> FastAPI:
                 author_model_override=author_model,
                 critic_model_override=critic_model,
                 event_callback=callback,
+                defer_initial_draft=True,
             )
+            logger.info(
+                "api.sessions discovery turn session_id={} complete={} questions={}",
+                session_id,
+                result.complete,
+                len(result.questions),
+            )
+            if result.complete:
+                draft_requirements = result.summary or payload.message
+                logger.info(
+                    "api.sessions discovery complete session_id={} scheduling initial draft",
+                    session_id,
+                )
+
+                async def _continue_discovery_draft_task() -> None:
+                    try:
+                        await runtime.continue_discovery_draft(
+                            session_id=session_id,
+                            requirements=draft_requirements,
+                            author_model_override=author_model,
+                            event_callback=callback,
+                        )
+                        logger.info(
+                            "api.sessions discovery draft complete session_id={}",
+                            session_id,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.exception(
+                            "api.sessions discovery draft failed session_id=%s",
+                            session_id,
+                        )
+                        await callback({"type": "error", "message": f"Initial draft failed: {exc}"})
+
+                task = asyncio.create_task(_continue_discovery_draft_task())
+                task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
             return {"result": asdict(result)}
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc

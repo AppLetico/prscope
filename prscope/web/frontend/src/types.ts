@@ -1,5 +1,6 @@
 export type SessionStatus =
   | "created"
+  | "preparing"
   | "discovering"
   | "discovery"
   | "drafting"
@@ -21,6 +22,8 @@ export interface PlanningSession {
   current_round: number;
   created_at: string;
   updated_at: string;
+  session_total_cost_usd?: number | null;
+  max_prompt_tokens?: number | null;
 }
 
 export interface PlanningTurn {
@@ -91,6 +94,11 @@ export interface ModelCatalogItem {
   context_window_tokens?: number | null;
 }
 
+export interface RepoProfileSummary {
+  name: string;
+  path: string;
+}
+
 export type UIEvent =
   | { type: "thinking"; message: string }
   | {
@@ -126,4 +134,6 @@ export type UIEvent =
       context_window_tokens?: number;
       context_usage_ratio?: number;
     }
-  | { type: "clarification_needed"; question: string; context?: string; source?: string };
+  | { type: "clarification_needed"; question: string; context?: string; source?: string }
+  | { type: "setup_progress"; step: string }
+  | { type: "discovery_ready"; opening: string };

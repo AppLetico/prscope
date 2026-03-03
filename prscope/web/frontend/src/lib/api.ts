@@ -4,6 +4,7 @@ import type {
   PlanVersion,
   PlanningSession,
   PlanningTurn,
+  RepoProfileSummary,
 } from "../types";
 
 const REPO_STORAGE_KEY = "prscope.web.repo";
@@ -17,6 +18,21 @@ function getRepoContext(): string | null {
     return repo;
   }
   return window.localStorage.getItem(REPO_STORAGE_KEY);
+}
+
+/** Set repo context (localStorage). Caller should also update URL search params if needed. */
+export function setRepoContext(repo: string | null): void {
+  if (repo) {
+    window.localStorage.setItem(REPO_STORAGE_KEY, repo);
+  } else {
+    window.localStorage.removeItem(REPO_STORAGE_KEY);
+  }
+}
+
+function pathWithRepo(path: string, repo: string | null): string {
+  if (repo == null) return path;
+  const separator = path.includes("?") ? "&" : "?";
+  return `${path}${separator}repo=${encodeURIComponent(repo)}`;
 }
 
 export function getActiveRepoContext(): string | null {
@@ -55,9 +71,7 @@ export function setStoredModelSelection(
 
 function withRepoQuery(path: string): string {
   const repo = getRepoContext();
-  if (!repo) return path;
-  const separator = path.includes("?") ? "&" : "?";
-  return `${path}${separator}repo=${encodeURIComponent(repo)}`;
+  return pathWithRepo(path, repo);
 }
 
 function withRepoBody<T extends Record<string, unknown>>(body: T): T & { repo?: string } {
@@ -84,8 +98,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return (await response.json()) as T;
 }
 
-export function listSessions() {
-  return request<{ items: PlanningSession[] }>(withRepoQuery("/api/sessions"));
+export function listSessions(repo?: string | null) {
+  const effectiveRepo = repo !== undefined ? repo : getRepoContext();
+  return request<{ items: PlanningSession[] }>(pathWithRepo("/api/sessions", effectiveRepo));
+}
+
+export function listRepos() {
+  return request<{ cwd: { name: string; path: string }; items: RepoProfileSummary[] }>("/api/repos");
 }
 
 export function createChatSession(models?: { author_model?: string; critic_model?: string }) {
@@ -120,9 +139,9 @@ export function sendDiscoveryMessage(
   message: string,
   models?: { author_model?: string; critic_model?: string },
 ) {
-  return request<{ result: DiscoveryTurnResult }>(withRepoQuery(`/api/sessions/${sessionId}/message`), {
+  return request<{ result: DiscoveryTurnResult }>(`/api/sessions/${sessionId}/message`, {
     method: "POST",
-    body: JSON.stringify(withRepoBody({ message, ...models })),
+    body: JSON.stringify({ message, ...models }),
   });
 }
 
@@ -135,9 +154,9 @@ export function runRound(
     critic: Record<string, unknown>;
     author: Record<string, unknown>;
     convergence: { converged: boolean; reason: string; change_pct: number };
-  }>(withRepoQuery(`/api/sessions/${sessionId}/round`), {
+  }>(`/api/sessions/${sessionId}/round`, {
     method: "POST",
-    body: JSON.stringify(withRepoBody({ user_input, ...models })),
+    body: JSON.stringify({ user_input, ...models }),
   });
 }
 
@@ -146,31 +165,28 @@ export function listModels() {
 }
 
 export function submitClarification(sessionId: string, answers: string[]) {
-  return request<{ ok: boolean }>(withRepoQuery(`/api/sessions/${sessionId}/clarify`), {
+  return request<{ ok: boolean }>(`/api/sessions/${sessionId}/clarify`, {
     method: "POST",
-    body: JSON.stringify(withRepoBody({ answers })),
+    body: JSON.stringify({ answers }),
   });
 }
 
 export function approveSession(sessionId: string) {
-  return request<{ approved: boolean }>(withRepoQuery(`/api/sessions/${sessionId}/approve`), {
+  return request<{ approved: boolean }>(`/api/sessions/${sessionId}/approve`, {
     method: "POST",
-    body: JSON.stringify(withRepoBody({})),
+    body: JSON.stringify({}),
   });
 }
 
 export function exportSession(sessionId: string) {
-  return request<{ files: Array<{ name: string; kind: string; url: string }> }>(
-    withRepoQuery(`/api/sessions/${sessionId}/export`),
-    {
-      method: "POST",
-      body: JSON.stringify(withRepoBody({})),
-    },
-  );
+  return request<{ files: Array<{ name: string; kind: string; url: string }> }>(`/api/sessions/${sessionId}/export`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
 }
 
 export async function downloadFile(url: string, filename: string): Promise<void> {
-  const response = await fetch(withRepoQuery(url));
+  const response = await fetch(url);
   if (!response.ok) {
     const text = await response.text();
     throw new Error(text || `Download failed: ${response.status}`);
@@ -188,5 +204,11 @@ export async function downloadFile(url: string, filename: string): Promise<void>
 }
 
 export function getDiff(sessionId: string) {
-  return request<{ diff: string }>(withRepoQuery(`/api/sessions/${sessionId}/diff`));
+  return request<{ diff: string }>(`/api/sessions/${sessionId}/diff`);
+}
+
+export function deleteSession(sessionId: string) {
+  return request<{ deleted: boolean }>(`/api/sessions/${sessionId}`, {
+    method: "DELETE",
+  });
 }

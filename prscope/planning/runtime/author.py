@@ -796,11 +796,13 @@ class AuthorAgent:
         max_output_tokens: int | None = None,
         quick_start_mode: bool = False,
         model_override: str | None = None,
+        reset_tool_history: bool = True,
     ) -> AuthorResult:
         if max_attempts is None:
             max_attempts = self.config.author_tool_rounds
-        self.tool_executor.accessed_paths.clear()
-        self.tool_executor.read_history.clear()
+        if reset_tool_history:
+            self.tool_executor.accessed_paths.clear()
+            self.tool_executor.read_history.clear()
         conversation = [
             {"role": "system", "content": AUTHOR_SYSTEM_PROMPT},
             *messages,

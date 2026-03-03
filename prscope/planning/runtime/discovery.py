@@ -14,8 +14,10 @@ from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 
 from ...config import PlanningConfig
+from ...pricing import MODEL_CONTEXT_WINDOWS
 from ...memory import MemoryStore
 from .tools import CODEBASE_TOOLS, ToolExecutor
+from .telemetry import completion_telemetry
 
 
 DISCOVERY_SYSTEM_PROMPT = """You are a planning assistant helping scope a software implementation plan.
@@ -59,6 +61,11 @@ After 1-2 exchanges when you have enough context, return ONLY this JSON (no extr
 ## Rules
 - Research first, questions second.
 - Max 3 questions per turn.
+- Batch questions in one turn: when discovery is still open, ask all unresolved questions together
+  in a single response (usually 3), not one-by-one across multiple turns.
+- Do not ask "Q2" or "Q3" in later turns if those could have been asked in the prior question batch.
+- Only ask a follow-up single question when a prior answer is genuinely ambiguous or contradictory.
+- Never repeat a question the user already answered in a previous turn.
 - If the user's message already answers all open questions, complete immediately.
 - Reference specific file paths you found when relevant.
 """
@@ -99,21 +106,32 @@ def parse_questions(reply: str) -> list[DiscoveryQuestion]:
     lines = reply.splitlines()
     i = 0
 
-    # Regex for bold question headers in a few common formats
+    # Accept both bold and plain headers:
+    #   **Q1: text** / Q1: text / Question 1: text / 1. text
     q_re = re.compile(
-        r"\*\*\s*(?:Q\s*\d*\s*[:\.]?\s*|Question\s+\d+\s*[:\.]?\s*|\d+\s*[:\.]?\s*)(.+?)\*\*",
+        r"^(?:Q\s*\d*|Question\s+\d+|\d+)\s*[:\.\)\-]\s*(.+)$",
         re.IGNORECASE,
     )
-    opt_re = re.compile(r"^([A-D])\)\s*(.+)", re.IGNORECASE)
+    # Accept option prefixes with markdown bullets and separators:
+    #   A) text / A. text / - A) text / * B. text
+    opt_re = re.compile(r"^(?:[-*]\s*)?([A-D])[\)\.\-:]\s*(.+)$", re.IGNORECASE)
+
+    def normalize_line(line: str) -> str:
+        normalized = line.strip()
+        # Strip simple markdown wrappers and bullets.
+        normalized = re.sub(r"^[-*]\s+", "", normalized)
+        normalized = normalized.replace("**", "").strip()
+        return normalized
 
     while i < len(lines):
-        q_match = q_re.search(lines[i])
+        line = normalize_line(lines[i])
+        q_match = q_re.match(line)
         if q_match:
             q_text = q_match.group(1).strip().rstrip(":?").strip() + "?"
             options: list[QuestionOption] = []
             i += 1
             while i < len(lines):
-                stripped = lines[i].strip()
+                stripped = normalize_line(lines[i])
                 opt_match = opt_re.match(stripped)
                 if opt_match:
                     letter = opt_match.group(1).upper()
@@ -164,8 +182,20 @@ class DiscoveryManager:
         self.config = config
         self.tool_executor = tool_executor
         self.memory = memory
-        self.turn_count = 0
+        self.turn_counts_by_session: dict[str, int] = {}
         self.event_callback = event_callback
+
+    def reset_session(self, session_id: str) -> None:
+        self.turn_counts_by_session[session_id] = 0
+
+    def clear_session(self, session_id: str) -> None:
+        self.turn_counts_by_session.pop(session_id, None)
+
+    def _next_turn_count(self, session_id: str) -> int:
+        current = int(self.turn_counts_by_session.get(session_id, 0))
+        next_count = current + 1
+        self.turn_counts_by_session[session_id] = next_count
+        return next_count
 
     async def _emit(self, event: dict[str, Any]) -> None:
         if self.event_callback is None:
@@ -209,6 +239,7 @@ class DiscoveryManager:
         if hasattr(litellm, "set_verbose"):
             litellm.set_verbose = False
         conversation = list(messages)
+        announced_scanning = False
 
         for _ in range(max_tool_rounds):
             response = await self._safe_completion_call(
@@ -223,6 +254,11 @@ class DiscoveryManager:
             tool_calls = getattr(message, "tool_calls", None) or []
 
             if tool_calls:
+                if not announced_scanning:
+                    announced_scanning = True
+                    await self._emit(
+                        {"type": "thinking", "message": "Scanning codebase and refining questions..."}
+                    )
                 # Execute all tool calls and append results
                 conversation.append(
                     {
@@ -331,11 +367,33 @@ class DiscoveryManager:
         last_error: Exception | None = None
         for idx, model in enumerate(models_to_try):
             try:
-                return await asyncio.to_thread(
+                llm_started = asyncio.get_running_loop().time()
+                response = await asyncio.to_thread(
                     litellm.completion,
                     model=model,
                     **kwargs,
                 )
+                llm_elapsed_ms = (asyncio.get_running_loop().time() - llm_started) * 1000.0
+                telemetry = completion_telemetry(response, model=model)
+                context_window = MODEL_CONTEXT_WINDOWS.get(model)
+                await self._emit(
+                    {
+                        "type": "token_usage",
+                        "session_stage": "discovery",
+                        "model": model,
+                        "prompt_tokens": telemetry.usage.prompt_tokens,
+                        "completion_tokens": telemetry.usage.completion_tokens,
+                        "call_cost_usd": telemetry.cost.total_cost_usd,
+                        "llm_call_latency_ms": round(llm_elapsed_ms, 2),
+                        "context_window_tokens": context_window,
+                        "context_usage_ratio": (
+                            round(float(telemetry.usage.prompt_tokens) / float(context_window), 4)
+                            if context_window and context_window > 0
+                            else None
+                        ),
+                    }
+                )
+                return response
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
                 err_text = str(exc).lower()
@@ -362,41 +420,110 @@ class DiscoveryManager:
             "that aren't already answered by the code."
         )
 
+    @staticmethod
+    def _strip_json_comments(raw: str) -> str:
+        # Best-effort cleanup for model outputs that include JS-style comments.
+        no_block = re.sub(r"/\*.*?\*/", "", raw, flags=re.DOTALL)
+        no_line = re.sub(r"//[^\n\r]*", "", no_block)
+        return no_line.strip()
+
+    @classmethod
+    def _parse_discovery_complete_candidate(cls, candidate: str) -> dict[str, Any] | None:
+        for attempt in (candidate, cls._strip_json_comments(candidate)):
+            try:
+                parsed = json.loads(attempt)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict) and str(parsed.get("discovery", "")).strip().lower() == "complete":
+                return parsed
+        return None
+
+    @staticmethod
+    def _extract_json_code_blocks(text: str) -> list[str]:
+        blocks = re.findall(r"```json\s*(\{[\s\S]*?\})\s*```", text, flags=re.IGNORECASE)
+        return [block.strip() for block in blocks if block.strip()]
+
+    @staticmethod
+    def _extract_balanced_json_objects(text: str) -> list[str]:
+        candidates: list[str] = []
+        start = text.find("{")
+        while start != -1:
+            depth = 0
+            in_string = False
+            escaped = False
+            end = -1
+            for idx in range(start, len(text)):
+                ch = text[idx]
+                if escaped:
+                    escaped = False
+                    continue
+                if ch == "\\":
+                    escaped = True
+                    continue
+                if ch == "\"":
+                    in_string = not in_string
+                    continue
+                if in_string:
+                    continue
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = idx
+                        break
+            if end != -1:
+                candidate = text[start : end + 1].strip()
+                if candidate:
+                    candidates.append(candidate)
+                start = text.find("{", end + 1)
+            else:
+                break
+        return candidates
+
+    def _extract_completion_payload(self, text: str) -> dict[str, Any] | None:
+        candidates = self._extract_json_code_blocks(text)
+        candidates.extend(self._extract_balanced_json_objects(text))
+        for candidate in candidates:
+            parsed = self._parse_discovery_complete_candidate(candidate)
+            if parsed is not None:
+                return parsed
+        return None
+
     def _try_extract_completion(self, text: str) -> DiscoveryTurnResult:
-        match = re.search(r"\{[^{}]*\"discovery\"\s*:\s*\"complete\"[^{}]*\}", text, re.DOTALL)
-        if not match:
-            questions = parse_questions(text)
-            return DiscoveryTurnResult(reply=text, complete=False, summary=None, questions=questions)
-        try:
-            parsed = json.loads(match.group(0))
-        except json.JSONDecodeError:
+        parsed = self._extract_completion_payload(text)
+        if parsed is None:
             questions = parse_questions(text)
             return DiscoveryTurnResult(reply=text, complete=False, summary=None, questions=questions)
 
-        if parsed.get("discovery") == "complete":
-            summary = str(parsed.get("summary", "")).strip()
-            prose = (text[: match.start()] + text[match.end() :]).strip()
-            return DiscoveryTurnResult(
-                reply=prose or "Discovery complete — drafting plan now.",
-                complete=True,
-                summary=summary or None,
-            )
-        questions = parse_questions(text)
-        return DiscoveryTurnResult(reply=text, complete=False, summary=None, questions=questions)
+        summary_raw = parsed.get("summary", "")
+        if isinstance(summary_raw, str):
+            summary = summary_raw.strip()
+        elif summary_raw:
+            summary = json.dumps(summary_raw, ensure_ascii=False)
+        else:
+            summary = ""
+        # Remove fenced JSON blocks from chat-visible prose to keep response clean.
+        prose = re.sub(r"```json[\s\S]*?```", "", text, flags=re.IGNORECASE).strip()
+        return DiscoveryTurnResult(
+            reply=prose or "Discovery complete — drafting plan now.",
+            complete=True,
+            summary=summary or None,
+        )
 
     async def handle_turn(
         self,
         conversation: list[dict[str, Any]],
+        session_id: str = "default",
         model_override: str | None = None,
     ) -> DiscoveryTurnResult:
-        self.turn_count += 1
+        turn_count = self._next_turn_count(session_id)
 
-        if self.turn_count >= self.config.discovery_max_turns:
+        if turn_count >= self.config.discovery_max_turns:
             summary = await self.force_summary(conversation)
             return DiscoveryTurnResult(
                 reply=(
-                    f"Discovery limit reached ({self.config.discovery_max_turns} turns). "
-                    "Proceeding with draft."
+                    "I have enough context to start drafting your plan now."
                 ),
                 complete=True,
                 summary=summary,
@@ -417,13 +544,89 @@ class DiscoveryManager:
             system_content += f"\n\n## Pre-built Codebase Memory\n{memory_context}"
 
         messages = [{"role": "system", "content": system_content}, *conversation]
-        await self._emit({"type": "thinking", "message": "Scanning codebase and refining questions..."})
+        await self._emit({"type": "thinking", "message": "Refining questions from available context..."})
         response = await self._llm_call_with_tools(
             messages,
             max_tool_rounds=self.config.discovery_tool_rounds,
             model_override=model_override,
         )
-        return self._try_extract_completion(response)
+        parsed = self._try_extract_completion(response)
+        # Guardrail: discovery should ask a batched question set (2-3), not one-by-one.
+        if not parsed.complete and len(parsed.questions) == 1:
+            expanded = await self._expand_question_batch(
+                original_response=response,
+                model_override=model_override,
+            )
+            expanded_parsed = self._try_extract_completion(expanded)
+            if not expanded_parsed.complete and len(expanded_parsed.questions) >= 2:
+                return expanded_parsed
+            # Retry once more to reduce one-by-one drift from weaker model replies.
+            expanded_retry = await self._expand_question_batch(
+                original_response=expanded,
+                model_override=model_override,
+            )
+            expanded_retry_parsed = self._try_extract_completion(expanded_retry)
+            if not expanded_retry_parsed.complete and len(expanded_retry_parsed.questions) >= 2:
+                return expanded_retry_parsed
+        # Guardrail: if the model returned prose (no questions, not complete) it
+        # likely decided discovery is done but forgot to emit the completion JSON.
+        # Ask it to either emit the JSON payload or provide more questions.
+        if not parsed.complete and len(parsed.questions) == 0:
+            reformatted = await self._force_completion_or_questions(
+                original_response=response,
+                model_override=model_override,
+            )
+            reformatted_parsed = self._try_extract_completion(reformatted)
+            if reformatted_parsed.complete or len(reformatted_parsed.questions) > 0:
+                return reformatted_parsed
+            # If still empty after reformat, treat as implicit completion so the
+            # session can proceed rather than hanging with no questions and no draft.
+            summary = parsed.reply[:500] if parsed.reply else "Requirements gathered from conversation."
+            return DiscoveryTurnResult(
+                reply=parsed.reply or "Discovery complete — drafting plan now.",
+                complete=True,
+                summary=summary,
+                questions=[],
+            )
+        return parsed
+
+    async def _force_completion_or_questions(self, original_response: str, model_override: str | None = None) -> str:
+        """Ask the model to reformat a prose-only response into either the completion JSON or questions."""
+        prompt = (
+            "Your previous response contained neither discovery questions nor the required completion JSON.\n"
+            "You must do one of the following:\n\n"
+            "Option A — If you have all the information needed, emit ONLY this JSON (no prose):\n"
+            '{"discovery":"complete","summary":"<comprehensive requirements summary>"}\n\n'
+            "Option B — If you need more information, emit 2-3 discovery questions in this exact format:\n"
+            "Q1: ...\nA) ...\nB) ...\nC) ...\nD) Other — describe your preference\n\n"
+            "Do not include any other text. Choose exactly one option.\n\n"
+            f"Your previous response was:\n{original_response}"
+        )
+        return await self._llm_call(
+            [
+                {"role": "system", "content": DISCOVERY_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            model_override=model_override,
+        )
+
+    async def _expand_question_batch(self, original_response: str, model_override: str | None = None) -> str:
+        """Rewrite a singleton question into a full 2-3 question discovery batch."""
+        prompt = (
+            "Rewrite the discovery questions as a single batched response with 2-3 questions.\n"
+            "Return only question blocks in this exact format:\n"
+            "Q1: ...\nA) ...\nB) ...\nC) ...\nD) Other — describe your preference\n\n"
+            "Do not include any explanatory prose before or after questions.\n"
+            "Do not ask one question at a time.\n\n"
+            f"Original response:\n{original_response}"
+        )
+        return await self._llm_call(
+            [
+                {"role": "system", "content": DISCOVERY_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            model_override=model_override,
+        )
 
     async def force_summary(
         self,

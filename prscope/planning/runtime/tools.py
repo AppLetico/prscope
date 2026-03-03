@@ -84,7 +84,7 @@ CODEBASE_TOOLS = [
         "type": "function",
         "function": {
             "name": "ask_clarification",
-            "description": "Ask the user a clarification question and pause progression",
+            "description": "Ask the user a clarification question that CANNOT be answered by scanning the codebase. Only call this AFTER you have used list_files, read_file, and grep_code to exhaust relevant file-based evidence. Never ask about directory structure, file locations, test frameworks, or naming conventions without first calling list_files('.') to inspect the root.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -136,6 +136,11 @@ class ToolExecutor:
         self._last_ttl_cleanup_at: datetime | None = None
 
     def set_session(self, session_id: str) -> None:
+        # Avoid cross-session evidence leakage while preserving continuity
+        # within the same session across discovery -> drafting transitions.
+        if self.session_id is not None and self.session_id != session_id:
+            self.accessed_paths.clear()
+            self.read_history.clear()
         self.session_id = session_id
 
     def maybe_cleanup_artifacts(self, max_age_days: int = 7) -> None:

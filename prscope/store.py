@@ -1425,6 +1425,20 @@ class Store:
             row = conn.execute("SELECT * FROM plan_versions WHERE id = last_insert_rowid()").fetchone()
             return PlanVersion(**dict(row))
 
+    def update_plan_version_convergence(
+        self, session_id: str, round_number: int, convergence_score: float
+    ) -> None:
+        """Update the convergence score of an existing plan version (after check_convergence)."""
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE plan_versions
+                SET convergence_score = ?
+                WHERE session_id = ? AND round = ?
+                """,
+                (convergence_score, session_id, round_number),
+            )
+
     def get_plan_versions(self, session_id: str, limit: int = 20) -> list[PlanVersion]:
         """Get latest plan versions for a session."""
         with self._connect() as conn:

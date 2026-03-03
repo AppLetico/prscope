@@ -8,6 +8,10 @@ def test_model_catalog_resolves_known_model():
     assert model is not None
     assert model["provider"] == "openai"
 
+    frontier = get_model("claude-sonnet-4-6")
+    assert frontier is not None
+    assert frontier["provider"] == "anthropic"
+
 
 def test_model_catalog_availability_reflects_env(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)

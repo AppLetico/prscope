@@ -425,6 +425,11 @@ make run
 
 # Start discovery-mode planning
 make plan-chat
+
+# Run the web app (two terminals)
+make web              # show instructions
+make web-backend      # API on :8420 (loads .env)
+make web-frontend     # Vite on :5173
 ```
 
 For performance runs, use the [Benchmark Harness](#benchmark-harness) section above.

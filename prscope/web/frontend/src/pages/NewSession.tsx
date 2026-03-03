@@ -1,25 +1,31 @@
 import { useState, useRef, useEffect } from "react";
-import { useNavigate, Link } from "react-router-dom";
+import { useNavigate, Link, useSearchParams } from "react-router-dom";
 import {
   createChatSession,
   createRequirementsSession,
   getActiveRepoContext,
   getStoredModelSelection,
+  listRepos,
   listModels,
+  setRepoContext,
   setStoredModelSelection,
 } from "../lib/api";
 import { ArrowLeft, MessageSquare, FileText, Loader2 } from "lucide-react";
 import { clsx } from "clsx";
-import type { ModelCatalogItem } from "../types";
+import type { ModelCatalogItem, RepoProfileSummary } from "../types";
 
 export function NewSessionPage() {
   const navigate = useNavigate();
-  const activeRepo = getActiveRepoContext();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const urlRepo = searchParams.get("repo");
+  const [activeRepo, setActiveRepo] = useState<string | null>(() => urlRepo ?? getActiveRepoContext());
   const [mode, setMode] = useState<"chat" | "requirements">("chat");
   const [requirements, setRequirements] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
   const [models, setModels] = useState<ModelCatalogItem[]>([]);
+  const [repos, setRepos] = useState<RepoProfileSummary[]>([]);
+  const [cwd, setCwd] = useState<{ name: string; path: string } | null>(null);
   const [authorModel, setAuthorModel] = useState("");
   const [criticModel, setCriticModel] = useState("");
   const inputRef = useRef<HTMLTextAreaElement>(null);
@@ -29,6 +35,37 @@ export function NewSessionPage() {
       inputRef.current.focus();
     }
   }, [mode]);
+
+  useEffect(() => {
+    setActiveRepo(urlRepo ?? getActiveRepoContext());
+  }, [urlRepo]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void listRepos()
+      .then((result) => {
+        if (!cancelled) {
+          setRepos(result.items);
+          setCwd(result.cwd);
+          // If current repo is not in the server's list (e.g. different config), clear it so we use auto-detect
+          const names = new Set(result.items.map((r) => r.name));
+          setActiveRepo((current) => {
+            if (current != null && !names.has(current)) {
+              setRepoContext(null);
+              setSearchParams({});
+              return null;
+            }
+            return current;
+          });
+        }
+      })
+      .catch(() => {
+        // Keep New Plan usable even when repo discovery fails.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -50,6 +87,16 @@ export function NewSessionPage() {
       cancelled = true;
     };
   }, [activeRepo]);
+
+  const handleRepoChange = (repo: string | null) => {
+    setActiveRepo(repo);
+    setRepoContext(repo);
+    if (repo) {
+      setSearchParams({ repo });
+    } else {
+      setSearchParams({});
+    }
+  };
 
   const submit = async () => {
     if (mode === "requirements" && !requirements.trim()) return;
@@ -98,7 +145,7 @@ export function NewSessionPage() {
             <p className="text-zinc-500 mt-2">Start a new planning session to scope out your next feature.</p>
             {!activeRepo ? (
               <p className="text-zinc-600 text-sm mt-2">
-                No explicit repo selected in the UI. Backend auto-detection is enabled; use `?repo=&lt;name&gt;` only to pin a repo.
+                No explicit repo selected. Auto-detection is enabled.
               </p>
             ) : (
               <p className="text-zinc-600 text-sm mt-2">
@@ -141,6 +188,23 @@ export function NewSessionPage() {
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+          <label className="flex flex-col gap-1 text-sm text-zinc-300 md:col-span-2">
+            <span>Repository</span>
+            <select
+              value={activeRepo ?? ""}
+              onChange={(event) => handleRepoChange(event.target.value || null)}
+              className="h-9 rounded-md border border-zinc-800 bg-zinc-950 px-2 text-zinc-200"
+            >
+              <option value="">
+                {cwd ? `Auto-detect (${cwd.name})` : "Auto-detect (current working directory)"}
+              </option>
+              {repos.map((repo) => (
+                <option key={repo.name} value={repo.name}>
+                  {repo.name}
+                </option>
+              ))}
+            </select>
+          </label>
           <label className="flex flex-col gap-1 text-sm text-zinc-300">
             <span>Author model</span>
             <select

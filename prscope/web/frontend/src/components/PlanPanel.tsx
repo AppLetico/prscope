@@ -8,10 +8,19 @@ interface PlanPanelProps {
   content: string;
   isDiffMode?: boolean;
   status?: SessionStatus;
+  activityMessage?: string | null;
+  isRefreshing?: boolean;
 }
 
-export function PlanPanel({ content, isDiffMode = false, status }: PlanPanelProps) {
+export function PlanPanel({
+  content,
+  isDiffMode = false,
+  status,
+  activityMessage = null,
+  isRefreshing = false,
+}: PlanPanelProps) {
   const [copied, setCopied] = useState(false);
+  const showLiveIndicator = Boolean(activityMessage) || isRefreshing;
 
   if (!content) {
     const isInProgress = status === "discovering"
@@ -67,7 +76,15 @@ export function PlanPanel({ content, isDiffMode = false, status }: PlanPanelProp
 
   return (
     <div className="h-full overflow-y-auto bg-zinc-900/10 scroll-smooth relative">
-      <div className="sticky top-4 z-10 flex justify-end px-6">
+      <div className="sticky top-4 z-10 flex items-center justify-between gap-4 px-6">
+        {showLiveIndicator ? (
+          <div className="inline-flex max-w-[70%] items-center gap-2 rounded-md border border-indigo-500/30 bg-indigo-500/10 px-2 py-1 text-[11px] text-indigo-200 llm-status-glow">
+            <span className="inline-block h-1.5 w-1.5 rounded-full bg-indigo-300 animate-pulse" />
+            <span className="truncate llm-status-motion">
+              {activityMessage ?? "Refreshing draft..."}
+            </span>
+          </div>
+        ) : <span />}
         <Tooltip content={copied ? "Copied" : "Copy plan"}>
           <button
             type="button"

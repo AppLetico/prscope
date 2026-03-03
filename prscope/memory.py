@@ -10,11 +10,12 @@ import logging
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 
 import yaml
 
 from .config import PlanningConfig, RepoProfile
+from .pricing import MODEL_CONTEXT_WINDOWS, estimate_cost_usd
 from .planning.scanners import ScannerBackend, get_scanner
 
 logger = logging.getLogger(__name__)
@@ -210,14 +211,33 @@ class MemoryStore:
             return True
         return not all((self.memory_dir / f"{block}.md").exists() for block in MEMORY_BLOCKS)
 
-    async def ensure_memory(self, profile: dict[str, Any], rebuild: bool = False) -> None:
+    async def ensure_memory(
+        self,
+        profile: dict[str, Any],
+        rebuild: bool = False,
+        progress_callback: Callable[[str], Awaitable[None]] | None = None,
+        event_callback: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> None:
         git_sha = str(profile.get("git_sha", "unknown"))
         if not self.should_rebuild(git_sha, rebuild=rebuild):
+            if progress_callback:
+                await progress_callback("Using cached codebase memory.")
             return
-        await self.build_all_blocks(profile)
+        await self.build_all_blocks(
+            profile,
+            progress_callback=progress_callback,
+            event_callback=event_callback,
+        )
         self._write_meta(git_sha)
+        if progress_callback:
+            await progress_callback("Ready.")
 
-    async def build_all_blocks(self, profile: dict[str, Any]) -> None:
+    async def build_all_blocks(
+        self,
+        profile: dict[str, Any],
+        progress_callback: Callable[[str], Awaitable[None]] | None = None,
+        event_callback: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> None:
         self.memory_dir.mkdir(parents=True, exist_ok=True)
 
         scanner_name = getattr(self._scanner, "name", "grep")
@@ -227,9 +247,13 @@ class MemoryStore:
             # no LLM call needed.  Write it as a single "context" block and
             # create lightweight stubs for the other expected blocks so the
             # rest of the system keeps working.
+            if progress_callback:
+                await progress_callback("Scanning codebase...")
             context = await asyncio.to_thread(
                 self._scanner.build_context, self.repo.resolved_path, profile
             )
+            if progress_callback:
+                await progress_callback("Building context...")
             (self.memory_dir / "context.md").write_text(context, encoding="utf-8")
             # Stubs so load_block() never returns empty string for expected blocks
             stub = f"*See context.md for full {scanner_name} output.*"
@@ -241,6 +265,8 @@ class MemoryStore:
 
         # Default grep path: scanner builds a text profile, then LLM summarises
         # it into structured memory blocks.
+        if progress_callback:
+            await progress_callback("Scanning codebase...")
         scanner_context = await asyncio.to_thread(
             self._scanner.build_context, self.repo.resolved_path, profile
         )
@@ -249,7 +275,9 @@ class MemoryStore:
 
         async def build_one(block_name: str, prompt: str) -> None:
             async with semaphore:
-                content = await self._complete(prompt)
+                if progress_callback:
+                    await progress_callback(f"Building {block_name} summary...")
+                content = await self._complete(prompt, event_callback=event_callback)
                 (self.memory_dir / f"{block_name}.md").write_text(content, encoding="utf-8")
 
         await asyncio.gather(*(build_one(name, prompt) for name, prompt in prompts.items()))
@@ -306,14 +334,18 @@ class MemoryStore:
             ),
         }
 
-    async def _complete(self, prompt: str) -> str:
+    async def _complete(
+        self,
+        prompt: str,
+        event_callback: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> str:
         try:
             import litellm
         except ImportError:
             return self._fallback_summary(prompt)
 
-        def _run_completion() -> str:
-            response = litellm.completion(
+        def _run_completion() -> Any:
+            return litellm.completion(
                 model=self.config.author_model,
                 messages=[
                     {
@@ -325,11 +357,45 @@ class MemoryStore:
                 temperature=0.1,
                 max_tokens=1200,
             )
-            content = response.choices[0].message.content
-            return str(content or "").strip()
 
         try:
-            return await asyncio.to_thread(_run_completion)
+            llm_started = asyncio.get_running_loop().time()
+            response = await asyncio.to_thread(_run_completion)
+            llm_elapsed_ms = (asyncio.get_running_loop().time() - llm_started) * 1000.0
+            content = response.choices[0].message.content
+            if event_callback is not None:
+                usage_obj = getattr(response, "usage", None)
+                prompt_tokens = int(
+                    getattr(usage_obj, "prompt_tokens", None)
+                    or getattr(usage_obj, "input_tokens", 0)
+                    or 0
+                )
+                completion_tokens = int(
+                    getattr(usage_obj, "completion_tokens", None)
+                    or getattr(usage_obj, "output_tokens", 0)
+                    or 0
+                )
+                model = self.config.author_model
+                context_window = MODEL_CONTEXT_WINDOWS.get(model)
+                estimate = estimate_cost_usd(model, prompt_tokens, completion_tokens)
+                await event_callback(
+                    {
+                        "type": "token_usage",
+                        "session_stage": "memory",
+                        "model": model,
+                        "prompt_tokens": prompt_tokens,
+                        "completion_tokens": completion_tokens,
+                        "call_cost_usd": estimate.total_cost_usd,
+                        "llm_call_latency_ms": round(llm_elapsed_ms, 2),
+                        "context_window_tokens": context_window,
+                        "context_usage_ratio": (
+                            round(float(prompt_tokens) / float(context_window), 4)
+                            if context_window and context_window > 0
+                            else None
+                        ),
+                    }
+                )
+            return str(content or "").strip()
         except Exception:
             return self._fallback_summary(prompt)
 

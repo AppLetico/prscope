@@ -90,6 +90,7 @@ class PlanningRuntime:
         self._clarification_gates.pop(session_id, None)
         self._clarification_logs.pop(session_id, None)
         self._session_working_summary.pop(session_id, None)
+        self.discovery.clear_session(session_id)
         self.tools.delete_session_artifacts(session_id)
 
     def _session_reads(self, session_id: str) -> set[str]:
@@ -346,9 +347,19 @@ class PlanningRuntime:
         emitter = AnalyticsEmitter(callback)
         await emitter.emit(event)
 
-    async def _prepare_memory(self, rebuild_memory: bool = False) -> dict[str, str]:
+    async def _prepare_memory(
+        self,
+        rebuild_memory: bool = False,
+        progress_callback: Any = None,
+        event_callback: Any = None,
+    ) -> dict[str, str]:
         profile = build_profile(self.repo.resolved_path)
-        await self.memory.ensure_memory(profile, rebuild=rebuild_memory)
+        await self.memory.ensure_memory(
+            profile,
+            rebuild=rebuild_memory,
+            progress_callback=progress_callback,
+            event_callback=event_callback,
+        )
         blocks = self.memory.load_all_blocks()
         blocks["manifesto"] = self.memory.load_manifesto()
         return blocks
@@ -358,16 +369,27 @@ class PlanningRuntime:
 
     @staticmethod
     def _author_chat_summary(plan_content: str, round_number: int) -> str:
-        referenced = sorted(re.findall(r"`([A-Za-z0-9_./-]+\.[A-Za-z0-9]+)`", plan_content))
-        file_count = len(set(referenced))
+        referenced = sorted(set(re.findall(r"`([A-Za-z0-9_./-]+\.[A-Za-z0-9]+)`", plan_content)))
+        file_count = len(referenced)
+        max_listed_files = 3
+        if file_count:
+            listed = ", ".join(referenced[:max_listed_files])
+            if file_count > max_listed_files:
+                listed = f"{listed}, +{file_count - max_listed_files} more"
+            referenced_summary = f"Referenced files: {file_count} ({listed}). "
+        else:
+            referenced_summary = f"Referenced files: {file_count}. "
         return (
-            f"Plan updated (round {round_number}). "
-            f"Referenced files: {file_count}. "
-            "Review full plan in the plan panel."
+            f"Draft ready (version {round_number + 1}). "
+            + referenced_summary
+            + "Open the plan panel to review and continue refining."
         )
 
-    @staticmethod
-    def _critic_chat_summary(critic: CriticResult) -> str:
+    def _critic_chat_summary(
+        self,
+        critic: CriticResult,
+        constraints: list[ParsedConstraint] | None = None,
+    ) -> str:
         lines = [
             (
                 f"Critic review: {critic.major_issues_remaining} major, "
@@ -375,12 +397,22 @@ class PlanningRuntime:
             ),
         ]
         if critic.hard_constraint_violations:
+            resolved_constraints = constraints if constraints is not None else self._constraints()
+            constraint_lookup = {item.id: item.text for item in resolved_constraints if item.id and item.text}
+            max_listed = 5
+            rendered_violations: list[str] = []
+            for constraint_id in critic.hard_constraint_violations[:max_listed]:
+                text = constraint_lookup.get(constraint_id, "")
+                if text:
+                    rendered_violations.append(f"{text} ({constraint_id})")
+                else:
+                    rendered_violations.append(constraint_id)
             lines.append(
                 "Hard-constraint violations: "
-                + ", ".join(critic.hard_constraint_violations[:5])
+                + ", ".join(rendered_violations)
                 + (
-                    f" (+{len(critic.hard_constraint_violations) - 5} more)"
-                    if len(critic.hard_constraint_violations) > 5
+                    f" (+{len(critic.hard_constraint_violations) - max_listed} more)"
+                    if len(critic.hard_constraint_violations) > max_listed
                     else ""
                 )
             )
@@ -424,7 +456,10 @@ class PlanningRuntime:
                 session_id,
             )
             memory_started = time.perf_counter()
-            await self._prepare_memory(rebuild_memory=rebuild_memory)
+            await self._prepare_memory(
+                rebuild_memory=rebuild_memory,
+                event_callback=wrapped_event,
+            )
             await self._emit_event(
                 event_callback,
                 {
@@ -680,8 +715,8 @@ class PlanningRuntime:
         author_model: str | None = None,
         critic_model: str | None = None,
         rebuild_memory: bool = False,
-    ) -> tuple[PlanningSession, str]:
-        await self._prepare_memory(rebuild_memory=rebuild_memory)
+    ) -> tuple[PlanningSession, str | None]:
+        """Create a chat session with status 'preparing'. Call continue_chat_setup to build memory and get opening."""
         session = self.store.create_planning_session(
             repo_name=self.repo.name,
             title="New Plan (discovery)",
@@ -689,11 +724,34 @@ class PlanningRuntime:
             author_model=author_model or self.planning_config.author_model,
             critic_model=critic_model or self.planning_config.critic_model,
             seed_type="chat",
-            status="discovering",
+            status="preparing",
         )
+        return session, None
+
+    async def continue_chat_setup(
+        self,
+        session_id: str,
+        rebuild_memory: bool = False,
+        event_callback: Any | None = None,
+    ) -> str:
+        """Build memory (with progress), add opening turn, set status to discovering. Returns opening message."""
+        async def wrapped_event(event: dict[str, Any]) -> None:
+            await self._emit_event(event_callback, event, session_id)
+
+        async def on_progress(step: str) -> None:
+            await wrapped_event({"type": "setup_progress", "step": step})
+
+        await self._prepare_memory(
+            rebuild_memory=rebuild_memory,
+            progress_callback=on_progress,
+            event_callback=wrapped_event,
+        )
+        self.discovery.reset_session(session_id)
         opening = self.discovery.opening_prompt()
-        self._core(session.id).add_turn("author", opening, round_number=0)
-        return session, opening
+        self._core(session_id).add_turn("author", opening, round_number=0)
+        self.store.update_planning_session(session_id, status="discovering")
+        await wrapped_event({"type": "discovery_ready", "opening": opening})
+        return opening
 
     async def handle_discovery_turn(
         self,
@@ -702,6 +760,7 @@ class PlanningRuntime:
         author_model_override: str | None = None,
         critic_model_override: str | None = None,
         event_callback: Any | None = None,
+        defer_initial_draft: bool = False,
     ) -> DiscoveryTurnResult:
         async with self._session_lock(session_id):
             core = self._core(session_id)
@@ -728,27 +787,32 @@ class PlanningRuntime:
                 selected_author_model = self._resolve_author_model(session, author_model_override)
                 result = await self.discovery.handle_turn(
                     conversation,
+                    session_id=session_id,
                     model_override=selected_author_model,
                 )
+                self._record_session_reads(session_id, self.tools.accessed_paths.copy())
                 core.add_turn("author", result.reply, round_number=current_round)
 
                 if result.complete:
                     summary = result.summary or user_message
                     self.store.update_planning_session(session_id, requirements=summary)
                     core.transition("drafting")
-                    author_result = await self._run_initial_draft(
-                        core,
-                        requirements=summary,
-                        author_model_override=selected_author_model,
-                    )
-                    self._record_session_reads(session_id, author_result.accessed_paths)
-                    core.add_turn(
-                        "author",
-                        self._author_chat_summary(author_result.plan, 0),
-                        round_number=0,
-                    )
-                    core.save_plan_version(author_result.plan, round_number=0)
-                    core.transition("refining")
+                    if defer_initial_draft:
+                        pass
+                    else:
+                        author_result = await self._run_initial_draft(
+                            core,
+                            requirements=summary,
+                            author_model_override=selected_author_model,
+                        )
+                        self._record_session_reads(session_id, author_result.accessed_paths)
+                        core.add_turn(
+                            "author",
+                            self._author_chat_summary(author_result.plan, 0),
+                            round_number=0,
+                        )
+                        core.save_plan_version(author_result.plan, round_number=0)
+                        core.transition("refining")
 
                 return result
             except Exception:
@@ -763,12 +827,29 @@ class PlanningRuntime:
                         await maybe
                 raise
 
+    async def continue_discovery_draft(
+        self,
+        session_id: str,
+        requirements: str,
+        author_model_override: str | None = None,
+        event_callback: Any | None = None,
+    ) -> PlanningSession:
+        """Continue drafting after discovery has already transitioned session to drafting."""
+        return await self._continue_initial_draft(
+            session_id=session_id,
+            requirements=requirements,
+            author_model_override=author_model_override,
+            event_callback=event_callback,
+            rebuild_memory=False,
+        )
+
     async def _run_initial_draft(
         self,
         core: PlanningCore,
         requirements: str,
         author_model_override: str | None = None,
     ) -> AuthorResult:
+        session = core.get_session()
         blocks = self.memory.load_all_blocks()
         manifesto = self._truncate_memory_block("manifesto", self.memory.load_manifesto())
         manifesto_excerpt = self._excerpt(manifesto, max_lines=40)
@@ -817,11 +898,13 @@ class PlanningRuntime:
             max_attempts=min(max_attempts, self.planning_config.author_tool_rounds),
             max_tool_calls=max_tool_calls,
             min_grounding_ratio=min_grounding_ratio,
+            grounding_paths=self._session_reads(session.id),
             draft_phase="planner",
             require_clarification_first=require_clarification_first and self.author.clarification_handler is not None,
             max_output_tokens=max_output_tokens,
             quick_start_mode=True,
             model_override=author_model_override,
+            reset_tool_history=False,
         )
         return result
 
@@ -1075,7 +1158,7 @@ class PlanningRuntime:
                         session_id,
                         clarifications_log_json=json.dumps(self._clarification_logs.get(session_id, [])),
                     )
-                critic_content = self._critic_chat_summary(critic_result)
+                critic_content = self._critic_chat_summary(critic_result, constraints=constraints)
                 budget = TokenBudgetManager(context_window=128_000, max_completion_tokens=4000)
                 budget.enforce_required([requirements, f"Manifesto:\n{manifesto_excerpt}"])
                 remaining_prompt = budget.available_prompt_tokens - estimate_tokens(requirements)
@@ -1227,6 +1310,9 @@ class PlanningRuntime:
                     session_id,
                 )
                 convergence = core.check_convergence()
+                # Persist convergence score for UI: 1.0 when converged, else 1 - change_pct
+                convergence_score = 1.0 if convergence.converged else max(0.0, 1.0 - convergence.change_pct)
+                self.store.update_plan_version_convergence(session_id, round_number, convergence_score)
                 plan_quality_score = self._plan_quality_score(
                     critic=critic_result,
                     grounding_ratio=author_result.grounding_ratio,

@@ -140,3 +140,55 @@ body {
   margin-bottom: 1em;
   border-color: #3f3f46;
 }
+
+.llm-status-glow {
+  text-shadow:
+    0 0 12px rgba(129, 140, 248, 0.5),
+    0 0 30px rgba(129, 140, 248, 0.3);
+  filter: drop-shadow(0 0 8px rgba(99, 102, 241, 0.35));
+  animation: llm-status-glow-pulse 2.2s ease-in-out infinite;
+}
+
+@keyframes llm-status-glow-pulse {
+  0%,
+  100% {
+    opacity: 0.88;
+    text-shadow:
+      0 0 8px rgba(129, 140, 248, 0.28),
+      0 0 18px rgba(129, 140, 248, 0.16);
+  }
+  50% {
+    opacity: 1;
+    text-shadow:
+      0 0 14px rgba(129, 140, 248, 0.44),
+      0 0 28px rgba(129, 140, 248, 0.24);
+  }
+}
+
+.llm-status-motion {
+  background-image: linear-gradient(
+    110deg,
+    rgba(212, 212, 216, 0.88) 0%,
+    rgba(199, 210, 254, 0.92) 24%,
+    rgba(255, 255, 255, 1) 48%,
+    rgba(165, 180, 252, 0.9) 68%,
+    rgba(212, 212, 216, 0.88) 100%
+  );
+  background-size: 220% 100%;
+  background-position: 0% 50%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+  animation:
+    llm-status-glow-pulse 2.2s ease-in-out infinite,
+    llm-status-text-sweep 2.8s linear infinite;
+}
+
+@keyframes llm-status-text-sweep {
+  from {
+    background-position: 0% 50%;
+  }
+  to {
+    background-position: 220% 50%;
+  }
+}

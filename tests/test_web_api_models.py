@@ -30,6 +30,24 @@ def test_models_endpoint_returns_catalog(tmp_path, monkeypatch):
     payload = response.json()
     assert isinstance(payload.get("items"), list)
     assert any(item.get("model_id") == "gpt-4o-mini" for item in payload["items"])
+    assert any(item.get("model_id") == "o3" for item in payload["items"])
+    assert any(item.get("model_id") == "claude-opus-4-6" for item in payload["items"])
+    assert any(item.get("model_id") == "gemini-3.1-pro" for item in payload["items"])
+
+
+def test_repos_endpoint_returns_configured_profiles(tmp_path, monkeypatch):
+    _write_minimal_config(tmp_path)
+    monkeypatch.setenv("PRSCOPE_CONFIG_ROOT", str(tmp_path))
+    app = create_app()
+    client = TestClient(app)
+
+    response = client.get("/api/repos")
+    assert response.status_code == 200
+    payload = response.json()
+    assert isinstance(payload.get("items"), list)
+    assert len(payload["items"]) >= 1
+    assert payload["items"][0]["name"]
+    assert payload["items"][0]["path"]
 
 
 def test_create_session_rejects_unavailable_model(tmp_path, monkeypatch):

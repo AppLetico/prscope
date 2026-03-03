@@ -4,7 +4,7 @@
 # Use python3 on macOS, python elsewhere
 PYTHON := $(shell command -v python3 2>/dev/null || echo python)
 
-.PHONY: install dev test lint format check clean help
+.PHONY: install dev test lint format check clean help web web-backend web-frontend web-kill
 
 # Default target
 help:
@@ -28,6 +28,13 @@ help:
 	@echo "  make evaluate-all Evaluate all pending PRs (loops until done)"
 	@echo "  make plan-chat    Start interactive discovery mode"
 	@echo "  make digest       Show PR digest"
+	@echo ""
+	@echo "Web app (run in two terminals)"
+	@echo ""
+	@echo "  make web-backend   Start API server (port 8420, loads .env)"
+	@echo "  make web-frontend  Start Vite dev server (port 5173)"
+	@echo "  make web-kill      Kill processes on 8420 and 5173 (free the ports)"
+	@echo "  make web           Show instructions to run backend + frontend"
 	@echo ""
 
 # Install package in editable mode
@@ -108,3 +115,27 @@ run: profile sync evaluate
 # Full workflow: profile -> sync (full) -> evaluate (all)
 run-full: profile sync-full evaluate-all
 	@echo "Prscope full workflow complete"
+
+# --- Web app ---
+
+# Show how to run the web app
+web:
+	@echo "Run the app in two terminals:"
+	@echo "  Terminal 1: make web-backend"
+	@echo "  Terminal 2: make web-frontend"
+	@echo "Then open: http://localhost:5173/new?repo=prscope"
+	@echo ""
+
+# Start API server (loads .env from repo root)
+web-backend:
+	@bash -c 'set -a; [ -f .env ] && . ./.env; set +a; exec uvicorn prscope.web.api:create_app --factory --host 127.0.0.1 --port 8420'
+
+# Start Vite dev server (frontend)
+web-frontend:
+	cd prscope/web/frontend && npm run dev
+
+# Kill processes on backend (8420) and frontend (5173) ports
+web-kill:
+	@-lsof -ti :8420 | xargs kill 2>/dev/null || true
+	@-lsof -ti :5173 | xargs kill 2>/dev/null || true
+	@echo "Killed processes on 8420 and 5173 (if any)."

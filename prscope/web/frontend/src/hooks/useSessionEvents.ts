@@ -81,11 +81,24 @@ function normalizeEvent(rawType: string, rawPayload: Record<string, unknown>): U
       source: rawPayload.source ? String(rawPayload.source) : undefined,
     };
   }
+  if (rawType === "setup_progress") {
+    return { type: "setup_progress", step: String(rawPayload.step ?? "") };
+  }
+  if (rawType === "discovery_ready") {
+    return { type: "discovery_ready", opening: String(rawPayload.opening ?? "") };
+  }
   return null;
 }
 
-export function useSessionEvents(sessionId: string, onEvent: (event: UIEvent) => void) {
+export function useSessionEvents(
+  sessionId: string,
+  onEvent: (event: UIEvent) => void,
+  enabled = true,
+) {
   useEffect(() => {
+    if (!enabled || !sessionId) {
+      return;
+    }
     const params = new URLSearchParams(window.location.search);
     const repo = params.get("repo") ?? window.localStorage.getItem("prscope.web.repo");
     const basePath = `/api/sessions/${sessionId}/events`;
@@ -114,6 +127,8 @@ export function useSessionEvents(sessionId: string, onEvent: (event: UIEvent) =>
     bind("warning");
     bind("token_usage");
     bind("clarification_needed");
+    bind("setup_progress");
+    bind("discovery_ready");
 
     eventSource.onmessage = (event) => {
       try {
@@ -128,5 +143,5 @@ export function useSessionEvents(sessionId: string, onEvent: (event: UIEvent) =>
     return () => {
       eventSource.close();
     };
-  }, [sessionId, onEvent]);
+  }, [sessionId, onEvent, enabled]);
 }
