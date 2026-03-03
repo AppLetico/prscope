@@ -481,20 +481,21 @@ class DiscoveryManager:
                 break
         return candidates
 
-    def _extract_completion_payload(self, text: str) -> dict[str, Any] | None:
+    def _extract_completion_payload(self, text: str) -> tuple[dict[str, Any], str] | None:
         candidates = self._extract_json_code_blocks(text)
         candidates.extend(self._extract_balanced_json_objects(text))
         for candidate in candidates:
             parsed = self._parse_discovery_complete_candidate(candidate)
             if parsed is not None:
-                return parsed
+                return parsed, candidate
         return None
 
     def _try_extract_completion(self, text: str) -> DiscoveryTurnResult:
-        parsed = self._extract_completion_payload(text)
-        if parsed is None:
+        payload = self._extract_completion_payload(text)
+        if payload is None:
             questions = parse_questions(text)
             return DiscoveryTurnResult(reply=text, complete=False, summary=None, questions=questions)
+        parsed, payload_text = payload
 
         summary_raw = parsed.get("summary", "")
         if isinstance(summary_raw, str):
@@ -503,8 +504,9 @@ class DiscoveryManager:
             summary = json.dumps(summary_raw, ensure_ascii=False)
         else:
             summary = ""
-        # Remove fenced JSON blocks from chat-visible prose to keep response clean.
-        prose = re.sub(r"```json[\s\S]*?```", "", text, flags=re.IGNORECASE).strip()
+        # Remove machine-readable completion payload from chat-visible prose.
+        prose = re.sub(r"```json[\s\S]*?```", "", text, flags=re.IGNORECASE)
+        prose = prose.replace(payload_text, "", 1).strip()
         return DiscoveryTurnResult(
             reply=prose or "Discovery complete — drafting plan now.",
             complete=True,

@@ -42,7 +42,7 @@ function StatusBadge({ status }: { status: string }) {
       </Tooltip>
     );
   }
-  if (status === "refining" || status === "discovery") {
+  if (status === "refining" || status === "discovering") {
     return (
       <Tooltip content="Actively working on the plan">
         <div className="flex items-center gap-1.5 cursor-default">

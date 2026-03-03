@@ -2,12 +2,12 @@ export type SessionStatus =
   | "created"
   | "preparing"
   | "discovering"
-  | "discovery"
   | "drafting"
   | "refining"
   | "converged"
   | "approved"
-  | "exported";
+  | "exported"
+  | "error";
 
 export interface PlanningSession {
   id: string;
@@ -20,6 +20,10 @@ export interface PlanningSession {
   seed_type: string;
   seed_ref: string | null;
   current_round: number;
+  pending_questions?: DiscoveryQuestion[] | null;
+  phase_message?: string | null;
+  is_processing?: boolean;
+  active_tool_calls?: ToolCallEntry[];
   created_at: string;
   updated_at: string;
   session_total_cost_usd?: number | null;
@@ -102,6 +106,16 @@ export interface RepoProfileSummary {
 export type UIEvent =
   | { type: "thinking"; message: string }
   | {
+      type: "session_state";
+      v: 1;
+      status: SessionStatus;
+      phase_message: string | null;
+      is_processing: boolean;
+      current_round: number;
+      pending_questions: DiscoveryQuestion[] | null;
+      active_tool_calls: ToolCallEntry[];
+    }
+  | {
       type: "tool_call";
       name: string;
       path?: string;
@@ -119,7 +133,7 @@ export type UIEvent =
       enabled: boolean;
       reason?: string;
     }
-  | { type: "plan_ready"; round?: number; saved_at_unix_s?: number }
+  | { type: "plan_ready"; round?: number; initial_draft?: boolean; saved_at_unix_s?: number }
   | { type: "complete"; message?: string }
   | { type: "error"; message: string }
   | { type: "warning"; message: string }

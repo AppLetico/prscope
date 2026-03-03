@@ -9,6 +9,7 @@ import json
 import logging
 import re
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,7 @@ from .tools import ToolExecutor
 MEMORY_BLOCK_KEYS = {"architecture", "modules", "patterns", "entrypoints", "context"}
 # Keep startup responsive; deeper refinement can happen in subsequent rounds.
 INITIAL_DRAFT_TIMEOUT_SECONDS = 90
+MAX_ACTIVE_TOOL_CALLS = 50
 logger = logging.getLogger(__name__)
 
 
@@ -398,6 +400,13 @@ class PlanningRuntime:
     async def _emit_event(
         self, callback: Any | None, event: dict[str, Any], session_id: str
     ) -> None:
+        emitter = AnalyticsEmitter(callback)
+        event_type = str(event.get("type", "")).strip().lower()
+        if event_type in {"tool_call", "tool_result", "complete"}:
+            snapshot = self._persist_tool_event_state(session_id, event_type, event)
+            if snapshot is not None:
+                await emitter.emit(snapshot)
+
         # Aggregate cost/token telemetry centrally before forwarding downstream.
         if event.get("type") == "token_usage":
             call_cost = float(event.get("call_cost_usd", 0.0) or 0.0)
@@ -416,8 +425,79 @@ class PlanningRuntime:
                 "session_total_usd": running_cost,
                 "max_prompt_tokens": max_prompt,
             }
-        emitter = AnalyticsEmitter(callback)
         await emitter.emit(event)
+
+    def _persist_tool_event_state(
+        self,
+        session_id: str,
+        event_type: str,
+        event: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        core = self._core(session_id)
+        session = core.get_session()
+        active = []
+        if session.active_tool_calls_json:
+            try:
+                parsed = json.loads(session.active_tool_calls_json)
+                if isinstance(parsed, list):
+                    active = [item for item in parsed if isinstance(item, dict)]
+            except json.JSONDecodeError:
+                active = []
+
+        now_iso = datetime.now(timezone.utc).isoformat()
+        if event_type == "tool_call":
+            active.append(
+                {
+                    "id": f"{int(time.time() * 1000)}-{len(active)}",
+                    "name": str(event.get("name", "tool")),
+                    "path": event.get("path"),
+                    "query": event.get("query"),
+                    "session_stage": event.get("session_stage"),
+                    "status": "running",
+                    "created_at": now_iso,
+                }
+            )
+        elif event_type == "tool_result":
+            name = str(event.get("name", "tool"))
+            stage = str(event.get("session_stage", ""))
+            matched = False
+            for idx in range(len(active) - 1, -1, -1):
+                item = active[idx]
+                if (
+                    str(item.get("name", "")) == name
+                    and str(item.get("session_stage", "")) == stage
+                    and str(item.get("status", "")) == "running"
+                ):
+                    item["status"] = "done"
+                    item["duration_ms"] = event.get("duration_ms")
+                    matched = True
+                    break
+            if not matched:
+                active.append(
+                    {
+                        "id": f"{int(time.time() * 1000)}-{len(active)}",
+                        "name": name,
+                        "session_stage": event.get("session_stage"),
+                        "status": "done",
+                        "duration_ms": event.get("duration_ms"),
+                        "created_at": now_iso,
+                    }
+                )
+        elif event_type == "complete":
+            active = []
+        else:
+            return None
+
+        active.sort(key=lambda item: str(item.get("created_at", "")))
+        if len(active) > MAX_ACTIVE_TOOL_CALLS:
+            active = active[-MAX_ACTIVE_TOOL_CALLS:]
+
+        return core.transition_and_snapshot(
+            session.status,
+            phase_message=session.phase_message,
+            active_tool_calls_json=json.dumps(active),
+            allow_round_stability=True,
+        )
 
     async def _prepare_memory(
         self,
@@ -522,6 +602,12 @@ class PlanningRuntime:
                 await self._emit_event(event_callback, event, session_id)
 
             self.author.event_callback = wrapped_event
+            snapshot = core.transition_and_snapshot(
+                "drafting",
+                phase_message="Building initial plan draft...",
+                pending_questions_json=None,
+            )
+            await wrapped_event(snapshot)
             await self._emit_event(
                 event_callback,
                 {"type": "thinking", "message": "Building initial plan draft..."},
@@ -610,34 +696,13 @@ class PlanningRuntime:
                 {
                     "type": "plan_ready",
                     "round": 0,
+                    "initial_draft": True,
                     "saved_at_unix_s": time.time(),
                 },
                 session_id,
             )
-            core.transition("refining")
-            async def _background_refine_once() -> None:
-                try:
-                    await self._emit_event(
-                        event_callback,
-                        {"type": "thinking", "message": "Running automatic refinement pass..."},
-                        session_id,
-                    )
-                    await self.run_adversarial_round(
-                        session_id=session_id,
-                        user_input=None,
-                        event_callback=event_callback,
-                    )
-                except Exception as exc:  # noqa: BLE001
-                    await self._emit_event(
-                        event_callback,
-                        {
-                            "type": "warning",
-                            "message": f"Automatic refinement pass skipped: {exc}",
-                        },
-                        session_id,
-                    )
-            background_task = asyncio.create_task(_background_refine_once())
-            background_task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
+            snapshot = core.transition_and_snapshot("refining", phase_message=None)
+            await self._emit_event(event_callback, snapshot, session_id)
             await self._emit_event(
                 event_callback,
                 {"type": "complete", "message": "Initial draft complete"},
@@ -831,8 +896,10 @@ class PlanningRuntime:
         )
         self.discovery.reset_session(session_id)
         opening = self.discovery.opening_prompt()
-        self._core(session_id).add_turn("author", opening, round_number=0)
-        self.store.update_planning_session(session_id, status="discovering")
+        core = self._core(session_id)
+        core.add_turn("author", opening, round_number=0)
+        snapshot = core.transition_and_snapshot("discovering", phase_message=None)
+        await wrapped_event(snapshot)
         await wrapped_event({"type": "discovery_ready", "opening": opening})
         return opening
 
@@ -851,9 +918,8 @@ class PlanningRuntime:
             session = core.get_session()
             if session.status not in {"discovering", "discovery"}:
                 raise ValueError("Session is not in discovery mode")
+            core.validate_command("message", session)
 
-            previous_state = session.status
-            previous_round = session.current_round
             async def wrapped_event(event: dict[str, Any]) -> None:
                 await self._emit_event(event_callback, event, session_id)
 
@@ -886,7 +952,12 @@ class PlanningRuntime:
                 if result.complete:
                     summary = result.summary or user_message
                     self.store.update_planning_session(session_id, requirements=summary)
-                    core.transition("drafting")
+                    snapshot = core.transition_and_snapshot(
+                        "drafting",
+                        phase_message="Building initial plan draft...",
+                        pending_questions_json=None,
+                    )
+                    await wrapped_event(snapshot)
                     if defer_initial_draft:
                         pass
                     else:
@@ -902,15 +973,20 @@ class PlanningRuntime:
                             round_number=0,
                         )
                         core.save_plan_version(author_result.plan, round_number=0)
-                        core.transition("refining")
+                        snapshot = core.transition_and_snapshot("refining", phase_message=None)
+                        await wrapped_event(snapshot)
+                else:
+                    snapshot = core.transition_and_snapshot(
+                        "discovering",
+                        phase_message=None,
+                        pending_questions_json=(
+                            json.dumps(result.questions) if result.questions else None
+                        ),
+                    )
+                    await wrapped_event(snapshot)
 
                 return result
             except Exception:
-                self.store.update_planning_session(
-                    session_id,
-                    status=previous_state,
-                    current_round=previous_round,
-                )
                 if event_callback:
                     maybe = event_callback({"type": "error", "message": "Discovery turn failed"})
                     if asyncio.iscoroutine(maybe):
@@ -1026,11 +1102,12 @@ class PlanningRuntime:
             session = core.get_session()
             if session.status not in {"refining", "converged", "approved"}:
                 raise ValueError(f"Session is not in refining state: {session.status}")
+            core.validate_command("round", session)
 
-            previous_state = session.status
-            previous_round = session.current_round
             if session.status == "converged":
-                core.transition("refining")
+                snapshot = core.transition_and_snapshot("refining", phase_message=None)
+                await self._emit_event(event_callback, snapshot, session_id)
+                session = core.get_session()
 
             if event_callback:
                 await self._emit_event(
@@ -1047,6 +1124,12 @@ class PlanningRuntime:
                 selected_critic_model = self._resolve_critic_model(session, critic_model_override)
 
                 round_number = session.current_round + 1
+                snapshot = core.transition_and_snapshot(
+                    "refining",
+                    phase_message="Running critique...",
+                    current_round=round_number,
+                )
+                await self._emit_event(event_callback, snapshot, session_id)
                 blocks = self.memory.load_all_blocks()
                 manifesto = self._truncate_memory_block("manifesto", self.memory.load_manifesto())
                 manifesto_excerpt = self._excerpt(manifesto, max_lines=40)
@@ -1551,9 +1634,10 @@ class PlanningRuntime:
                         major_issues=convergence.major_issues,
                     )
                 if convergence.converged:
-                    core.transition("converged")
+                    snapshot = core.transition_and_snapshot("converged", phase_message=None)
                 else:
-                    core.transition("refining")
+                    snapshot = core.transition_and_snapshot("refining", phase_message=None)
+                await self._emit_event(event_callback, snapshot, session_id)
                 if event_callback:
                     await self._emit_event(
                         event_callback,
@@ -1569,11 +1653,6 @@ class PlanningRuntime:
                 )
                 raise
             except Exception:
-                self.store.update_planning_session(
-                    session_id,
-                    status=previous_state,
-                    current_round=previous_round,
-                )
                 if event_callback:
                     await self._emit_event(
                         event_callback,

@@ -9,9 +9,12 @@ import re
 from dataclasses import dataclass
 import difflib
 from difflib import SequenceMatcher
+from datetime import datetime, timezone
+import json
+from typing import Any
 
 from ..config import PlanningConfig
-from ..store import PlanVersion, PlanningTurn, Store
+from ..store import PlanVersion, PlanningSession, PlanningTurn, Store
 
 
 @dataclass
@@ -40,19 +43,39 @@ class InvalidTransitionError(RuntimeError):
     """Raised when a state transition is not allowed."""
 
 
+class InvalidCommandError(RuntimeError):
+    """Raised when a command is invalid for current state."""
+
+
+_UNSET = object()
+
+
 class PlanningCore:
     """Deterministic planning state and convergence logic."""
 
     ALLOWED_TRANSITIONS: dict[str, set[str]] = {
-        "created": {"discovering"},
-        "discovering": {"drafting"},
-        "discovery": {"drafting"},  # backward-compatible persisted value
-        "drafting": {"refining"},
-        "refining": {"refining", "converged"},
-        "converged": {"approved", "refining"},
-        "approved": {"exported"},
+        "created": {"discovering", "error"},
+        "preparing": {"discovering", "error"},
+        "discovering": {"drafting", "error"},
+        "drafting": {"refining", "error"},
+        "refining": {"refining", "converged", "error"},
+        "converged": {"approved", "refining", "error"},
+        "approved": {"exported", "error"},
         "exported": set(),
+        "error": set(),
     }
+    VALID_COMMANDS: dict[str, set[str]] = {
+        "created": set(),
+        "preparing": set(),
+        "discovering": {"message"},
+        "drafting": set(),
+        "refining": {"message", "round"},
+        "converged": {"round", "approve"},
+        "approved": {"export"},
+        "exported": set(),
+        "error": set(),
+    }
+    WORK_STATES: set[str] = {"discovering", "drafting", "refining"}
 
     def __init__(self, store: Store, session_id: str, config: PlanningConfig):
         self.store = store
@@ -90,7 +113,6 @@ class PlanningCore:
             plan_sha=plan_sha,
             diff_from_previous=diff_from_previous,
         )
-        self.store.update_planning_session(self.session_id, current_round=round_number)
         return version
 
     def add_turn(
@@ -123,12 +145,148 @@ class PlanningCore:
         self.store.update_planning_session(self.session_id, current_round=next_round)
         return next_round
 
+    @classmethod
+    def allowed_commands_for(cls, status: str) -> list[str]:
+        return sorted(cls.VALID_COMMANDS.get(status, set()))
+
+    def validate_command(self, command_type: str, session: PlanningSession | None = None) -> None:
+        current = session or self.get_session()
+        allowed = self.VALID_COMMANDS.get(current.status, set())
+        if command_type not in allowed:
+            raise InvalidCommandError(
+                f"Command '{command_type}' is invalid for status '{current.status}'. "
+                f"Allowed: {sorted(allowed)}"
+            )
+
+    @staticmethod
+    def _parse_json(raw: str | None, default: Any) -> Any:
+        if not raw:
+            return default
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            return default
+
+    def _build_snapshot(self, session: PlanningSession) -> dict[str, Any]:
+        pending_questions = self._parse_json(session.pending_questions_json, None)
+        if pending_questions is not None and not isinstance(pending_questions, list):
+            pending_questions = None
+        active_tool_calls = self._parse_json(session.active_tool_calls_json, [])
+        if not isinstance(active_tool_calls, list):
+            active_tool_calls = []
+        return {
+            "type": "session_state",
+            "v": 1,
+            "status": session.status,
+            "phase_message": session.phase_message,
+            "is_processing": bool(session.is_processing),
+            "current_round": session.current_round,
+            "pending_questions": pending_questions,
+            "active_tool_calls": active_tool_calls,
+        }
+
+    def transition_and_snapshot(
+        self,
+        new_status: str,
+        *,
+        phase_message: str | None = None,
+        pending_questions_json: str | None | object = _UNSET,
+        active_tool_calls_json: str | None | object = _UNSET,
+        current_round: int | None = None,
+        allow_round_stability: bool = False,
+    ) -> dict[str, Any]:
+        with self.store._connect() as conn:  # noqa: SLF001
+            conn.execute("BEGIN IMMEDIATE")
+            row = conn.execute(
+                "SELECT * FROM planning_sessions WHERE id = ?",
+                (self.session_id,),
+            ).fetchone()
+            if row is None:
+                raise ValueError(f"Planning session not found: {self.session_id}")
+            session = PlanningSession(**dict(row))
+            old_status = session.status
+            if old_status == "discovery":
+                old_status = "discovering"
+            allowed = self.ALLOWED_TRANSITIONS.get(old_status, set())
+            if new_status != old_status and new_status not in allowed:
+                raise InvalidTransitionError(f"Invalid transition {old_status} -> {new_status}")
+
+            if old_status == "refining" and new_status == "refining":
+                if allow_round_stability:
+                    current_round = session.current_round
+                elif current_round is None or current_round <= session.current_round:
+                    raise InvalidTransitionError(
+                        "refining -> refining requires current_round > existing round"
+                    )
+            elif current_round is not None and current_round != session.current_round:
+                raise InvalidTransitionError(
+                    "current_round can only change on refining -> refining transitions"
+                )
+
+            next_pending_questions_json = session.pending_questions_json
+            if pending_questions_json is not _UNSET:
+                next_pending_questions_json = pending_questions_json
+            if new_status != "discovering":
+                next_pending_questions_json = None
+            if new_status == "discovering":
+                if next_pending_questions_json is not None and phase_message is not None:
+                    raise InvalidTransitionError(
+                        "discovery coherence violated: cannot show questions while processing"
+                    )
+                if phase_message is not None:
+                    next_pending_questions_json = None
+
+            next_active_tool_calls_json = session.active_tool_calls_json
+            if active_tool_calls_json is not _UNSET:
+                next_active_tool_calls_json = active_tool_calls_json
+
+            next_round = session.current_round if current_round is None else current_round
+            is_processing = int(new_status in self.WORK_STATES and phase_message is not None)
+            was_processing = bool(session.is_processing)
+            now = datetime.now(timezone.utc).isoformat()
+            if not was_processing and is_processing:
+                processing_started_at = now
+            elif was_processing and not is_processing:
+                processing_started_at = None
+            else:
+                processing_started_at = session.processing_started_at
+
+            updated_at = datetime.utcnow().isoformat() + "Z"
+            conn.execute(
+                """
+                UPDATE planning_sessions
+                SET status = ?,
+                    phase_message = ?,
+                    is_processing = ?,
+                    pending_questions_json = ?,
+                    active_tool_calls_json = ?,
+                    processing_started_at = ?,
+                    current_round = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    new_status,
+                    phase_message,
+                    is_processing,
+                    next_pending_questions_json,
+                    next_active_tool_calls_json,
+                    processing_started_at,
+                    next_round,
+                    updated_at,
+                    self.session_id,
+                ),
+            )
+            updated = conn.execute(
+                "SELECT * FROM planning_sessions WHERE id = ?",
+                (self.session_id,),
+            ).fetchone()
+            if updated is None:
+                raise ValueError(f"Planning session not found: {self.session_id}")
+            return self._build_snapshot(PlanningSession(**dict(updated)))
+
     def transition(self, new_status: str) -> None:
-        session = self.get_session()
-        allowed = self.ALLOWED_TRANSITIONS.get(session.status, set())
-        if new_status not in allowed and new_status != session.status:
-            raise InvalidTransitionError(f"Invalid transition {session.status} -> {new_status}")
-        self.store.update_planning_session(self.session_id, status=new_status)
+        self.transition_and_snapshot(new_status, phase_message=None)
 
     def approve(self, unverified_references: set[str] | None = None) -> None:
         if self.config.require_verified_file_references and unverified_references:
@@ -140,10 +298,38 @@ class PlanningCore:
         session = self.get_session()
         if session.status not in {"converged", "approved"}:
             raise InvalidTransitionError(f"Cannot approve from status: {session.status}")
-        self.store.update_planning_session(self.session_id, status="approved")
+        self.transition_and_snapshot("approved", phase_message=None)
 
     def mark_exported(self) -> None:
         self.transition("exported")
+
+    @classmethod
+    def reconcile_stuck_sessions(
+        cls,
+        store: Store,
+        config: PlanningConfig,
+        timeout_seconds: int = 300,
+    ) -> int:
+        now = datetime.now(timezone.utc)
+        reconciled = 0
+        sessions = store.list_planning_sessions(limit=10_000)
+        for session in sessions:
+            if not bool(session.is_processing):
+                continue
+            if session.status not in cls.WORK_STATES:
+                continue
+            if not session.processing_started_at:
+                continue
+            try:
+                started = datetime.fromisoformat(session.processing_started_at.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if (now - started).total_seconds() < timeout_seconds:
+                continue
+            core = PlanningCore(store, session.id, config)
+            core.transition_and_snapshot("error", phase_message=None)
+            reconciled += 1
+        return reconciled
 
     def _extract_structure(self, content: str) -> PlanStructure:
         todo_count = content.count("- [ ]") + content.count("TODO")

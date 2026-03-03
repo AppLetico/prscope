@@ -8,6 +8,7 @@ import asyncio
 import json
 import os
 import time
+from contextlib import asynccontextmanager
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
@@ -21,7 +22,12 @@ from loguru import logger
 
 from ..config import PrscopeConfig, get_repo_root
 from ..model_catalog import get_model, list_models
-from ..planning.core import ApprovalBlockedError, InvalidTransitionError
+from ..planning.core import (
+    ApprovalBlockedError,
+    InvalidCommandError,
+    InvalidTransitionError,
+    PlanningCore,
+)
 from ..planning.runtime import PlanningRuntime
 from ..store import Store
 from .events import SessionEventEmitter
@@ -40,6 +46,7 @@ class StartSessionRequest(BaseModel):
 
 class MessageRequest(BaseModel):
     message: str
+    command_id: str
     repo: Optional[str] = None
     author_model: Optional[str] = None
     critic_model: Optional[str] = None
@@ -47,12 +54,14 @@ class MessageRequest(BaseModel):
 
 class RoundRequest(BaseModel):
     user_input: Optional[str] = None
+    command_id: str
     repo: Optional[str] = None
     author_model: Optional[str] = None
     critic_model: Optional[str] = None
 
 
 class ApproveRequest(BaseModel):
+    command_id: str
     repo: Optional[str] = None
     unverified_references: list[str] = Field(default_factory=list)
 
@@ -186,7 +195,42 @@ class RuntimeRegistry:
 
 
 def _session_to_dict(session: Any) -> dict[str, Any]:
-    return asdict(session)
+    data = asdict(session)
+    pending_questions: Any = None
+    if data.get("pending_questions_json"):
+        try:
+            parsed = json.loads(str(data["pending_questions_json"]))
+            if isinstance(parsed, list):
+                pending_questions = parsed
+        except json.JSONDecodeError:
+            pending_questions = None
+    active_tool_calls: list[dict[str, Any]] = []
+    if data.get("active_tool_calls_json"):
+        try:
+            parsed = json.loads(str(data["active_tool_calls_json"]))
+            if isinstance(parsed, list):
+                active_tool_calls = [item for item in parsed if isinstance(item, dict)]
+        except json.JSONDecodeError:
+            active_tool_calls = []
+    data["pending_questions"] = pending_questions
+    data["phase_message"] = data.get("phase_message")
+    data["is_processing"] = bool(data.get("is_processing", 0))
+    data["active_tool_calls"] = active_tool_calls
+    return data
+
+
+def _session_state_event(session: Any) -> dict[str, Any]:
+    payload = _session_to_dict(session)
+    return {
+        "type": "session_state",
+        "v": 1,
+        "status": payload.get("status"),
+        "phase_message": payload.get("phase_message"),
+        "is_processing": bool(payload.get("is_processing")),
+        "current_round": int(payload.get("current_round", 0) or 0),
+        "pending_questions": payload.get("pending_questions"),
+        "active_tool_calls": payload.get("active_tool_calls", []),
+    }
 
 
 def _turn_to_dict(turn: Any) -> dict[str, Any]:
@@ -198,9 +242,25 @@ def _version_to_dict(version: Any) -> dict[str, Any]:
 
 
 def create_app() -> FastAPI:
-    app = FastAPI(title="prscope-web", version="0.1.0")
     emitter = SessionEventEmitter()
     registry = RuntimeRegistry(emitter)
+
+    @asynccontextmanager
+    async def lifespan(_: FastAPI):
+        try:
+            config = PrscopeConfig.load(registry._config_root())
+            reconciled = PlanningCore.reconcile_stuck_sessions(
+                store=Store(),
+                config=config.planning,
+                timeout_seconds=300,
+            )
+            if reconciled:
+                logger.info("startup reconciliation updated {} stuck sessions", reconciled)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("startup reconciliation skipped: {}", exc)
+        yield
+
+    app = FastAPI(title="prscope-web", version="0.1.0", lifespan=lifespan)
 
     def _runtime_for(repo_name: Optional[str]) -> tuple[PrscopeConfig, Store, PlanningRuntime]:
         try:
@@ -235,6 +295,56 @@ def create_app() -> FastAPI:
                 detail=f"Selected {role} model '{model_id}' is unavailable: {reason}",
             )
         return model_id
+
+    def _parse_last_commands(session: Any) -> dict[str, str]:
+        raw = getattr(session, "last_commands_json", None)
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        if not isinstance(parsed, dict):
+            return {}
+        return {str(k): str(v) for k, v in parsed.items()}
+
+    def _conflict_payload(session: Any, detail: str = "Operation in progress") -> dict[str, Any]:
+        return {
+            "detail": detail,
+            "status": session.status,
+            "phase_message": session.phase_message,
+            "allowed_commands": PlanningCore.allowed_commands_for(session.status),
+        }
+
+    def _enforce_command_gate(
+        *,
+        session: Any,
+        command_type: str,
+        command_id: str,
+    ) -> bool:
+        last = _parse_last_commands(session).get(command_type)
+        if last == command_id:
+            return True
+        if bool(getattr(session, "is_processing", 0)):
+            raise HTTPException(status_code=409, detail=_conflict_payload(session))
+        if command_type not in PlanningCore.allowed_commands_for(session.status):
+            raise HTTPException(
+                status_code=409,
+                detail=_conflict_payload(session, detail=f"Command '{command_type}' not allowed"),
+            )
+        return False
+
+    def _store_last_command(session_id: str, command_type: str, command_id: str) -> None:
+        session_store = Store()
+        session = session_store.get_planning_session(session_id)
+        if session is None:
+            return
+        last = _parse_last_commands(session)
+        last[command_type] = command_id
+        session_store.update_planning_session(
+            session_id,
+            last_commands_json=json.dumps(last),
+        )
 
     app.add_middleware(
         CORSMiddleware,
@@ -487,6 +597,13 @@ def create_app() -> FastAPI:
             session = Store().get_planning_session(session_id)
             if session is None:
                 raise HTTPException(status_code=404, detail="session not found")
+            if _enforce_command_gate(
+                session=session,
+                command_type="message",
+                command_id=payload.command_id,
+            ):
+                return {"idempotent": True}
+            _store_last_command(session_id, "message", payload.command_id)
             author_model = _validated_model_or_400(
                 payload.author_model or session.author_model,
                 "author",
@@ -545,6 +662,8 @@ def create_app() -> FastAPI:
             return {"result": asdict(result)}
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except InvalidCommandError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
@@ -555,6 +674,13 @@ def create_app() -> FastAPI:
         session = Store().get_planning_session(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="session not found")
+        if _enforce_command_gate(
+            session=session,
+            command_type="round",
+            command_id=payload.command_id,
+        ):
+            return {"idempotent": True}
+        _store_last_command(session_id, "round", payload.command_id)
         author_model = _validated_model_or_400(
             payload.author_model or session.author_model,
             "author",
@@ -578,6 +704,8 @@ def create_app() -> FastAPI:
             )
         except InvalidTransitionError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except InvalidCommandError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
@@ -599,6 +727,16 @@ def create_app() -> FastAPI:
     async def approve_session(session_id: str, payload: ApproveRequest) -> dict[str, Any]:
         repo_name = _repo_for_session(session_id, payload.repo)
         _, _, runtime = _runtime_for(repo_name=repo_name)
+        session = Store().get_planning_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        if _enforce_command_gate(
+            session=session,
+            command_type="approve",
+            command_id=payload.command_id,
+        ):
+            return {"idempotent": True, "approved": bool(session.status == "approved")}
+        _store_last_command(session_id, "approve", payload.command_id)
         try:
             runtime.approve(
                 session_id=session_id,
@@ -607,6 +745,8 @@ def create_app() -> FastAPI:
         except ApprovalBlockedError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except InvalidTransitionError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except InvalidCommandError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"approved": True}
 
@@ -682,6 +822,13 @@ def create_app() -> FastAPI:
     async def stream_events(session_id: str) -> EventSourceResponse:
         async def event_generator() -> Any:
             try:
+                session = Store().get_planning_session(session_id)
+                if session is not None:
+                    snapshot = _session_state_event(session)
+                    yield {
+                        "event": "session_state",
+                        "data": json.dumps({k: v for k, v in snapshot.items() if k != "type"}),
+                    }
                 async for event in emitter.subscribe(session_id):
                     etype = str(event.get("type", "message"))
                     payload = {k: v for k, v in event.items() if k != "type"}

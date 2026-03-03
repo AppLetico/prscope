@@ -1,7 +1,23 @@
 import { useEffect } from "react";
-import type { UIEvent } from "../types";
+import type { DiscoveryQuestion, SessionStatus, ToolCallEntry, UIEvent } from "../types";
 
 function normalizeEvent(rawType: string, rawPayload: Record<string, unknown>): UIEvent | null {
+  if (rawType === "session_state") {
+    return {
+      type: "session_state",
+      v: 1,
+      status: String(rawPayload.status ?? "discovering") as SessionStatus,
+      phase_message: rawPayload.phase_message ? String(rawPayload.phase_message) : null,
+      is_processing: Boolean(rawPayload.is_processing),
+      current_round: Number(rawPayload.current_round ?? 0),
+      pending_questions: Array.isArray(rawPayload.pending_questions)
+        ? (rawPayload.pending_questions as DiscoveryQuestion[])
+        : null,
+      active_tool_calls: Array.isArray(rawPayload.active_tool_calls)
+        ? (rawPayload.active_tool_calls as ToolCallEntry[])
+        : [],
+    };
+  }
   if (rawType === "thinking") {
     return { type: "thinking", message: String(rawPayload.message ?? "Thinking...") };
   }
@@ -29,6 +45,10 @@ function normalizeEvent(rawType: string, rawPayload: Record<string, unknown>): U
     return {
       type: "plan_ready",
       round: rawPayload.round !== undefined ? Number(rawPayload.round) : undefined,
+      initial_draft:
+        rawPayload.initial_draft !== undefined
+          ? Boolean(rawPayload.initial_draft)
+          : undefined,
       saved_at_unix_s:
         rawPayload.saved_at_unix_s !== undefined
           ? Number(rawPayload.saved_at_unix_s)
@@ -118,6 +138,7 @@ export function useSessionEvents(
     };
 
     bind("thinking");
+    bind("session_state");
     bind("tool_call");
     bind("tool_result");
     bind("context_compaction");

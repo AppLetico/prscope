@@ -35,6 +35,7 @@ interface ActionBarProps {
   contextWindowTokens?: number | null;
   contextPercent?: number | null;
   contextCompactionEnabled?: boolean;
+  critiquePending?: boolean;
   onDelete?: () => void;
 }
 
@@ -62,6 +63,7 @@ export function ActionBar({
   contextWindowTokens = null,
   contextPercent = null,
   contextCompactionEnabled = false,
+  critiquePending = false,
   onDelete,
 }: ActionBarProps) {
   const [moreOpen, setMoreOpen] = useState(false);
@@ -78,17 +80,17 @@ export function ActionBar({
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, [moreOpen]);
   const isConverged = status === "converged" || status === "approved" || status === "exported";
-  const isRefining = status === "refining" || status === "discovery";
+  const isRefining = status === "refining" || status === "discovering";
   const statusTooltip = {
     created: "Session created.",
     preparing: "Preparing codebase memory.",
     discovering: "Discovery mode: gathering requirements.",
-    discovery: "Discovery mode: gathering requirements.",
     drafting: "Drafting initial plan.",
     refining: "Refining plan with critique rounds.",
     converged: "Plan has converged and is ready for approval.",
     approved: "Plan approved.",
     exported: "Plan exported.",
+    error: "Session encountered an error and needs attention.",
   }[status];
   
   return (
@@ -285,7 +287,12 @@ export function ActionBar({
           {canCritique && (
             <button
               onClick={onCritique}
-              className="flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-medium rounded-md bg-zinc-800/60 text-zinc-300 border border-zinc-700/60 hover:bg-zinc-700 hover:text-zinc-100 transition-all shadow-sm active:scale-95"
+              className={clsx(
+                "flex items-center gap-1.5 px-3 py-1.5 text-[11px] font-medium rounded-md border transition-all shadow-sm active:scale-95",
+                critiquePending
+                  ? "bg-indigo-500/15 text-indigo-200 border-indigo-400/50 hover:bg-indigo-500/25 animate-pulse"
+                  : "bg-zinc-800/60 text-zinc-300 border-zinc-700/60 hover:bg-zinc-700 hover:text-zinc-100",
+              )}
             >
               <RefreshCw className="w-3.5 h-3.5" />
               Critique

@@ -16,7 +16,10 @@ interface ChatPanelProps {
   phaseMessage?: string | null;
   warnings: string[];
   pendingClarification: ClarificationPrompt | null;
+  showCritiquePrompt: boolean;
+  inputDisabled?: boolean;
   onSubmit: (text: string) => Promise<void>;
+  onCritique: () => Promise<void> | void;
   onSubmitClarification: (answer: string) => Promise<void>;
 }
 
@@ -67,7 +70,10 @@ export function ChatPanel({
   phaseMessage = null,
   warnings,
   pendingClarification,
+  showCritiquePrompt,
+  inputDisabled = false,
   onSubmit,
+  onCritique,
   onSubmitClarification,
 }: ChatPanelProps) {
   const [input, setInput] = useState("");
@@ -204,6 +210,7 @@ export function ChatPanel({
   }, [autoScroll]);
 
   const handleSubmit = async () => {
+    if (inputDisabled) return;
     const text = input.trim();
     if (!text) return;
     setInput("");
@@ -480,7 +487,11 @@ export function ChatPanel({
                     <ToolCallStream toolCalls={turnToolCalls} />
                   </div>
                 )}
-                {isUser && !optimisticUserMessage && idx === latestUserTurnIndex && activeToolCalls.length > 0 && (
+                {isUser
+                  && !optimisticUserMessage
+                  && idx === latestUserTurnIndex
+                  && activeToolCalls.length > 0
+                  && !toolCallsByUserTurnIndex.has(idx) && (
                   <div className="flex justify-start w-full pl-12">
                     <ToolCallStream toolCalls={activeToolCalls} defaultOpen />
                   </div>
@@ -536,7 +547,7 @@ export function ChatPanel({
                   </p>
                   <button
                     type="button"
-                    disabled={!allQuestionsAnswered || submittingAnswers}
+                    disabled={inputDisabled || !allQuestionsAnswered || submittingAnswers}
                     onClick={() => void submitSelectedAnswers()}
                     className="rounded-md bg-indigo-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-400 disabled:opacity-50 disabled:cursor-not-allowed"
                   >
@@ -589,6 +600,25 @@ export function ChatPanel({
               </div>
             </div>
           )}
+          {showCritiquePrompt && (
+            <div className="rounded-xl border border-indigo-500/40 bg-indigo-500/10 p-4">
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <p className="text-xs uppercase tracking-wide text-indigo-300">Draft ready</p>
+                  <p className="mt-1 text-sm text-zinc-100">
+                    Initial plan is ready. Run a critique pass when you want the next refinement.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  className="shrink-0 rounded-md bg-indigo-500 px-3 py-2 text-xs font-medium text-white hover:bg-indigo-400"
+                  onClick={() => void onCritique()}
+                >
+                  Run Critique
+                </button>
+              </div>
+            </div>
+          )}
 
           {(liveStatusMessage || warningSummary.length > 0) && (
             <div className="pl-12 mt-2 space-y-2 animate-in fade-in duration-200">
@@ -637,6 +667,7 @@ export function ChatPanel({
             ref={inputRef}
             className="w-full max-h-48 min-h-[44px] bg-transparent text-zinc-100 placeholder:text-zinc-500 px-3 py-2.5 text-sm focus:outline-none resize-none overflow-y-auto"
             value={input}
+            disabled={inputDisabled}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => {
               if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
@@ -664,7 +695,7 @@ export function ChatPanel({
             <Tooltip content="Send message">
               <button
                 type="button"
-                disabled={!input.trim()}
+                disabled={inputDisabled || !input.trim()}
                 className="p-2 rounded-xl bg-indigo-500 text-white hover:bg-indigo-400 disabled:opacity-50 disabled:hover:bg-indigo-500 transition-colors shadow-sm active:scale-95"
                 onClick={() => void handleSubmit()}
               >

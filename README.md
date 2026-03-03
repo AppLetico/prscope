@@ -32,6 +32,7 @@ See `CONTRIBUTING.md` for development workflow, performance benchmark requiremen
 - [Quickstart](#quickstart)
 - [Three Ways to Start a Plan](#three-ways-to-start-a-plan)
 - [Web UI Workflow](#web-ui-workflow)
+- [Runtime State Model](#runtime-state-model)
 - [Planning Features](#planning-features)
 - [Memory Stack: Skills + Recall](#memory-stack-skills--recall)
 - [Full Configuration Reference](#full-configuration-reference)
@@ -202,6 +203,28 @@ For background operation, run `prscope web --background`.
 - Model availability is key-aware (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`/`GEMINI_API_KEY`) and exposed from `GET /api/models`.
 - The backend validates every selected model at request time; if a model becomes unavailable, the request fails with a clear validation error so the UI can prompt reselection.
 - Last selected model pair is persisted per repo in browser local storage for convenience.
+
+---
+
+## Runtime State Model
+
+Prscope now uses a server-authoritative runtime model for planning sessions:
+
+- Session row is the canonical state machine (`status`, `phase_message`, `pending_questions`, `is_processing`, `active_tool_calls`)
+- `session_state` SSE events carry full snapshots and are emitted snapshot-first on connect
+- Commands are idempotent via `command_id` and validated against explicit state/command rules
+- Frontend renders from canonical session state rather than reconstructing from turn text
+
+Why this matters:
+
+- page reloads are predictable
+- duplicate submits/retries are safely handled
+- multi-tab behavior stays consistent
+
+Further reading:
+
+- `docs/planning-state-machine.md` (formal contract and invariants)
+- `docs/agent-harness.md` (end-to-end API/runtime/SSE behavior)
 
 ---
 
@@ -411,10 +434,10 @@ Prscope uses [LiteLLM](https://docs.litellm.ai/docs/providers) — any provider 
 
 ```
 prscope/
-├── cli.py                      # Click CLI (plan, upstream, repos groups)
+├── cli.py                      # Click CLI (plan, upstream, recall, repos groups)
 ├── config.py                   # Config + RepoProfile dataclasses
-├── store.py                    # SQLite storage (sessions, turns, versions)
-├── memory.py                   # Codebase memory builder + manifesto parser
+├── store.py                    # SQLite storage (sessions, turns, versions, session recall BM25)
+├── memory.py                   # Codebase memory builder, manifesto parser, load_skills()
 ├── profile.py                  # Local repo file tree profiling
 ├── scoring.py                  # Upstream PR relevance scoring
 ├── github.py                   # GitHub REST client
@@ -428,7 +451,7 @@ prscope/
 │   ├── core.py                 # Pure state machine + convergence logic
 │   ├── render.py               # PRD/RFC Jinja2 rendering
 │   └── runtime/
-│       ├── orchestration.py    # PlanningRuntime entry points
+│       ├── orchestration.py    # PlanningRuntime entry points (manifesto → skills → recall → memory)
 │       ├── author.py           # Author LLM loop + tool enforcement
 │       ├── critic.py           # Critic LLM + JSON contract validation
 │       ├── discovery.py        # Chat-first discovery flow
@@ -441,7 +464,8 @@ prscope/
 
 tests/
 ├── test_config.py              # Config + multi-repo parsing
-├── test_store.py               # DB including planning tables
+├── test_store.py               # DB including planning tables + search_sessions
+├── test_memory_skills.py        # load_skills() boundary and truncation
 ├── test_planning_core.py       # Convergence logic + constraint parsing
 ├── test_cli.py                 # CLI command surface
 ├── test_scoring.py             # PR relevance scoring

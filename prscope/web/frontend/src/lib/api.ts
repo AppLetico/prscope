@@ -10,6 +10,12 @@ import type {
 const REPO_STORAGE_KEY = "prscope.web.repo";
 const MODEL_SELECTION_STORAGE_PREFIX = "prscope.web.models.";
 
+export class ConflictError extends Error {
+  status?: string;
+  phase_message?: string | null;
+  allowed_commands?: string[];
+}
+
 function getRepoContext(): string | null {
   const params = new URLSearchParams(window.location.search);
   const repo = params.get("repo");
@@ -87,11 +93,31 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (!response.ok) {
     const text = await response.text();
     let detail = text;
+    let payload: Record<string, unknown> | null = null;
     try {
-      const payload = JSON.parse(text) as { detail?: string };
-      if (payload.detail) detail = payload.detail;
+      payload = JSON.parse(text) as Record<string, unknown>;
+      if (typeof payload.detail === "string") detail = payload.detail;
+      if (typeof payload.detail === "object" && payload.detail !== null) {
+        payload = payload.detail as Record<string, unknown>;
+        if (typeof payload.detail === "string") detail = payload.detail;
+      }
     } catch {
       // Keep raw text fallback for non-JSON errors
+    }
+    if (response.status === 409) {
+      const error = new ConflictError(detail || "Operation in progress");
+      if (payload) {
+        error.status = typeof payload.status === "string" ? payload.status : undefined;
+        error.phase_message =
+          payload.phase_message === null || typeof payload.phase_message === "string"
+            ? (payload.phase_message as string | null)
+            : undefined;
+        if (Array.isArray(payload.allowed_commands)) {
+          error.allowed_commands = payload.allowed_commands
+            .filter((value): value is string => typeof value === "string");
+        }
+      }
+      throw error;
     }
     throw new Error(detail || `Request failed: ${response.status}`);
   }
@@ -139,9 +165,10 @@ export function sendDiscoveryMessage(
   message: string,
   models?: { author_model?: string; critic_model?: string },
 ) {
+  const command_id = crypto.randomUUID();
   return request<{ result: DiscoveryTurnResult }>(`/api/sessions/${sessionId}/message`, {
     method: "POST",
-    body: JSON.stringify({ message, ...models }),
+    body: JSON.stringify({ message, command_id, ...models }),
   });
 }
 
@@ -150,13 +177,14 @@ export function runRound(
   user_input?: string,
   models?: { author_model?: string; critic_model?: string },
 ) {
+  const command_id = crypto.randomUUID();
   return request<{
     critic: Record<string, unknown>;
     author: Record<string, unknown>;
     convergence: { converged: boolean; reason: string; change_pct: number };
   }>(`/api/sessions/${sessionId}/round`, {
     method: "POST",
-    body: JSON.stringify({ user_input, ...models }),
+    body: JSON.stringify({ user_input, command_id, ...models }),
   });
 }
 
@@ -172,9 +200,10 @@ export function submitClarification(sessionId: string, answers: string[]) {
 }
 
 export function approveSession(sessionId: string) {
+  const command_id = crypto.randomUUID();
   return request<{ approved: boolean }>(`/api/sessions/${sessionId}/approve`, {
     method: "POST",
-    body: JSON.stringify({}),
+    body: JSON.stringify({ command_id }),
   });
 }
 

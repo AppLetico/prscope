@@ -14,11 +14,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import subprocess
 import sys
 import webbrowser
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import click
 from dotenv import load_dotenv
@@ -36,6 +38,7 @@ except Exception:
 from . import __version__
 from .config import (
     PrscopeConfig,
+    RepoProfile,
     get_repo_root,
     ensure_prscope_dir,
 )
@@ -827,6 +830,71 @@ def _format_age(path: Path) -> str:
     return f"{days}d ago"
 
 
+def _delete_session_cache(
+    sessions: list[Any],
+    repo_name: str | None,
+    config: PrscopeConfig | None,
+) -> None:
+    """Remove session-related cache: per-session tool-results dirs and rounds.jsonl."""
+    repoNames = {s.repo_name for s in sessions if getattr(s, "repo_name", None)}
+    if repo_name:
+        repoNames = {repo_name}
+
+    # Per-repo rounds.jsonl (cost log)
+    for rn in repoNames:
+        rounds_path = Path.home() / ".prscope" / "repos" / rn / "rounds.jsonl"
+        if rounds_path.exists():
+            rounds_path.unlink()
+
+    # Per-session tool-results (only when we have config to resolve repo path)
+    if config:
+        for s in sessions:
+            sid = getattr(s, "id", None)
+            rn = getattr(s, "repo_name", None)
+            if not sid or not rn:
+                continue
+            try:
+                repo_profile = config.resolve_repo(rn, cwd=Path.cwd())
+            except Exception:
+                continue
+            artifact_dir = repo_profile.resolved_path / ".prscope" / "tool-results" / sid
+            if artifact_dir.exists() and artifact_dir.is_dir():
+                shutil.rmtree(artifact_dir, ignore_errors=True)
+
+
+def _clear_repo_planning_cache(repo: RepoProfile) -> None:
+    """Clear planning-related cache only. Preserves configs, manifestos, and skills.
+
+    Clears: ~/.prscope/repos/<name>/memory/, rounds.jsonl, constraint_stats, audit;
+    and <repo>/.prscope/tool-results/. Does NOT touch prscope.yml, manifesto.md, or .prscope/skills/.
+    """
+    # ~/.prscope/repos/<name>/memory/ (rebuilt on next run)
+    if repo.memory_dir.exists():
+        for p in repo.memory_dir.iterdir():
+            if p.is_file():
+                p.unlink(missing_ok=True)
+        for p in repo.memory_dir.iterdir():
+            if p.is_dir():
+                shutil.rmtree(p, ignore_errors=True)
+    # ~/.prscope/repos/<name>/rounds.jsonl, constraint_stats.json
+    base = Path.home() / ".prscope" / "repos" / repo.name
+    for name in ("rounds.jsonl", "constraint_stats.json"):
+        p = base / name
+        if p.exists():
+            p.unlink(missing_ok=True)
+    # ~/.prscope/repos/<name>/audit/
+    if repo.audit_dir.exists():
+        for p in repo.audit_dir.iterdir():
+            if p.is_file():
+                p.unlink(missing_ok=True)
+            else:
+                shutil.rmtree(p, ignore_errors=True)
+    # <repo>/.prscope/tool-results/ only (preserve .prscope/manifesto.md and .prscope/skills/)
+    tool_results = repo.resolved_path / ".prscope" / "tool-results"
+    if tool_results.exists() and tool_results.is_dir():
+        shutil.rmtree(tool_results, ignore_errors=True)
+
+
 def _open_web_session(session_id: str, host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
     _, base_url = ensure_server_running(host=host, port=port, open_browser=False)
     webbrowser.open(f"{base_url}/sessions/{session_id}")
@@ -1307,7 +1375,7 @@ def plan_delete(
     store = Store()
 
     if delete_all:
-        sessions = store.list_planning_sessions(repo_name=repo_name)
+        sessions = store.list_planning_sessions(repo_name=repo_name, limit=10_000)
         if not sessions:
             click.echo("No sessions to delete.")
             return
@@ -1319,8 +1387,14 @@ def plan_delete(
             click.echo(f"  ... and {len(sessions) - 10} more")
         if not yes:
             click.confirm("Delete all?", abort=True)
+        config = None
+        try:
+            config = PrscopeConfig.load(get_repo_root())
+        except Exception:
+            pass
+        _delete_session_cache(sessions, repo_name, config)
         count = store.delete_all_planning_sessions(repo_name=repo_name)
-        click.echo(f"Deleted {count} session(s).")
+        click.echo(f"Deleted {count} session(s) (DB and session cache).")
         return
 
     if not session_id:
@@ -1336,6 +1410,50 @@ def plan_delete(
         )
     store.delete_planning_session(session_id)
     click.echo(f"Deleted session {session_id[:8]}.")
+
+
+@plan_group.command("reset")
+@click.option("--repo", "repo_name", help="Reset only this repo profile (default: all configured repos)")
+@click.option("--yes", "-y", is_flag=True, help="Skip confirmation prompt")
+def plan_reset(repo_name: str | None, yes: bool) -> None:
+    """Blank slate: delete all planning sessions and clear cache so you can test from scratch.
+
+    Clears sessions, session cache, memory cache, rounds, audit, and tool-results.
+    Preserves: prscope.yml, prscope.features.yml, .prscope/manifesto.md, .prscope/skills/
+    (no need to redo configs or manifestos).
+    """
+    repo_root = get_repo_root()
+    config = PrscopeConfig.load(repo_root)
+    if repo_name:
+        repos = [config.resolve_repo(repo_name, cwd=Path.cwd())]
+    else:
+        repos = config.list_repos()
+    if not repos:
+        click.echo("No repositories configured.")
+        return
+
+    store = Store()
+    total_sessions = 0
+    for repo in repos:
+        sessions = store.list_planning_sessions(repo_name=repo.name, limit=10_000)
+        total_sessions += len(sessions)
+
+    scope = f"repo '{repo_name}'" if repo_name else f"all {len(repos)} repo(s)"
+    click.echo(f"Reset {scope}:")
+    click.echo(f"  - {total_sessions} planning session(s) will be deleted")
+    click.echo("  - Session cache, memory, rounds, audit, and tool-results will be cleared")
+    click.echo("  - Configs, manifestos, and skills are preserved")
+    if not yes:
+        click.confirm("Continue?", abort=True)
+
+    for repo in repos:
+        sessions = store.list_planning_sessions(repo_name=repo.name, limit=10_000)
+        _delete_session_cache(sessions, repo.name, config)
+        store.delete_all_planning_sessions(repo_name=repo.name)
+        _clear_repo_planning_cache(repo)
+        click.echo(f"  Reset {repo.name}.")
+
+    click.echo("Reset complete. You can test from scratch.")
 
 
 @main.command("scanners")

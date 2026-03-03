@@ -161,7 +161,7 @@ Relevant knobs:
 - repo-level `memory_block_max_chars` overrides
 - repo-level `manifesto_file` override
 
-Related operational command patterns are documented in `docs/agent-harness.md`.
+Related runtime/state behavior is documented in `docs/agent-harness.md` and `docs/planning-state-machine.md`.
 
 ## Practical Tips
 

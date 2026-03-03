@@ -2,6 +2,10 @@
 .prscope/
 .env
 
+# Benchmarks: keep summary (best_performance.json) and dir structure (.gitkeep), ignore full history
+benchmarks/results/history/run-*.json
+benchmarks/results/history/run-*.log
+
 # Python
 __pycache__/
 *.py[cod]

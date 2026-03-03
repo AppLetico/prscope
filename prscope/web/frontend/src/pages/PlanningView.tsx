@@ -8,6 +8,7 @@ import { ResizableLayout } from "../components/ResizableLayout";
 import { useSessionEvents } from "../hooks/useSessionEvents";
 import {
   approveSession,
+  ConflictError,
   deleteSession,
   downloadFile,
   exportSession,
@@ -20,75 +21,12 @@ import {
   setStoredModelSelection,
   submitClarification,
 } from "../lib/api";
-import type { ClarificationPrompt, DiscoveryQuestion, ToolCallEntry, UIEvent } from "../types";
+import type { ClarificationPrompt, PlanningSession, ToolCallEntry, UIEvent } from "../types";
 import { AlertCircle, Check, Loader2 } from "lucide-react";
-
-function parseDiscoveryQuestionsFromReply(reply: string): DiscoveryQuestion[] {
-  const stripInlineMarkdown = (value: string): string => value
-    .replace(/`([^`]+)`/g, "$1")
-    .replace(/\*\*([^*]+)\*\*/g, "$1")
-    .replace(/__([^_]+)__/g, "$1")
-    .replace(/\*([^*]+)\*/g, "$1")
-    .replace(/_([^_]+)_/g, "$1")
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
-    .replace(/\s+/g, " ")
-    .trim();
-  const normalizeQuestionText = (value: string): string => {
-    const cleaned = stripInlineMarkdown(value).replace(/^[\-\*]\s+/, "").trim();
-    if (!cleaned) return "";
-    if (cleaned.endsWith("?")) return cleaned;
-    const withoutTrailingPunctuation = cleaned.replace(/[.!:;]+$/, "").trim();
-    return `${withoutTrailingPunctuation}?`;
-  };
-  const lines = reply.split("\n");
-  const questions: DiscoveryQuestion[] = [];
-  const questionRe = /^\s*(?:\*\*)?\s*(?:Q\s*\d+|Q|Question\s+\d+|\d+)\s*[:.\-)]\s*(.+?)(?:\*\*)?\s*$/i;
-  const optionRe = /^\s*([A-D])\)\s*(.+)\s*$/i;
-
-  let i = 0;
-  while (i < lines.length) {
-    const qMatch = lines[i]?.match(questionRe);
-    if (!qMatch) {
-      i += 1;
-      continue;
-    }
-    const questionText = normalizeQuestionText(qMatch[1] ?? "");
-    const options: DiscoveryQuestion["options"] = [];
-    i += 1;
-    while (i < lines.length) {
-      const optMatch = lines[i]?.match(optionRe);
-      if (optMatch) {
-        const text = stripInlineMarkdown(optMatch[2] ?? "");
-        options.push({
-          letter: optMatch[1].toUpperCase(),
-          text,
-          is_other: /^other\b/i.test(text),
-        });
-        i += 1;
-        continue;
-      }
-      if (options.length > 0) {
-        break;
-      }
-      i += 1;
-    }
-
-    if (options.length > 0) {
-      questions.push({
-        index: questions.length + 1,
-        text: questionText,
-        options,
-      });
-    }
-  }
-
-  return questions;
-}
 
 export function PlanningViewPage() {
   const { id = "" } = useParams();
   const navigate = useNavigate();
-  const [questions, setQuestions] = useState<DiscoveryQuestion[]>([]);
   const [activeToolCalls, setActiveToolCalls] = useState<ToolCallEntry[]>([]);
   const [toolCallGroups, setToolCallGroups] = useState<ToolCallEntry[][]>([]);
   const [thinkingMessage, setThinkingMessage] = useState<string | null>(null);
@@ -104,9 +42,16 @@ export function PlanningViewPage() {
   const [contextUsageRatio, setContextUsageRatio] = useState<number | null>(null);
   const [contextCompactionEnabled, setContextCompactionEnabled] = useState<boolean>(false);
   const [pendingClarification, setPendingClarification] = useState<ClarificationPrompt | null>(null);
-  const [phaseMessage, setPhaseMessage] = useState<string | null>(null);
+  const [showCritiquePrompt, setShowCritiquePrompt] = useState(false);
   const [setupSteps, setSetupSteps] = useState<string[]>([]);
-  const [isSubmittingDiscoveryTurn, setIsSubmittingDiscoveryTurn] = useState(false);
+  const [sessionState, setSessionState] = useState<{
+    status: PlanningSession["status"];
+    current_round: number;
+    pending_questions: PlanningSession["pending_questions"];
+    phase_message: string | null;
+    is_processing: boolean;
+    active_tool_calls: ToolCallEntry[];
+  } | null>(null);
   const activeToolCallsRef = useRef<ToolCallEntry[]>([]);
   const lastEventAtMs = useRef<number>(0);
   const lastRefetchAtMs = useRef<number>(0);
@@ -150,6 +95,32 @@ export function PlanningViewPage() {
   const selectedCriticModel =
     criticModel || session?.critic_model || storedModels.critic_model || fallbackModel;
   const refetchSession = sessionQuery.refetch;
+  const questions = sessionState?.pending_questions ?? [];
+  const phaseMessage = sessionState?.phase_message ?? null;
+  const isProcessing = sessionState?.is_processing ?? false;
+  const effectiveStatus = sessionState?.status ?? session?.status;
+  const effectiveRound = sessionState?.current_round ?? session?.current_round ?? 0;
+
+  useEffect(() => {
+    if (!session) return;
+    setSessionState({
+      status: session.status,
+      current_round: session.current_round,
+      pending_questions: session.pending_questions ?? null,
+      phase_message: session.phase_message ?? null,
+      is_processing: Boolean(session.is_processing),
+      active_tool_calls: session.active_tool_calls ?? [],
+    });
+    setActiveToolCalls(session.active_tool_calls ?? []);
+  }, [
+    session?.id,
+    session?.status,
+    session?.current_round,
+    session?.pending_questions,
+    session?.phase_message,
+    session?.is_processing,
+    session?.active_tool_calls,
+  ]);
 
   const flushActiveToolCalls = useCallback(() => {
     setActiveToolCalls((prev) => {
@@ -176,6 +147,18 @@ export function PlanningViewPage() {
 
   const handleEvent = useCallback((event: UIEvent) => {
     lastEventAtMs.current = Date.now();
+    if (event.type === "session_state") {
+      setSessionState({
+        status: event.status,
+        current_round: event.current_round,
+        pending_questions: event.pending_questions,
+        phase_message: event.phase_message,
+        is_processing: event.is_processing,
+        active_tool_calls: event.active_tool_calls,
+      });
+      setActiveToolCalls(event.active_tool_calls ?? []);
+      return;
+    }
     if (event.type === "thinking") {
       setThinkingMessage(event.message);
       return;
@@ -232,18 +215,16 @@ export function PlanningViewPage() {
     }
     if (event.type === "complete") {
       setThinkingMessage(null);
-      setPhaseMessage(null);
       flushActiveToolCalls();
-      setQuestions([]);
       setPendingClarification(null);
       setWarnings([]);
-      lastRefetchAtMs.current = Date.now();
-      void refetchSession();
       return;
     }
     if (event.type === "plan_ready") {
-      setPhaseMessage(null);
       flushActiveToolCalls();
+      if (event.round === 0) {
+        setShowCritiquePrompt(true);
+      }
       const now = Date.now();
       if (now - lastRefetchAtMs.current >= 800) {
         lastRefetchAtMs.current = now;
@@ -253,7 +234,6 @@ export function PlanningViewPage() {
     }
     if (event.type === "error") {
       setThinkingMessage(null);
-      setPhaseMessage(null);
       setError(event.message);
       return;
     }
@@ -323,10 +303,9 @@ export function PlanningViewPage() {
   useSessionEvents(id, handleEvent, Boolean(session));
 
   useEffect(() => {
-    const status = sessionQuery.data?.session.status;
+    const status = effectiveStatus;
     const isActive = status === "drafting"
       || status === "discovering"
-      || status === "discovery"
       || status === "refining";
     if (!isActive) {
       return;
@@ -344,107 +323,29 @@ export function PlanningViewPage() {
     return () => {
       window.clearInterval(timer);
     };
-  }, [sessionQuery, sessionQuery.data?.session.status]);
-
-  useEffect(() => {
-    const status = session?.status;
-    if (status !== "discovering" && status !== "discovery") {
-      return;
-    }
-    if (isSubmittingDiscoveryTurn) {
-      return;
-    }
-    if (questions.length > 0) {
-      return;
-    }
-    // Rehydrate the most recent unanswered question set from persisted turns.
-    let candidateContent: string | null = null;
-    for (let idx = turns.length - 1; idx >= 0; idx -= 1) {
-      const turn = turns[idx];
-      if (turn.role !== "author") continue;
-      const parsed = parseDiscoveryQuestionsFromReply(turn.content ?? "");
-      if (parsed.length === 0) continue;
-      const hasUserResponseAfter = turns.slice(idx + 1).some((nextTurn) => nextTurn.role === "user");
-      if (!hasUserResponseAfter) {
-        candidateContent = turn.content ?? "";
-        break;
-      }
-    }
-    if (!candidateContent) {
-      return;
-    }
-    const parsedQuestions = parseDiscoveryQuestionsFromReply(candidateContent);
-    if (parsedQuestions.length > 0) {
-      setQuestions(parsedQuestions);
-    }
-  }, [isSubmittingDiscoveryTurn, questions.length, session?.status, turns]);
+  }, [effectiveStatus, sessionQuery]);
 
   const submitMessage = async (text: string) => {
     try {
       setError(null);
-      const status = sessionQuery.data?.session.status;
+      const status = effectiveStatus;
       const models = {
         author_model: selectedAuthorModel || undefined,
         critic_model: selectedCriticModel || undefined,
       };
-      if (status === "discovering" || status === "discovery") {
-        const previousQuestions = questions;
-        setIsSubmittingDiscoveryTurn(true);
-        if (questions.length > 0) {
-          // Clear previous question batch while submitting answers to prevent stale rehydration flicker.
-          setQuestions([]);
-        }
-        setPhaseMessage(questions.length > 0 ? "Analyzing your answers" : "Thinking through your request");
-        let response;
-        try {
-          response = await sendDiscoveryMessage(id, text, models);
-        } catch (submitErr) {
-          // On error, restore previous questions and unblock rehydration.
-          setIsSubmittingDiscoveryTurn(false);
-          if (previousQuestions.length > 0) {
-            setQuestions(previousQuestions);
-          }
-          throw submitErr;
-        }
-        // Discovery turns may not emit a terminal "complete" event. Clear transient
-        // thinking text once the HTTP response arrives to avoid stale activity indicators.
-        setThinkingMessage(null);
-        flushActiveToolCalls();
-        const parsedQuestions = response.result.questions?.length > 0
-          ? response.result.questions
-          : parseDiscoveryQuestionsFromReply(response.result.reply ?? "");
-        if (parsedQuestions.length > 0) {
-          // New questions to show — safe to unblock rehydration immediately since
-          // questions.length > 0 will prevent the effect from firing.
-          setIsSubmittingDiscoveryTurn(false);
-          setQuestions(parsedQuestions);
-          setPhaseMessage(null);
-        } else {
-          // No questions (complete=true OR backend returned prose/empty).
-          // Keep isSubmittingDiscoveryTurn=true through the refetch so the rehydration
-          // effect can't fire while status is still "discovering" with stale turns.
-          setQuestions([]);
-          setPhaseMessage(null);
-        }
+      if (status === "discovering") {
+        await sendDiscoveryMessage(id, text, models);
       } else {
-        setPhaseMessage("Running planning round");
+        setShowCritiquePrompt(false);
         await runRound(id, text, models);
       }
       if (sessionQuery.data?.session.repo_name) {
         setStoredModelSelection(models, sessionQuery.data.session.repo_name);
       }
-      const refreshed = await sessionQuery.refetch();
-      // After refetch the session status is "drafting"/"refining", so it's now
-      // safe to unblock the rehydration effect — its own status guard prevents it
-      // from firing on non-discovery sessions.
-      setIsSubmittingDiscoveryTurn(false);
-      // Clear stale phase text once the draft/round has persisted.
-      if (refreshed.data?.current_plan) {
-        setPhaseMessage(null);
-      }
     } catch (err) {
-      setIsSubmittingDiscoveryTurn(false);
-      setPhaseMessage(null);
+      if (err instanceof ConflictError) {
+        return;
+      }
       setError(String(err));
     }
   };
@@ -463,6 +364,7 @@ export function PlanningViewPage() {
   const onCritique = async () => {
     try {
       setError(null);
+      setShowCritiquePrompt(false);
       await runRound(id, undefined, {
         author_model: selectedAuthorModel || undefined,
         critic_model: selectedCriticModel || undefined,
@@ -516,9 +418,8 @@ export function PlanningViewPage() {
   };
 
   const contextPercent = contextUsageRatio !== null ? contextUsageRatio * 100 : null;
-  const activeStatus = session?.status;
+  const activeStatus = effectiveStatus;
   const isActiveSession = activeStatus === "discovering"
-    || activeStatus === "discovery"
     || activeStatus === "drafting"
     || activeStatus === "refining";
   const hasRunningToolCalls = activeToolCalls.some((call) => call.status === "running");
@@ -572,6 +473,7 @@ export function PlanningViewPage() {
             contextWindowTokens={null}
             contextPercent={null}
             contextCompactionEnabled={false}
+            critiquePending={false}
           />
         ) : null}
         <div className="flex-1 flex flex-col items-center justify-center p-8">
@@ -615,14 +517,14 @@ export function PlanningViewPage() {
           <ActionBar
             repoName={session.repo_name}
             title={session.title}
-            round={session.current_round}
-            status={session.status}
+            round={effectiveRound}
+            status={effectiveStatus ?? session.status}
             convergenceScore={sessionQuery.data?.current_plan?.convergence_score ?? undefined}
-            canCritique={session.status === "refining" || session.status === "converged"}
-            canApprove={session.status === "converged" || session.status === "approved"}
+            canCritique={!isProcessing && (effectiveStatus === "refining" || effectiveStatus === "converged")}
+            canApprove={!isProcessing && (effectiveStatus === "converged" || effectiveStatus === "approved")}
             canExport={
               Boolean(sessionQuery.data?.current_plan)
-              && (session.status === "approved" || session.status === "exported")
+              && (effectiveStatus === "approved" || effectiveStatus === "exported")
             }
             onCritique={() => void onCritique()}
             onApprove={() => void onApprove()}
@@ -655,6 +557,7 @@ export function PlanningViewPage() {
             contextWindowTokens={contextWindowTokens}
             contextPercent={contextPercent}
             contextCompactionEnabled={contextCompactionEnabled}
+            critiquePending={showCritiquePrompt}
             onDelete={onDelete}
           />
           
@@ -677,7 +580,7 @@ export function PlanningViewPage() {
                 <PlanPanel
                   content={planContent}
                   isDiffMode={showDiff}
-                  status={session.status}
+                  status={effectiveStatus ?? session.status}
                   activityMessage={leftPanelActivityMessage}
                   isRefreshing={sessionQuery.isFetching && isPlanActivelyUpdating}
                 />
@@ -692,7 +595,10 @@ export function PlanningViewPage() {
                   phaseMessage={phaseMessage}
                   warnings={warnings}
                   pendingClarification={pendingClarification}
+                  showCritiquePrompt={showCritiquePrompt}
+                  inputDisabled={isProcessing}
                   onSubmit={submitMessage}
+                  onCritique={onCritique}
                   onSubmitClarification={handleClarificationSubmit}
                 />
               }

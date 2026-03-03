@@ -26,7 +26,16 @@ from .config import get_prscope_dir
 
 
 DB_FILENAME = "prscope.db"
-CURRENT_SCHEMA_VERSION = 9
+CURRENT_SCHEMA_VERSION = 10
+_UNSET = object()
+PROTECTED_SESSION_FIELDS = {
+    "status",
+    "is_processing",
+    "pending_questions_json",
+    "phase_message",
+    "active_tool_calls_json",
+    "processing_started_at",
+}
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -119,6 +128,12 @@ CREATE TABLE IF NOT EXISTS planning_sessions (
     seed_ref TEXT,
     current_round INTEGER NOT NULL DEFAULT 0,
     no_recall INTEGER NOT NULL DEFAULT 0,
+    pending_questions_json TEXT,
+    phase_message TEXT,
+    is_processing INTEGER NOT NULL DEFAULT 0,
+    processing_started_at TEXT,
+    last_commands_json TEXT,
+    active_tool_calls_json TEXT,
     session_total_cost_usd REAL,
     max_prompt_tokens INTEGER,
     confidence_trend REAL,
@@ -319,6 +334,12 @@ class PlanningSession:
     no_recall: int
     created_at: str
     updated_at: str
+    pending_questions_json: str | None = None
+    phase_message: str | None = None
+    is_processing: int = 0
+    processing_started_at: str | None = None
+    last_commands_json: str | None = None
+    active_tool_calls_json: str | None = None
     session_total_cost_usd: float | None = None
     max_prompt_tokens: int | None = None
     confidence_trend: float | None = None
@@ -568,6 +589,24 @@ class Store:
                     "ALTER TABLE planning_sessions ADD COLUMN no_recall INTEGER NOT NULL DEFAULT 0"
                 )
             current = 9
+
+        # v9 -> v10: canonical session workflow state columns
+        if current < 10:
+            additions = (
+                ("planning_sessions", "pending_questions_json", "TEXT"),
+                ("planning_sessions", "phase_message", "TEXT"),
+                ("planning_sessions", "is_processing", "INTEGER NOT NULL DEFAULT 0"),
+                ("planning_sessions", "processing_started_at", "TEXT"),
+                ("planning_sessions", "last_commands_json", "TEXT"),
+                ("planning_sessions", "active_tool_calls_json", "TEXT"),
+            )
+            for table, column, sql_type in additions:
+                if not self._column_exists(conn, table, column):
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+            conn.execute(
+                "UPDATE planning_sessions SET status = 'discovering' WHERE status = 'discovery'"
+            )
+            current = 10
 
         self._set_schema_version(conn, current)
     
@@ -977,10 +1016,12 @@ class Store:
                 """
                 INSERT INTO planning_sessions
                     (id, repo_name, title, requirements, author_model, critic_model, status, seed_type, seed_ref,
-                     current_round, session_total_cost_usd, max_prompt_tokens, confidence_trend,
+                     current_round, pending_questions_json, phase_message, is_processing,
+                     processing_started_at, last_commands_json, active_tool_calls_json,
+                     session_total_cost_usd, max_prompt_tokens, confidence_trend,
                      converged_early, no_recall,
                      clarifications_log_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     sid,
@@ -993,6 +1034,12 @@ class Store:
                     seed_type,
                     seed_ref,
                     0,
+                    None,
+                    None,
+                    0,
+                    None,
+                    "{}",
+                    "[]",
                     0.0,
                     0,
                     0.0,
@@ -1193,6 +1240,7 @@ class Store:
         self,
         session_id: str,
         *,
+        _bypass_protection: bool = False,
         status: str | None = None,
         requirements: str | None = None,
         author_model: str | None = None,
@@ -1204,8 +1252,33 @@ class Store:
         confidence_trend: float | None = None,
         converged_early: int | None = None,
         clarifications_log_json: str | None = None,
+        pending_questions_json: str | None | object = _UNSET,
+        phase_message: str | None | object = _UNSET,
+        is_processing: int | bool | object = _UNSET,
+        processing_started_at: str | None | object = _UNSET,
+        last_commands_json: str | None | object = _UNSET,
+        active_tool_calls_json: str | None | object = _UNSET,
     ) -> PlanningSession:
         """Update mutable fields on a planning session."""
+        if not _bypass_protection:
+            protected_updates: set[str] = set()
+            if status is not None:
+                protected_updates.add("status")
+            if pending_questions_json is not _UNSET:
+                protected_updates.add("pending_questions_json")
+            if phase_message is not _UNSET:
+                protected_updates.add("phase_message")
+            if is_processing is not _UNSET:
+                protected_updates.add("is_processing")
+            if processing_started_at is not _UNSET:
+                protected_updates.add("processing_started_at")
+            if active_tool_calls_json is not _UNSET:
+                protected_updates.add("active_tool_calls_json")
+            if protected_updates:
+                raise RuntimeError(
+                    "Direct write to protected fields: "
+                    f"{sorted(protected_updates)}. Use transition_and_snapshot() instead."
+                )
         updates: list[str] = []
         params: list[Any] = []
         if status is not None:
@@ -1241,6 +1314,24 @@ class Store:
         if clarifications_log_json is not None:
             updates.append("clarifications_log_json = ?")
             params.append(clarifications_log_json)
+        if pending_questions_json is not _UNSET:
+            updates.append("pending_questions_json = ?")
+            params.append(pending_questions_json)
+        if phase_message is not _UNSET:
+            updates.append("phase_message = ?")
+            params.append(phase_message)
+        if is_processing is not _UNSET:
+            updates.append("is_processing = ?")
+            params.append(int(bool(is_processing)))
+        if processing_started_at is not _UNSET:
+            updates.append("processing_started_at = ?")
+            params.append(processing_started_at)
+        if last_commands_json is not _UNSET:
+            updates.append("last_commands_json = ?")
+            params.append(last_commands_json)
+        if active_tool_calls_json is not _UNSET:
+            updates.append("active_tool_calls_json = ?")
+            params.append(active_tool_calls_json)
 
         updates.append("updated_at = ?")
         params.append(self._now())

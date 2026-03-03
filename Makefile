@@ -4,7 +4,7 @@
 # Use python3 on macOS, python elsewhere
 PYTHON := $(shell command -v python3 2>/dev/null || echo python)
 
-.PHONY: install dev test lint format check clean help web web-backend web-frontend web-kill
+.PHONY: install dev test lint format check clean help web web-backend web-frontend web-kill sessions-delete reset
 
 # Default target
 help:
@@ -34,6 +34,8 @@ help:
 	@echo "  make web-backend   Start API server (port 8420, loads .env)"
 	@echo "  make web-frontend  Start Vite dev server (port 5173)"
 	@echo "  make web-kill      Kill processes on 8420 and 5173 (free the ports)"
+	@echo "  make sessions-delete  Delete all planning sessions and session cache (prompts for confirmation)"
+	@echo "  make reset            Blank slate: delete sessions + clear all planning cache (prompts; use -y to skip)"
 	@echo "  make web           Show instructions to run backend + frontend"
 	@echo ""
 
@@ -126,9 +128,9 @@ web:
 	@echo "Then open: http://localhost:5173/new?repo=prscope"
 	@echo ""
 
-# Start API server (loads .env from repo root)
+# Start API server (loads .env from repo root). Use --reload for dev (auto-restart on file changes).
 web-backend:
-	@bash -c 'set -a; [ -f .env ] && . ./.env; set +a; exec uvicorn prscope.web.api:create_app --factory --host 127.0.0.1 --port 8420'
+	@bash -c 'set -a; [ -f .env ] && . ./.env; set +a; exec uvicorn prscope.web.api:create_app --factory --host 127.0.0.1 --port 8420 --reload'
 
 # Start Vite dev server (frontend)
 web-frontend:
@@ -139,3 +141,11 @@ web-kill:
 	@-lsof -ti :8420 | xargs kill 2>/dev/null || true
 	@-lsof -ti :5173 | xargs kill 2>/dev/null || true
 	@echo "Killed processes on 8420 and 5173 (if any)."
+
+# Delete all planning sessions (uses prscope plan delete --all; also clears session cache)
+sessions-delete:
+	$(PYTHON) -m prscope.cli plan delete --all
+
+# Blank slate for testing: delete all sessions and clear planning cache (memory, rounds, audit, tool-results)
+reset:
+	$(PYTHON) -m prscope.cli plan reset --yes

@@ -24,7 +24,6 @@ export function PlanPanel({
 
   if (!content) {
     const isInProgress = status === "discovering"
-      || status === "discovery"
       || status === "drafting"
       || status === "refining";
     return (
