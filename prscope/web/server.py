@@ -27,11 +27,9 @@ if _load_root != Path.cwd():
 import uvicorn
 from fastapi import HTTPException, Request
 from fastapi.responses import FileResponse
-from fastapi.staticfiles import StaticFiles
 from loguru import logger
 
 from .api import create_app
-
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8420
@@ -39,6 +37,7 @@ DEFAULT_PORT = 8420
 
 class InterceptHandler(logging.Handler):
     """Intercept standard logging messages toward Loguru sinks."""
+
     def emit(self, record: logging.LogRecord) -> None:
         try:
             level = logger.level(record.levelname).name
@@ -62,14 +61,25 @@ def setup_logging() -> None:
     logger.remove()
 
     # Add console handler
-    logger.add(sys.stderr, level="INFO", colorize=True, format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>")
-    
+    logger.add(
+        sys.stderr,
+        level="INFO",
+        colorize=True,
+        format="<green>{time:YYYY-MM-DD HH:mm:ss}</green> | <level>{level: <8}</level> | <cyan>{name}</cyan>:<cyan>{function}</cyan>:<cyan>{line}</cyan> - <level>{message}</level>",
+    )
+
     # Add file handler
-    logger.add(str(log_file), level="DEBUG", rotation="10 MB", retention="1 week", format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}")
+    logger.add(
+        str(log_file),
+        level="DEBUG",
+        rotation="10 MB",
+        retention="1 week",
+        format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {name}:{function}:{line} - {message}",
+    )
 
     # Intercept standard logging
     logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
-    
+
     # Intercept uvicorn loggers
     for logger_name in ("uvicorn", "uvicorn.access", "uvicorn.error", "fastapi"):
         logging_logger = logging.getLogger(logger_name)
@@ -86,7 +96,7 @@ def is_port_open(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT, timeout: fl
 def create_server_app() -> object:
     setup_logging()
     logger.info("Starting prscope API server...")
-    
+
     app = create_app()
     static_dir = Path(__file__).parent / "static"
     index_path = static_dir / "index.html"
@@ -109,6 +119,7 @@ def create_server_app() -> object:
             if requested.exists() and requested.is_file():
                 return FileResponse(requested)
             return FileResponse(index_path)
+
     return app
 
 
@@ -143,12 +154,12 @@ def ensure_server_running(
         "--port",
         str(port),
     ]
-    
+
     # We still redirect stdout/stderr to the log file so that any low-level crashes
     # (before loguru initializes) are captured, but loguru will handle the rest.
     log_file = Path.home() / ".prscope" / "server.log"
     log_file.parent.mkdir(parents=True, exist_ok=True)
-    
+
     with open(log_file, "a") as f:
         subprocess.Popen(cmd, stdout=f, stderr=subprocess.STDOUT)
 

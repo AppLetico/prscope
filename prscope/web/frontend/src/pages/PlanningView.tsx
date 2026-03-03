@@ -103,16 +103,21 @@ export function PlanningViewPage() {
 
   useEffect(() => {
     if (!session) return;
-    setSessionState({
+    const nextState = {
       status: session.status,
       current_round: session.current_round,
       pending_questions: session.pending_questions ?? null,
       phase_message: session.phase_message ?? null,
       is_processing: Boolean(session.is_processing),
       active_tool_calls: session.active_tool_calls ?? [],
+    };
+    const nextCalls = session.active_tool_calls ?? [];
+    queueMicrotask(() => {
+      setSessionState(nextState);
+      setActiveToolCalls(nextCalls);
     });
-    setActiveToolCalls(session.active_tool_calls ?? []);
   }, [
+    session,
     session?.id,
     session?.status,
     session?.current_round,
@@ -137,13 +142,13 @@ export function PlanningViewPage() {
   // Hydrate cost/tokens from session when loading an existing session (SSE only sends live events)
   useEffect(() => {
     if (!session) return;
-    if (session.session_total_cost_usd != null) {
-      setSessionCostUsd(session.session_total_cost_usd);
-    }
-    if (session.max_prompt_tokens != null) {
-      setMaxPromptTokens(session.max_prompt_tokens);
-    }
-  }, [session?.id, session?.session_total_cost_usd, session?.max_prompt_tokens]);
+    const cost = session.session_total_cost_usd;
+    const tokens = session.max_prompt_tokens;
+    queueMicrotask(() => {
+      if (cost != null) setSessionCostUsd(cost);
+      if (tokens != null) setMaxPromptTokens(tokens);
+    });
+  }, [session, session?.id, session?.session_total_cost_usd, session?.max_prompt_tokens]);
 
   const handleEvent = useCallback((event: UIEvent) => {
     lastEventAtMs.current = Date.now();

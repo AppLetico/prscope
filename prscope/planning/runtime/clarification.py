@@ -44,4 +44,3 @@ class ClarificationGate:
     def abort(self) -> None:
         self._aborted = True
         self._event.set()
-

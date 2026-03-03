@@ -77,7 +77,7 @@ class PlanningConfig:
     memory_concurrency: int = 2
     discovery_max_turns: int = 5
     discovery_tool_rounds: int = 25  # max codebase tool calls per discovery turn (like Cursor plan mode)
-    author_tool_rounds: int = 25     # max codebase tool calls per author draft/refinement round
+    author_tool_rounds: int = 25  # max codebase tool calls per author draft/refinement round
     seed_token_budget: int = 4000
     require_verified_file_references: bool = False
     validate_temperature: float = 0.0
@@ -226,7 +226,7 @@ class PrscopeConfig:
             return get_repo_root()
 
     @classmethod
-    def load(cls, repo_root: Path) -> "PrscopeConfig":
+    def load(cls, repo_root: Path) -> PrscopeConfig:
         """Load configuration from repo root directory."""
         config = cls(repo_root=repo_root.resolve())
 
@@ -260,7 +260,7 @@ class PrscopeConfig:
         return upstream
 
     @classmethod
-    def _parse_main_config(cls, data: dict[str, Any], repo_root: Path) -> "PrscopeConfig":
+    def _parse_main_config(cls, data: dict[str, Any], repo_root: Path) -> PrscopeConfig:
         config = cls(repo_root=repo_root)
         config.local_repo = data.get("local_repo")
 
@@ -331,9 +331,7 @@ class PrscopeConfig:
             recall_top_k=max(1, int(planning_data.get("recall_top_k", 2))),
             recall_max_chars=max(0, int(planning_data.get("recall_max_chars", 1500))),
             memory_block_max_chars=memory_caps,
-            clarification_timeout_seconds=int(
-                planning_data.get("clarification_timeout_seconds", 600)
-            ),
+            clarification_timeout_seconds=int(planning_data.get("clarification_timeout_seconds", 600)),
         )
 
         repos_data = data.get("repos", {})
@@ -354,19 +352,13 @@ class PrscopeConfig:
                     output_dir=repo_data.get("output_dir"),
                     memory_block_max_chars={
                         "architecture": int(
-                            repo_data.get("memory_block_max_chars", {}).get(
-                                "architecture", memory_caps["architecture"]
-                            )
+                            repo_data.get("memory_block_max_chars", {}).get("architecture", memory_caps["architecture"])
                         ),
                         "modules": int(
-                            repo_data.get("memory_block_max_chars", {}).get(
-                                "modules", memory_caps["modules"]
-                            )
+                            repo_data.get("memory_block_max_chars", {}).get("modules", memory_caps["modules"])
                         ),
                         "manifesto": int(
-                            repo_data.get("memory_block_max_chars", {}).get(
-                                "manifesto", memory_caps["manifesto"]
-                            )
+                            repo_data.get("memory_block_max_chars", {}).get("manifesto", memory_caps["manifesto"])
                         ),
                     },
                 )

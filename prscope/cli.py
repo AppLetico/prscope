@@ -30,6 +30,7 @@ load_dotenv()  # Loads from current directory
 load_dotenv(Path.cwd() / ".env")  # Explicit current dir
 # Also try repo root
 from .config import get_repo_root
+
 try:
     load_dotenv(get_repo_root() / ".env")
 except Exception:
@@ -39,16 +40,15 @@ from . import __version__
 from .config import (
     PrscopeConfig,
     RepoProfile,
-    get_repo_root,
     ensure_prscope_dir,
+    get_repo_root,
 )
-from .store import Store
-from .profile import build_profile, hash_profile
-from .github import GitHubClient, sync_repo_prs, GitHubAPIError
-from .scoring import evaluate_pr
+from .github import GitHubAPIError, GitHubClient, sync_repo_prs
 from .planning.runtime import PlanningRuntime
+from .profile import build_profile, hash_profile
+from .scoring import evaluate_pr
+from .store import Store
 from .web.server import DEFAULT_HOST, DEFAULT_PORT, ensure_server_running
-
 
 # Sample configuration files
 SAMPLE_CONFIG = """\
@@ -209,15 +209,15 @@ def init(force: bool):
     """Initialize Prscope in the current repository."""
     repo_root = get_repo_root()
     click.echo(f"Initializing Prscope in: {repo_root}")
-    
+
     # Create .prscope directory
     prscope_dir = ensure_prscope_dir(repo_root)
     click.echo(f"  Created: {prscope_dir}")
-    
+
     # Initialize database
     store = Store()
     click.echo(f"  Database: {store.db_path}")
-    
+
     # Create sample config files
     config_path = repo_root / "prscope.yml"
     if not config_path.exists() or force:
@@ -225,14 +225,14 @@ def init(force: bool):
         click.echo(f"  Created: {config_path}")
     else:
         click.echo(f"  Skipped: {config_path} (already exists)")
-    
+
     features_path = repo_root / "prscope.features.yml"
     if not features_path.exists() or force:
         features_path.write_text(SAMPLE_FEATURES)
         click.echo(f"  Created: {features_path}")
     else:
         click.echo(f"  Skipped: {features_path} (already exists)")
-    
+
     # Add to .gitignore
     gitignore_path = repo_root / ".gitignore"
     gitignore_entry = "\n# Prscope\n.prscope/\n.env\n"
@@ -245,7 +245,7 @@ def init(force: bool):
     else:
         gitignore_path.write_text(gitignore_entry)
         click.echo(f"  Created: {gitignore_path}")
-    
+
     # Create env template if not exists
     env_example_path = repo_root / "env.example"
     if not env_example_path.exists() or force:
@@ -257,7 +257,7 @@ def init(force: bool):
                 click.echo(f"  Created: {env_example_path}")
         except Exception:
             pass
-    
+
     click.echo("\nPrscope initialized! Next steps:")
     click.echo("  1. Edit prscope.yml to add upstream repositories")
     click.echo("  2. Edit prscope.features.yml to define features")
@@ -274,14 +274,14 @@ def profile(as_json: bool):
     """Scan and profile the local codebase."""
     config = PrscopeConfig.load(get_repo_root())
     repo_root = config.get_local_repo_path()
-    
+
     if not as_json:
         click.echo(f"Profiling repository: {repo_root}")
-    
+
     # Build profile
     profile_data = build_profile(repo_root)
     profile_sha = hash_profile(profile_data)
-    
+
     # Save to store
     store = Store()
     store.save_profile(
@@ -289,26 +289,31 @@ def profile(as_json: bool):
         profile_sha=profile_sha,
         profile_json=json.dumps(profile_data),
     )
-    
+
     if as_json:
-        click.echo(json.dumps({
-            "profile_sha": profile_sha,
-            "git_sha": profile_data.get("git_sha"),
-            "total_files": profile_data["file_tree"]["total_files"],
-            "extensions": profile_data["file_tree"]["extensions"],
-            "import_stats": profile_data["import_stats"],
-        }, indent=2))
+        click.echo(
+            json.dumps(
+                {
+                    "profile_sha": profile_sha,
+                    "git_sha": profile_data.get("git_sha"),
+                    "total_files": profile_data["file_tree"]["total_files"],
+                    "extensions": profile_data["file_tree"]["extensions"],
+                    "import_stats": profile_data["import_stats"],
+                },
+                indent=2,
+            )
+        )
     else:
-        click.echo(f"\nProfile saved:")
+        click.echo("\nProfile saved:")
         click.echo(f"  SHA: {profile_sha}")
         click.echo(f"  Git HEAD: {profile_data.get('git_sha', 'unknown')}")
         click.echo(f"  Total files: {profile_data['file_tree']['total_files']}")
-        
+
         ext_counts = profile_data["file_tree"]["extensions"]
         top_exts = sorted(ext_counts.items(), key=lambda x: -x[1])[:5]
         if top_exts:
             click.echo(f"  Top extensions: {', '.join(f'{e}({c})' for e, c in top_exts)}")
-        
+
         stats = profile_data["import_stats"]
         click.echo(f"  Files analyzed: {stats['files_analyzed']}")
         click.echo(f"  Python imports: {stats['python_imports']}")
@@ -332,12 +337,12 @@ def sync(
     warn_legacy: bool = True,
 ):
     """Fetch PRs from upstream repositories.
-    
+
     By default, uses incremental sync (only PRs newer than last sync).
     First sync uses --since window (default: 90 days).
-    
+
     Examples:
-    
+
         prscope sync                    # Incremental (new PRs only)
         prscope sync --since 30d        # Last 30 days
         prscope sync --since 2024-01-01 # Since specific date
@@ -348,12 +353,12 @@ def sync(
 
     repo_root = get_repo_root()
     config = PrscopeConfig.load(repo_root)
-    
+
     if not config.upstream:
         click.echo("No upstream repositories configured.")
         click.echo("Add repositories to prscope.yml")
         sys.exit(1)
-    
+
     # Filter repos if specified
     repos_to_sync = config.upstream
     if repo:
@@ -361,38 +366,38 @@ def sync(
         if not repos_to_sync:
             click.echo(f"Repository not found in config: {repo}")
             sys.exit(1)
-    
+
     # Initialize GitHub client
     client = GitHubClient()
     store = Store()
-    
+
     # Use config defaults, allow CLI overrides
     default_state = state or config.sync.state
     default_max_prs = max_prs or config.sync.max_prs
     default_since = since or config.sync.since
     default_incremental = config.sync.incremental and not full
     default_fetch_files = config.sync.fetch_files and not no_files
-    
+
     click.echo(f"Sync settings: state={default_state}, max_prs={default_max_prs}, since={default_since}")
     if default_incremental:
         click.echo("  Mode: incremental (only new PRs since last sync)")
     else:
         click.echo("  Mode: full (using date window)")
-    
+
     total_new = 0
     total_updated = 0
     total_skipped = 0
-    
+
     for upstream in repos_to_sync:
         click.echo(f"\n{'─' * 60}")
         click.echo(f"📦 Syncing: {upstream.full_name}")
         click.echo(f"{'─' * 60}")
-        
+
         # Per-repo filters can override defaults
         pr_state = upstream.filters.get("state", default_state)
-        
+
         # Progress callback for real-time updates
-        last_stage = [None]
+
         def progress(stage: str, current: int, total: int, message: str):
             if stage == "fetch" and current == 0:
                 click.echo(f"  ⏳ {message}")
@@ -408,7 +413,7 @@ def sync(
                         click.echo()  # Newline at end
             elif stage == "done":
                 pass  # Handled below
-        
+
         try:
             new_count, updated_count, skipped_count = sync_repo_prs(
                 client=client,
@@ -421,17 +426,17 @@ def sync(
                 incremental=default_incremental,
                 progress_callback=progress,
             )
-            
+
             click.echo(f"\n  ✅ Done: {new_count} new, {updated_count} updated, {skipped_count} unchanged")
-            
+
             total_new += new_count
             total_updated += updated_count
             total_skipped += skipped_count
-            
+
         except GitHubAPIError as e:
             click.echo(f"\n  ❌ Error: {e}", err=True)
             continue
-    
+
     click.echo(f"\n{'═' * 60}")
     click.echo(f"📊 Sync Summary: {total_new} new, {total_updated} updated, {total_skipped} unchanged")
     click.echo(f"{'═' * 60}")
@@ -452,14 +457,14 @@ def evaluate(
     warn_legacy: bool = True,
 ):
     """Evaluate PRs for relevance using multi-stage analysis.
-    
+
     Uses 3-stage pipeline:
     1. Rule-based filtering (keywords + paths)
     2. Semantic similarity (detect already-implemented)
     3. LLM analysis (final decision with reasoning)
-    
+
     Examples:
-    
+
         prscope evaluate               # Evaluate all unevaluated PRs
         prscope evaluate --batch 10    # Limit to 10 PRs (control LLM costs)
         prscope evaluate --pr 123      # Evaluate specific PR
@@ -471,44 +476,44 @@ def evaluate(
     config = PrscopeConfig.load(get_repo_root())
     local_repo_path = config.get_local_repo_path()
     store = Store()
-    
+
     if not config.features:
         click.echo("No features defined in prscope.features.yml")
         sys.exit(1)
-    
+
     # Get current profile
     profile = store.get_latest_profile(str(local_repo_path))
     if not profile:
         click.echo("No profile found. Run: prscope profile")
         sys.exit(1)
-    
+
     local_profile_sha = profile.profile_sha
-    
+
     # Determine batch size
     batch_size = batch or config.sync.eval_batch_size
-    
+
     if not as_json:
         click.echo(f"\n{'═' * 60}")
-        click.echo(f"🔍 Evaluating PRs")
+        click.echo("🔍 Evaluating PRs")
         click.echo(f"{'═' * 60}")
         click.echo(f"  Profile: {local_profile_sha[:8]}")
         if config.upstream_eval.enabled:
             click.echo(f"  Upstream eval LLM: {config.upstream_eval.model}")
-            click.echo(f"  Mode: semantic + AI analysis (3-stage pipeline)")
+            click.echo("  Mode: semantic + AI analysis (3-stage pipeline)")
             click.echo(f"  Batch limit: {batch_size} PRs")
         else:
             click.echo("  Mode: rule-based only (enable LLM for better accuracy)")
-    
+
     # Get PRs to evaluate
     prs = store.list_pull_requests()
     if repo:
         upstream = store.get_upstream_repo(repo)
         if upstream:
             prs = [pr for pr in prs if pr.repo_id == upstream.id]
-    
+
     if pr_number:
         prs = [pr for pr in prs if pr.number == pr_number]
-    
+
     # Count already-evaluated PRs upfront
     pending_prs = []
     already_evaluated = 0
@@ -518,10 +523,10 @@ def evaluate(
                 already_evaluated += 1
                 continue
         pending_prs.append(pr)
-    
+
     total_pending = len(pending_prs)
     to_process = min(total_pending, batch_size)
-    
+
     if not as_json:
         click.echo(f"{'─' * 60}")
         click.echo(f"  Total PRs in database: {len(prs)}")
@@ -529,19 +534,19 @@ def evaluate(
         click.echo(f"  Pending evaluation: {total_pending}")
         click.echo(f"  Will process: {to_process} (batch limit: {batch_size})")
         click.echo(f"{'─' * 60}")
-    
+
     evaluated = []
     batch_limited = 0
-    
+
     # Load full profile data for LLM
     profile_data = profile.profile_data if config.upstream_eval.enabled else None
-    
+
     for i, pr in enumerate(pending_prs[:batch_size], 1):
         if not as_json:
-            pct = int(i / to_process * 100) if to_process > 0 else 0
+            int(i / to_process * 100) if to_process > 0 else 0
             click.echo(f"\n  [{i}/{to_process}] PR #{pr.number}: {pr.title[:45]}...")
-            click.echo(f"      ⏳ Analyzing...", nl=False)
-        
+            click.echo("      ⏳ Analyzing...", nl=False)
+
         files = store.get_pr_files(pr.id)
         result = evaluate_pr(
             pr=pr,
@@ -552,84 +557,91 @@ def evaluate(
             local_profile=profile_data,
             local_repo_path=local_repo_path,
         )
-        
+
         if result:
-            evaluated.append({
-                "pr_id": pr.id,
-                "number": pr.number,
-                "title": pr.title,
-                "rule_score": result.rule_score,
-                "final_score": result.final_score,
-                "final_decision": result.final_decision,
-                "llm_decision": result.llm_decision,
-                "llm_confidence": result.llm_confidence,
-                "llm_reasoning": result.llm_reasoning,
-                "matched_features": result.matched_features,
-                "has_existing_impl": result.has_existing_implementation,
-                "should_seed_plan": result.should_seed_plan(),
-            })
-            
+            evaluated.append(
+                {
+                    "pr_id": pr.id,
+                    "number": pr.number,
+                    "title": pr.title,
+                    "rule_score": result.rule_score,
+                    "final_score": result.final_score,
+                    "final_decision": result.final_decision,
+                    "llm_decision": result.llm_decision,
+                    "llm_confidence": result.llm_confidence,
+                    "llm_reasoning": result.llm_reasoning,
+                    "matched_features": result.matched_features,
+                    "has_existing_impl": result.has_existing_implementation,
+                    "should_seed_plan": result.should_seed_plan(),
+                }
+            )
+
             if not as_json:
                 icon = {"relevant": "✅", "maybe": "⚠️", "skip": "❌"}.get(result.final_decision, "  ")
                 conf_pct = int(result.llm_confidence * 100)
                 click.echo(f"\r      {icon} {result.final_decision.upper()} ({conf_pct}% confidence)")
                 if result.llm_reasoning:
                     click.echo(f"      💬 {result.llm_reasoning[:70]}")
-    
+
     # Calculate remaining
     batch_limited = total_pending - len(evaluated)
-    
+
     if as_json:
-        click.echo(json.dumps({
-            "evaluated": evaluated,
-            "skipped": already_evaluated,
-            "batch_limited": batch_limited,
-            "profile_sha": local_profile_sha,
-        }, indent=2))
+        click.echo(
+            json.dumps(
+                {
+                    "evaluated": evaluated,
+                    "skipped": already_evaluated,
+                    "batch_limited": batch_limited,
+                    "profile_sha": local_profile_sha,
+                },
+                indent=2,
+            )
+        )
     else:
         # Summary by decision
         implement = [r for r in evaluated if r["llm_decision"] == "implement"]
         partial = [r for r in evaluated if r["llm_decision"] == "partial"]
         skip_prs = [r for r in evaluated if r["llm_decision"] == "skip"]
         plan_seed_ready = [r for r in evaluated if r["should_seed_plan"]]
-        
+
         click.echo(f"\n{'═' * 60}")
-        click.echo(f"📊 Evaluation Summary")
+        click.echo("📊 Evaluation Summary")
         click.echo(f"{'═' * 60}")
         click.echo(f"  Evaluated this run: {len(evaluated)}")
         click.echo(f"  Previously evaluated: {already_evaluated}")
         if batch_limited > 0:
             click.echo(f"  Remaining (batch limit): {batch_limited}")
-        
-        click.echo(f"\n  📈 Results:")
+
+        click.echo("\n  📈 Results:")
         click.echo(f"      ✅ Implement: {len(implement)}")
         click.echo(f"      ⚠️  Partial:   {len(partial)}")
         click.echo(f"      ❌ Skip:      {len(skip_prs)}")
         click.echo(f"      🗺️  Plan-seed ready: {len(plan_seed_ready)}")
-        
+
         if implement:
             click.echo(f"\n{'─' * 60}")
             click.echo(f"✅ RECOMMENDED TO IMPLEMENT ({len(implement)})")
             click.echo(f"{'─' * 60}")
             for r in sorted(implement, key=lambda x: -x["llm_confidence"]):
-                conf_pct = int(r['llm_confidence'] * 100)
+                conf_pct = int(r["llm_confidence"] * 100)
                 click.echo(f"  PR #{r['number']}: {r['title'][:50]}")
                 click.echo(f"    Confidence: {conf_pct}%")
-                if r['llm_reasoning']:
+                if r["llm_reasoning"]:
                     click.echo(f"    Reason: {r['llm_reasoning'][:65]}")
                 click.echo()
-        
+
         if partial:
             click.echo(f"\n{'─' * 60}")
             click.echo(f"⚠️  PARTIAL RELEVANCE ({len(partial)})")
             click.echo(f"{'─' * 60}")
             for r in partial[:5]:  # Limit to 5
-                conf_pct = int(r['llm_confidence'] * 100)
+                conf_pct = int(r["llm_confidence"] * 100)
                 click.echo(f"  PR #{r['number']}: {r['title'][:50]} ({conf_pct}%)")
-        
+
         if batch_limited > 0:
             click.echo(f"\n💡 Tip: Run `prscope evaluate` again to process {batch_limited} more PRs")
-        
+
         if plan_seed_ready:
             click.echo(
                 "\n💡 Tip: seed planning directly from upstream context with:\n"
@@ -645,16 +657,16 @@ def digest(limit: int, as_json: bool, warn_legacy: bool = True):
     if warn_legacy:
         _warn_legacy_command("prscope digest", "prscope upstream digest")
     store = Store()
-    
+
     # Get recent relevant evaluations
     evaluations = store.list_evaluations(decision="relevant", limit=limit)
-    
+
     digest_data = []
     for eval in evaluations:
         pr = store.get_pull_request_by_id(eval.pr_id)
         if not pr:
             continue
-        
+
         # Get repo name
         repos = store.list_upstream_repos()
         repo_name = None
@@ -662,18 +674,20 @@ def digest(limit: int, as_json: bool, warn_legacy: bool = True):
             if r.id == pr.repo_id:
                 repo_name = r.full_name
                 break
-        
-        digest_data.append({
-            "repo": repo_name,
-            "number": pr.number,
-            "title": pr.title,
-            "author": pr.author,
-            "score": eval.final_score,
-            "matched_features": eval.matched_features,
-            "url": pr.html_url,
-            "evaluated_at": eval.created_at,
-        })
-    
+
+        digest_data.append(
+            {
+                "repo": repo_name,
+                "number": pr.number,
+                "title": pr.title,
+                "author": pr.author,
+                "score": eval.final_score,
+                "matched_features": eval.matched_features,
+                "url": pr.html_url,
+                "evaluated_at": eval.created_at,
+            }
+        )
+
     if as_json:
         click.echo(json.dumps(digest_data, indent=2))
     else:
@@ -681,7 +695,7 @@ def digest(limit: int, as_json: bool, warn_legacy: bool = True):
             click.echo("No relevant PRs found.")
             click.echo("Run: prscope sync && prscope evaluate")
             return
-        
+
         click.echo(f"Top {len(digest_data)} Relevant PRs:\n")
         for item in digest_data:
             click.echo(f"[{item['repo']}] PR #{item['number']}: {item['title']}")
@@ -699,35 +713,37 @@ def history(limit: int, decision: str | None, as_json: bool, warn_legacy: bool =
     if warn_legacy:
         _warn_legacy_command("prscope history", "prscope upstream history")
     store = Store()
-    
+
     evaluations = store.list_evaluations(decision=decision, limit=limit)
-    
+
     history_data = []
     for eval in evaluations:
         pr = store.get_pull_request_by_id(eval.pr_id)
         if not pr:
             continue
-        
-        history_data.append({
-            "id": eval.id,
-            "pr_number": pr.number,
-            "pr_title": pr.title,
-            "rule_score": eval.rule_score,
-            "final_score": eval.final_score,
-            "decision": eval.decision,
-            "matched_features": eval.matched_features,
-            "profile_sha": eval.local_profile_sha[:8],
-            "pr_sha": eval.pr_head_sha[:8] if eval.pr_head_sha else "unknown",
-            "created_at": eval.created_at,
-        })
-    
+
+        history_data.append(
+            {
+                "id": eval.id,
+                "pr_number": pr.number,
+                "pr_title": pr.title,
+                "rule_score": eval.rule_score,
+                "final_score": eval.final_score,
+                "decision": eval.decision,
+                "matched_features": eval.matched_features,
+                "profile_sha": eval.local_profile_sha[:8],
+                "pr_sha": eval.pr_head_sha[:8] if eval.pr_head_sha else "unknown",
+                "created_at": eval.created_at,
+            }
+        )
+
     if as_json:
         click.echo(json.dumps(history_data, indent=2))
     else:
         if not history_data:
             click.echo("No evaluation history found.")
             return
-        
+
         click.echo(f"Evaluation History ({len(history_data)} entries):\n")
         for item in history_data:
             decision_icon = {"relevant": "✓", "maybe": "?", "skip": "✗"}.get(item["decision"], " ")
@@ -916,9 +932,7 @@ def repos_list() -> None:
     click.echo("Name\tPath\tUpstreams\tMemory")
     for repo in repos:
         meta_path = repo.memory_dir / "_meta.json"
-        click.echo(
-            f"{repo.name}\t{repo.resolved_path}\t{len(repo.upstream)}\t{_format_age(meta_path)}"
-        )
+        click.echo(f"{repo.name}\t{repo.resolved_path}\t{len(repo.upstream)}\t{_format_age(meta_path)}")
 
 
 @main.group(name="plan")
@@ -984,9 +998,7 @@ def plan_start(
 def plan_chat(repo_name: str | None, no_recall: bool, no_open: bool, rebuild_memory: bool) -> None:
     """Start chat-first discovery mode."""
     _, _, runtime = _load_planning_runtime(repo_name)
-    session, opening = asyncio.run(
-        runtime.start_from_chat(no_recall=no_recall, rebuild_memory=rebuild_memory)
-    )
+    session, opening = asyncio.run(runtime.start_from_chat(no_recall=no_recall, rebuild_memory=rebuild_memory))
     click.echo(opening)
     click.echo(f"Created planning session: {session.id}")
     if not no_open:
@@ -1126,7 +1138,7 @@ def run_web(
     background: bool,
 ) -> None:
     """Run prscope web UI server (foreground by default, -b for background)."""
-    from .web.server import run_server, is_port_open
+    from .web.server import is_port_open, run_server
 
     if repo_root:
         os.environ["PRSCOPE_CONFIG_ROOT"] = str(Path(repo_root).expanduser().resolve())
@@ -1163,13 +1175,13 @@ def run_web(
         return
 
     import threading
+
     def _open_browser() -> None:
         import time as _time
+
         _time.sleep(1.5)
         target = (
-            f"{base_url}/sessions/{resume_session_id}{repo_query}"
-            if resume_session_id
-            else f"{base_url}/{repo_query}"
+            f"{base_url}/sessions/{resume_session_id}{repo_query}" if resume_session_id else f"{base_url}/{repo_query}"
         )
         webbrowser.open(target)
 
@@ -1189,10 +1201,7 @@ def plan_list(repo_name: str | None) -> None:
         return
     click.echo("Session ID\tRepo\tStatus\tRound\tTitle")
     for session in sessions:
-        click.echo(
-            f"{session.id}\t{session.repo_name}\t{session.status}\t"
-            f"{session.current_round}\t{session.title}"
-        )
+        click.echo(f"{session.id}\t{session.repo_name}\t{session.status}\t{session.current_round}\t{session.title}")
 
 
 @plan_group.command("export")
@@ -1264,15 +1273,11 @@ def plan_validate(session_id: str, repo_name: str | None) -> None:
     hard_count = len(result.hard_constraint_violations)
     major = result.major_issues_remaining
     if hard_count > 0 and major == 0:
-        click.echo(
-            "FAILED: hard constraint violations only "
-            f"({', '.join(result.hard_constraint_violations)})"
-        )
+        click.echo(f"FAILED: hard constraint violations only ({', '.join(result.hard_constraint_violations)})")
         sys.exit(2)
     if major > 0 or hard_count > 0:
         click.echo(
-            f"FAILED: {major} major issues, hard violations: "
-            f"{', '.join(result.hard_constraint_violations) or 'none'}"
+            f"FAILED: {major} major issues, hard violations: {', '.join(result.hard_constraint_violations) or 'none'}"
         )
         sys.exit(1)
     click.echo("Plan validated - 0 major issues, 0 hard constraint violations")
@@ -1405,9 +1410,7 @@ def plan_delete(
         raise click.ClickException(f"Session not found: {session_id}")
 
     if not yes:
-        click.confirm(
-            f"Delete session '{session.title}' ({session_id[:8]})?", abort=True
-        )
+        click.confirm(f"Delete session '{session.title}' ({session_id[:8]})?", abort=True)
     store.delete_planning_session(session_id)
     click.echo(f"Deleted session {session_id[:8]}.")
 
@@ -1467,7 +1470,7 @@ def list_scanners_cmd() -> None:
     click.echo("  " + "-" * 60)
 
     descriptions = {
-        "grep":    "Default — no extra deps, file-tree + README",
+        "grep": "Default — no extra deps, file-tree + README",
         "repomap": "tree-sitter symbol map (pip install aider-chat)",
         "repomix": "full repo pack (npm install -g repomix)",
     }
@@ -1532,31 +1535,17 @@ def analytics(repo_name: str | None) -> None:
         persisted_stats = store.get_constraint_stats(repo_name)
         for cid, payload in persisted_stats.items():
             if isinstance(payload, dict):
-                constraint_counts[cid] = max(
-                    constraint_counts.get(cid, 0), int(payload.get("violations", 0))
-                )
+                constraint_counts[cid] = max(constraint_counts.get(cid, 0), int(payload.get("violations", 0)))
 
     avg_cost = total_cost / len(sessions) if sessions else 0.0
     sorted_costs = sorted(costs)
     p75_cost = sorted_costs[int(0.75 * (len(sorted_costs) - 1))] if sorted_costs else 0.0
     avg_conf = (sum(confidence_values) / len(confidence_values)) if confidence_values else 0.0
-    avg_rounds = (
-        sum(rounds_to_convergence) / len(rounds_to_convergence)
-        if rounds_to_convergence
-        else 0.0
-    )
-    avg_conf_trend = (
-        sum(confidence_trends) / len(confidence_trends) if confidence_trends else 0.0
-    )
+    avg_rounds = sum(rounds_to_convergence) / len(rounds_to_convergence) if rounds_to_convergence else 0.0
+    avg_conf_trend = sum(confidence_trends) / len(confidence_trends) if confidence_trends else 0.0
     sorted_round_tokens = sorted(round_total_tokens)
-    p75_round_tokens = (
-        sorted_round_tokens[int(0.75 * (len(sorted_round_tokens) - 1))]
-        if sorted_round_tokens
-        else 0
-    )
-    clarification_rate = (
-        (clarification_pauses / total_rounds) * 100.0 if total_rounds else 0.0
-    )
+    p75_round_tokens = sorted_round_tokens[int(0.75 * (len(sorted_round_tokens) - 1))] if sorted_round_tokens else 0
+    clarification_rate = (clarification_pauses / total_rounds) * 100.0 if total_rounds else 0.0
     top_expensive_sessions = sorted(
         sessions,
         key=lambda item: float(item.session_total_cost_usd or 0.0),

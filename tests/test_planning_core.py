@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from pathlib import Path
-
 from prscope.config import PlanningConfig, RepoProfile
 from prscope.memory import MemoryStore
 from prscope.planning.core import PlanningCore

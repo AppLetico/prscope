@@ -7,7 +7,6 @@ No extra dependencies required.  This matches the pre-scanner behaviour.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 

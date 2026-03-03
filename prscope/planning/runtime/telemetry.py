@@ -29,15 +29,9 @@ class CompletionTelemetry:
 
 def extract_usage(response: Any, model: str) -> TokenUsage:
     usage_obj = getattr(response, "usage", None)
-    prompt_tokens = int(
-        getattr(usage_obj, "prompt_tokens", None)
-        or getattr(usage_obj, "input_tokens", 0)
-        or 0
-    )
+    prompt_tokens = int(getattr(usage_obj, "prompt_tokens", None) or getattr(usage_obj, "input_tokens", 0) or 0)
     completion_tokens = int(
-        getattr(usage_obj, "completion_tokens", None)
-        or getattr(usage_obj, "output_tokens", 0)
-        or 0
+        getattr(usage_obj, "completion_tokens", None) or getattr(usage_obj, "output_tokens", 0) or 0
     )
     return TokenUsage(
         prompt_tokens=prompt_tokens,
@@ -50,4 +44,3 @@ def completion_telemetry(response: Any, model: str) -> CompletionTelemetry:
     usage = extract_usage(response, model)
     cost = estimate_cost_usd(model, usage.prompt_tokens, usage.completion_tokens)
     return CompletionTelemetry(usage=usage, cost=cost)
-

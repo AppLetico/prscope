@@ -7,14 +7,15 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from collections.abc import Awaitable
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Callable
 
-from ...pricing import MODEL_CONTEXT_WINDOWS
 from ...config import PlanningConfig, RepoProfile
 from ...memory import ParsedConstraint
+from ...pricing import MODEL_CONTEXT_WINDOWS
 from .telemetry import completion_telemetry
 
 
@@ -259,9 +260,7 @@ class CriticAgent:
         raise RuntimeError("Unknown completion failure during critique.")
 
     @staticmethod
-    def _require_object_fields(
-        payload: Any, required_fields: set[str], *, field_name: str
-    ) -> dict[str, str]:
+    def _require_object_fields(payload: Any, required_fields: set[str], *, field_name: str) -> dict[str, str]:
         if not isinstance(payload, dict):
             raise CriticParseError(f"{field_name} entries must be objects")
         missing = [key for key in sorted(required_fields) if key not in payload]
@@ -339,9 +338,7 @@ class CriticAgent:
             if field_name not in data:
                 raise CriticParseError(f"Missing required field: {field_name}")
             if not isinstance(data[field_name], expected_type):
-                raise CriticParseError(
-                    f"Wrong type for {field_name}: expected {expected_type.__name__}"
-                )
+                raise CriticParseError(f"Wrong type for {field_name}: expected {expected_type.__name__}")
 
         violations = [str(v) for v in data["hard_constraint_violations"]]
         unknown = set(violations) - valid_constraint_ids
@@ -367,9 +364,7 @@ class CriticAgent:
                 optional_values[field_name] = float(value)
                 continue
             if not isinstance(value, expected_type):
-                raise CriticParseError(
-                    f"Wrong type for {field_name}: expected {expected_type.__name__}"
-                )
+                raise CriticParseError(f"Wrong type for {field_name}: expected {expected_type.__name__}")
             optional_values[field_name] = value
 
         failure_modes: list[dict[str, str]] = []
@@ -447,15 +442,10 @@ class CriticAgent:
                 prose="LiteLLM unavailable; critic fallback used.",
             )
 
-        valid_ids = {
-            c.id
-            for c in constraints
-            if c.severity == "hard" and not c.optional
-        }
+        valid_ids = {c.id for c in constraints if c.severity == "hard" and not c.optional}
         valid_ids_text = ", ".join(sorted(valid_ids)) if valid_ids else "(none configured)"
         constraints_blob = "\n".join(
-            f"- {c.id}: {c.text} (severity={c.severity}, optional={c.optional})"
-            for c in constraints
+            f"- {c.id}: {c.text} (severity={c.severity}, optional={c.optional})" for c in constraints
         )
         prior_critique_blob = prior_critique.strip() if prior_critique else "None"
         messages: list[dict[str, Any]] = [
@@ -523,9 +513,7 @@ class CriticAgent:
                     )
             except Exception as exc:  # noqa: BLE001
                 if strict_mode:
-                    raise CriticContractError(
-                        f"Critic failed in strict mode: {exc}"
-                    ) from exc
+                    raise CriticContractError(f"Critic failed in strict mode: {exc}") from exc
                 return CriticResult(
                     major_issues_remaining=0,
                     minor_issues_remaining=1,
@@ -553,8 +541,7 @@ class CriticAgent:
                         {
                             "role": "user",
                             "content": (
-                                f"Formatting error: {exc}. Respond again with JSON first, "
-                                "then prose critique."
+                                f"Formatting error: {exc}. Respond again with JSON first, then prose critique."
                             ),
                         }
                     )

@@ -71,6 +71,5 @@ async def test_round_returns_quickly_when_clarification_requested(tmp_path):
     assert author_result.plan == "# Plan\n\nInitial"
     assert any(event.get("type") == "clarification_needed" for event in events)
     assert any(
-        event.get("type") == "complete" and event.get("message") == "Clarification requested"
-        for event in events
+        event.get("type") == "complete" and event.get("message") == "Clarification requested" for event in events
     )

@@ -15,15 +15,15 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Generator
+from typing import Any
 from uuid import uuid4
 
 from .config import get_prscope_dir
-
 
 DB_FILENAME = "prscope.db"
 CURRENT_SCHEMA_VERSION = 10
@@ -226,12 +226,13 @@ CREATE INDEX IF NOT EXISTS idx_round_metrics_session_round ON planning_round_met
 @dataclass
 class RepoProfile:
     """Stored repo profile."""
+
     id: int | None
     repo_root: str
     profile_sha: str
     profile_json: str
     created_at: str
-    
+
     @property
     def profile_data(self) -> dict[str, Any]:
         return json.loads(self.profile_json)
@@ -240,6 +241,7 @@ class RepoProfile:
 @dataclass
 class UpstreamRepo:
     """Stored upstream repo."""
+
     id: int | None
     full_name: str
     last_synced_at: str | None
@@ -249,6 +251,7 @@ class UpstreamRepo:
 @dataclass
 class PullRequest:
     """Stored pull request."""
+
     id: int | None
     repo_id: int
     number: int
@@ -261,7 +264,7 @@ class PullRequest:
     merged_at: str | None
     head_sha: str | None
     html_url: str | None
-    
+
     @property
     def labels(self) -> list[str]:
         if self.labels_json:
@@ -272,6 +275,7 @@ class PullRequest:
 @dataclass
 class PRFile:
     """Stored PR file change."""
+
     id: int | None
     pr_id: int
     path: str
@@ -282,6 +286,7 @@ class PRFile:
 @dataclass
 class Evaluation:
     """Stored evaluation result."""
+
     id: int | None
     pr_id: int
     local_profile_sha: str
@@ -293,13 +298,13 @@ class Evaluation:
     llm_json: str | None
     decision: str | None
     created_at: str
-    
+
     @property
     def matched_features(self) -> list[str]:
         if self.matched_features_json:
             return json.loads(self.matched_features_json)
         return []
-    
+
     @property
     def signals(self) -> dict[str, Any]:
         if self.signals_json:
@@ -310,6 +315,7 @@ class Evaluation:
 @dataclass
 class Artifact:
     """Stored artifact (PRD file, etc.)."""
+
     id: int | None
     evaluation_id: int
     type: str
@@ -440,13 +446,13 @@ class PlanningRoundMetrics:
 
 class Store:
     """SQLite storage manager for Prscope."""
-    
+
     def __init__(self, db_path: Path | None = None):
         if db_path is None:
             db_path = get_prscope_dir() / DB_FILENAME
         self.db_path = db_path
         self._ensure_schema()
-    
+
     def _ensure_schema(self) -> None:
         """Ensure database schema exists."""
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -585,9 +591,7 @@ class Store:
         # v8 -> v9: persist per-session no_recall mode
         if current < 9:
             if not self._column_exists(conn, "planning_sessions", "no_recall"):
-                conn.execute(
-                    "ALTER TABLE planning_sessions ADD COLUMN no_recall INTEGER NOT NULL DEFAULT 0"
-                )
+                conn.execute("ALTER TABLE planning_sessions ADD COLUMN no_recall INTEGER NOT NULL DEFAULT 0")
             current = 9
 
         # v9 -> v10: canonical session workflow state columns
@@ -603,13 +607,11 @@ class Store:
             for table, column, sql_type in additions:
                 if not self._column_exists(conn, table, column):
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
-            conn.execute(
-                "UPDATE planning_sessions SET status = 'discovering' WHERE status = 'discovery'"
-            )
+            conn.execute("UPDATE planning_sessions SET status = 'discovering' WHERE status = 'discovery'")
             current = 10
 
         self._set_schema_version(conn, current)
-    
+
     @contextmanager
     def _connect(self) -> Generator[sqlite3.Connection, None, None]:
         """Context manager for database connection."""
@@ -624,7 +626,7 @@ class Store:
             conn.commit()
         finally:
             conn.close()
-    
+
     def _now(self) -> str:
         """Get current timestamp in ISO format."""
         return datetime.utcnow().isoformat() + "Z"
@@ -638,11 +640,11 @@ class Store:
         base = Path.home() / ".prscope" / "repos" / repo_name
         base.mkdir(parents=True, exist_ok=True)
         return base / "rounds.jsonl"
-    
+
     # =========================================================================
     # Repo Profiles
     # =========================================================================
-    
+
     def save_profile(self, repo_root: str, profile_sha: str, profile_json: str) -> RepoProfile:
         """Save or update a repo profile."""
         with self._connect() as conn:
@@ -654,80 +656,71 @@ class Store:
                     profile_json = excluded.profile_json,
                     created_at = excluded.created_at
                 """,
-                (repo_root, profile_sha, profile_json, self._now())
+                (repo_root, profile_sha, profile_json, self._now()),
             )
             row = conn.execute(
                 "SELECT * FROM repo_profiles WHERE repo_root = ? AND profile_sha = ?",
-                (repo_root, profile_sha)
+                (repo_root, profile_sha),
             ).fetchone()
             return RepoProfile(**dict(row))
-    
+
     def get_profile(self, repo_root: str, profile_sha: str) -> RepoProfile | None:
         """Get a specific profile by SHA."""
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM repo_profiles WHERE repo_root = ? AND profile_sha = ?",
-                (repo_root, profile_sha)
+                (repo_root, profile_sha),
             ).fetchone()
             return RepoProfile(**dict(row)) if row else None
-    
+
     def get_latest_profile(self, repo_root: str) -> RepoProfile | None:
         """Get the most recent profile for a repo."""
         with self._connect() as conn:
             row = conn.execute(
                 "SELECT * FROM repo_profiles WHERE repo_root = ? ORDER BY created_at DESC LIMIT 1",
-                (repo_root,)
+                (repo_root,),
             ).fetchone()
             return RepoProfile(**dict(row)) if row else None
-    
+
     # =========================================================================
     # Upstream Repos
     # =========================================================================
-    
+
     def upsert_upstream_repo(self, full_name: str) -> UpstreamRepo:
         """Insert or get an upstream repo."""
         with self._connect() as conn:
-            conn.execute(
-                "INSERT OR IGNORE INTO upstream_repos (full_name) VALUES (?)",
-                (full_name,)
-            )
-            row = conn.execute(
-                "SELECT * FROM upstream_repos WHERE full_name = ?",
-                (full_name,)
-            ).fetchone()
+            conn.execute("INSERT OR IGNORE INTO upstream_repos (full_name) VALUES (?)", (full_name,))
+            row = conn.execute("SELECT * FROM upstream_repos WHERE full_name = ?", (full_name,)).fetchone()
             return UpstreamRepo(**dict(row))
-    
+
     def update_repo_sync_time(self, repo_id: int, last_seen_updated_at: str | None = None) -> None:
         """Update last sync time for a repo."""
         with self._connect() as conn:
             conn.execute(
                 """
-                UPDATE upstream_repos 
+                UPDATE upstream_repos
                 SET last_synced_at = ?, last_seen_updated_at = COALESCE(?, last_seen_updated_at)
                 WHERE id = ?
                 """,
-                (self._now(), last_seen_updated_at, repo_id)
+                (self._now(), last_seen_updated_at, repo_id),
             )
-    
+
     def get_upstream_repo(self, full_name: str) -> UpstreamRepo | None:
         """Get upstream repo by full name."""
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM upstream_repos WHERE full_name = ?",
-                (full_name,)
-            ).fetchone()
+            row = conn.execute("SELECT * FROM upstream_repos WHERE full_name = ?", (full_name,)).fetchone()
             return UpstreamRepo(**dict(row)) if row else None
-    
+
     def list_upstream_repos(self) -> list[UpstreamRepo]:
         """List all upstream repos."""
         with self._connect() as conn:
             rows = conn.execute("SELECT * FROM upstream_repos ORDER BY full_name").fetchall()
             return [UpstreamRepo(**dict(row)) for row in rows]
-    
+
     # =========================================================================
     # Pull Requests
     # =========================================================================
-    
+
     def upsert_pull_request(
         self,
         repo_id: int,
@@ -747,8 +740,8 @@ class Store:
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO pull_requests 
-                    (repo_id, number, state, title, body, author, labels_json, 
+                INSERT INTO pull_requests
+                    (repo_id, number, state, title, body, author, labels_json,
                      updated_at, merged_at, head_sha, html_url)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(repo_id, number) DO UPDATE SET
@@ -762,33 +755,39 @@ class Store:
                     head_sha = excluded.head_sha,
                     html_url = excluded.html_url
                 """,
-                (repo_id, number, state, title, body, author, labels_json,
-                 updated_at, merged_at, head_sha, html_url)
+                (
+                    repo_id,
+                    number,
+                    state,
+                    title,
+                    body,
+                    author,
+                    labels_json,
+                    updated_at,
+                    merged_at,
+                    head_sha,
+                    html_url,
+                ),
             )
             row = conn.execute(
-                "SELECT * FROM pull_requests WHERE repo_id = ? AND number = ?",
-                (repo_id, number)
+                "SELECT * FROM pull_requests WHERE repo_id = ? AND number = ?", (repo_id, number)
             ).fetchone()
             return PullRequest(**dict(row))
-    
+
     def get_pull_request(self, repo_id: int, number: int) -> PullRequest | None:
         """Get a specific PR."""
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT * FROM pull_requests WHERE repo_id = ? AND number = ?",
-                (repo_id, number)
+                "SELECT * FROM pull_requests WHERE repo_id = ? AND number = ?", (repo_id, number)
             ).fetchone()
             return PullRequest(**dict(row)) if row else None
-    
+
     def get_pull_request_by_id(self, pr_id: int) -> PullRequest | None:
         """Get a PR by its database ID."""
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM pull_requests WHERE id = ?",
-                (pr_id,)
-            ).fetchone()
+            row = conn.execute("SELECT * FROM pull_requests WHERE id = ?", (pr_id,)).fetchone()
             return PullRequest(**dict(row)) if row else None
-    
+
     def list_pull_requests(
         self,
         repo_id: int | None = None,
@@ -799,24 +798,24 @@ class Store:
         with self._connect() as conn:
             query = "SELECT * FROM pull_requests WHERE 1=1"
             params: list[Any] = []
-            
+
             if repo_id is not None:
                 query += " AND repo_id = ?"
                 params.append(repo_id)
             if state is not None:
                 query += " AND state = ?"
                 params.append(state)
-            
+
             query += " ORDER BY updated_at DESC LIMIT ?"
             params.append(limit)
-            
+
             rows = conn.execute(query, params).fetchall()
             return [PullRequest(**dict(row)) for row in rows]
-    
+
     # =========================================================================
     # PR Files
     # =========================================================================
-    
+
     def save_pr_files(self, pr_id: int, files: list[dict[str, Any]]) -> None:
         """Save files for a PR (replaces existing)."""
         with self._connect() as conn:
@@ -826,34 +825,31 @@ class Store:
             for f in files:
                 conn.execute(
                     "INSERT INTO pr_files (pr_id, path, additions, deletions) VALUES (?, ?, ?, ?)",
-                    (pr_id, f.get("path", ""), f.get("additions", 0), f.get("deletions", 0))
+                    (pr_id, f.get("path", ""), f.get("additions", 0), f.get("deletions", 0)),
                 )
-    
+
     def get_pr_files(self, pr_id: int) -> list[PRFile]:
         """Get files for a PR."""
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM pr_files WHERE pr_id = ?",
-                (pr_id,)
-            ).fetchall()
+            rows = conn.execute("SELECT * FROM pr_files WHERE pr_id = ?", (pr_id,)).fetchall()
             return [PRFile(**dict(row)) for row in rows]
-    
+
     # =========================================================================
     # Evaluations
     # =========================================================================
-    
+
     def evaluation_exists(self, pr_id: int, local_profile_sha: str, pr_head_sha: str) -> bool:
         """Check if an evaluation already exists (deduplication)."""
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT 1 FROM evaluations 
+                SELECT 1 FROM evaluations
                 WHERE pr_id = ? AND local_profile_sha = ? AND pr_head_sha = ?
                 """,
-                (pr_id, local_profile_sha, pr_head_sha)
+                (pr_id, local_profile_sha, pr_head_sha),
             ).fetchone()
             return row is not None
-    
+
     def save_evaluation(
         self,
         pr_id: int,
@@ -870,7 +866,7 @@ class Store:
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO evaluations 
+                INSERT INTO evaluations
                     (pr_id, local_profile_sha, pr_head_sha, rule_score, final_score,
                      matched_features_json, signals_json, llm_json, decision, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -884,42 +880,45 @@ class Store:
                     created_at = excluded.created_at
                 """,
                 (
-                    pr_id, local_profile_sha, pr_head_sha, rule_score, final_score,
-                    json.dumps(matched_features), json.dumps(signals),
+                    pr_id,
+                    local_profile_sha,
+                    pr_head_sha,
+                    rule_score,
+                    final_score,
+                    json.dumps(matched_features),
+                    json.dumps(signals),
                     json.dumps(llm_result) if llm_result else None,
-                    decision, self._now()
-                )
+                    decision,
+                    self._now(),
+                ),
             )
             row = conn.execute(
                 """
-                SELECT * FROM evaluations 
+                SELECT * FROM evaluations
                 WHERE pr_id = ? AND local_profile_sha = ? AND pr_head_sha = ?
                 """,
-                (pr_id, local_profile_sha, pr_head_sha)
+                (pr_id, local_profile_sha, pr_head_sha),
             ).fetchone()
             return Evaluation(**dict(row))
-    
+
     def get_evaluation(self, pr_id: int, local_profile_sha: str, pr_head_sha: str) -> Evaluation | None:
         """Get a specific evaluation."""
         with self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT * FROM evaluations 
+                SELECT * FROM evaluations
                 WHERE pr_id = ? AND local_profile_sha = ? AND pr_head_sha = ?
                 """,
-                (pr_id, local_profile_sha, pr_head_sha)
+                (pr_id, local_profile_sha, pr_head_sha),
             ).fetchone()
             return Evaluation(**dict(row)) if row else None
-    
+
     def get_evaluation_by_id(self, evaluation_id: int) -> Evaluation | None:
         """Get evaluation by ID."""
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM evaluations WHERE id = ?",
-                (evaluation_id,)
-            ).fetchone()
+            row = conn.execute("SELECT * FROM evaluations WHERE id = ?", (evaluation_id,)).fetchone()
             return Evaluation(**dict(row)) if row else None
-    
+
     def list_evaluations(
         self,
         decision: str | None = None,
@@ -929,41 +928,38 @@ class Store:
         with self._connect() as conn:
             query = "SELECT * FROM evaluations WHERE 1=1"
             params: list[Any] = []
-            
+
             if decision is not None:
                 query += " AND decision = ?"
                 params.append(decision)
-            
+
             query += " ORDER BY created_at DESC LIMIT ?"
             params.append(limit)
-            
+
             rows = conn.execute(query, params).fetchall()
             return [Evaluation(**dict(row)) for row in rows]
-    
+
     # =========================================================================
     # Artifacts
     # =========================================================================
-    
+
     def save_artifact(self, evaluation_id: int, artifact_type: str, path: str) -> Artifact:
         """Save an artifact record."""
         with self._connect() as conn:
             conn.execute(
                 "INSERT INTO artifacts (evaluation_id, type, path, created_at) VALUES (?, ?, ?, ?)",
-                (evaluation_id, artifact_type, path, self._now())
+                (evaluation_id, artifact_type, path, self._now()),
             )
             row = conn.execute(
                 "SELECT * FROM artifacts WHERE evaluation_id = ? AND type = ? AND path = ?",
-                (evaluation_id, artifact_type, path)
+                (evaluation_id, artifact_type, path),
             ).fetchone()
             return Artifact(**dict(row))
-    
+
     def get_artifacts(self, evaluation_id: int) -> list[Artifact]:
         """Get artifacts for an evaluation."""
         with self._connect() as conn:
-            rows = conn.execute(
-                "SELECT * FROM artifacts WHERE evaluation_id = ?",
-                (evaluation_id,)
-            ).fetchall()
+            rows = conn.execute("SELECT * FROM artifacts WHERE evaluation_id = ?", (evaluation_id,)).fetchall()
             return [Artifact(**dict(row)) for row in rows]
 
     # =========================================================================
@@ -1068,9 +1064,7 @@ class Store:
     def delete_planning_session(self, session_id: str) -> bool:
         """Delete a session and all its turns and plan versions. Returns True if found."""
         with self._connect() as conn:
-            row = conn.execute(
-                "SELECT id FROM planning_sessions WHERE id = ?", (session_id,)
-            ).fetchone()
+            row = conn.execute("SELECT id FROM planning_sessions WHERE id = ?", (session_id,)).fetchone()
             if row is None:
                 return False
             conn.execute("DELETE FROM planning_turns WHERE session_id = ?", (session_id,))
@@ -1089,17 +1083,12 @@ class Store:
                     ).fetchall()
                 ]
             else:
-                ids = [
-                    row[0]
-                    for row in conn.execute("SELECT id FROM planning_sessions").fetchall()
-                ]
+                ids = [row[0] for row in conn.execute("SELECT id FROM planning_sessions").fetchall()]
             for sid in ids:
                 conn.execute("DELETE FROM planning_turns WHERE session_id = ?", (sid,))
                 conn.execute("DELETE FROM plan_versions WHERE session_id = ?", (sid,))
             if repo_name:
-                conn.execute(
-                    "DELETE FROM planning_sessions WHERE repo_name = ?", (repo_name,)
-                )
+                conn.execute("DELETE FROM planning_sessions WHERE repo_name = ?", (repo_name,))
             else:
                 conn.execute("DELETE FROM planning_sessions")
             return len(ids)
@@ -1442,50 +1431,51 @@ class Store:
                     missing_evidence_count,
                 ),
             )
-            row = conn.execute(
-                "SELECT * FROM planning_round_metrics WHERE id = last_insert_rowid()"
-            ).fetchone()
+            row = conn.execute("SELECT * FROM planning_round_metrics WHERE id = last_insert_rowid()").fetchone()
             metrics = PlanningRoundMetrics(**dict(row))
         if repo_name:
             # Atomic append for per-round analytics log.
             log_path = self._rounds_log_path(repo_name)
-            line = json.dumps(
-                {
-                    "session_id": session_id,
-                    "round": round_number,
-                    "timestamp": stamp,
-                    "author_prompt_tokens": author_prompt_tokens,
-                    "author_completion_tokens": author_completion_tokens,
-                    "critic_prompt_tokens": critic_prompt_tokens,
-                    "critic_completion_tokens": critic_completion_tokens,
-                    "max_prompt_tokens": max_prompt_tokens,
-                    "major_issues": major_issues,
-                    "minor_issues": minor_issues,
-                    "critic_confidence": critic_confidence,
-                    "vagueness_score": vagueness_score,
-                    "citation_count": citation_count,
-                    "constraint_violations": constraint_violations or [],
-                    "resolved_since_last_round": resolved_since_last_round or [],
-                    "clarifications_this_round": clarifications_this_round,
-                    "call_cost_usd": call_cost_usd,
-                    "issues_resolved": issues_resolved,
-                    "issues_introduced": issues_introduced,
-                    "net_improvement": net_improvement,
-                    "model_costs": model_costs or {},
-                    "time_to_first_tool_call": time_to_first_tool_call,
-                    "grounding_ratio": grounding_ratio,
-                    "static_injection_tokens_pct": static_injection_tokens_pct,
-                    "rejected_for_no_discovery": rejected_for_no_discovery,
-                    "rejected_for_grounding": rejected_for_grounding,
-                    "rejected_for_budget": rejected_for_budget,
-                    "average_read_depth_per_round": average_read_depth_per_round,
-                    "time_between_tool_calls": time_between_tool_calls,
-                    "rejection_reasons": rejection_reasons or [],
-                    "plan_quality_score": plan_quality_score,
-                    "unsupported_claims_count": unsupported_claims_count,
-                    "missing_evidence_count": missing_evidence_count,
-                }
-            ) + "\n"
+            line = (
+                json.dumps(
+                    {
+                        "session_id": session_id,
+                        "round": round_number,
+                        "timestamp": stamp,
+                        "author_prompt_tokens": author_prompt_tokens,
+                        "author_completion_tokens": author_completion_tokens,
+                        "critic_prompt_tokens": critic_prompt_tokens,
+                        "critic_completion_tokens": critic_completion_tokens,
+                        "max_prompt_tokens": max_prompt_tokens,
+                        "major_issues": major_issues,
+                        "minor_issues": minor_issues,
+                        "critic_confidence": critic_confidence,
+                        "vagueness_score": vagueness_score,
+                        "citation_count": citation_count,
+                        "constraint_violations": constraint_violations or [],
+                        "resolved_since_last_round": resolved_since_last_round or [],
+                        "clarifications_this_round": clarifications_this_round,
+                        "call_cost_usd": call_cost_usd,
+                        "issues_resolved": issues_resolved,
+                        "issues_introduced": issues_introduced,
+                        "net_improvement": net_improvement,
+                        "model_costs": model_costs or {},
+                        "time_to_first_tool_call": time_to_first_tool_call,
+                        "grounding_ratio": grounding_ratio,
+                        "static_injection_tokens_pct": static_injection_tokens_pct,
+                        "rejected_for_no_discovery": rejected_for_no_discovery,
+                        "rejected_for_grounding": rejected_for_grounding,
+                        "rejected_for_budget": rejected_for_budget,
+                        "average_read_depth_per_round": average_read_depth_per_round,
+                        "time_between_tool_calls": time_between_tool_calls,
+                        "rejection_reasons": rejection_reasons or [],
+                        "plan_quality_score": plan_quality_score,
+                        "unsupported_claims_count": unsupported_claims_count,
+                        "missing_evidence_count": missing_evidence_count,
+                    }
+                )
+                + "\n"
+            )
             fd = os.open(log_path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644)
             try:
                 os.write(fd, line.encode("utf-8"))
@@ -1501,9 +1491,7 @@ class Store:
             ).fetchall()
             return [PlanningRoundMetrics(**dict(row)) for row in rows]
 
-    def update_constraint_stats(
-        self, repo_name: str, constraint_ids: list[str], session_id: str
-    ) -> None:
+    def update_constraint_stats(self, repo_name: str, constraint_ids: list[str], session_id: str) -> None:
         path = self._repo_stats_path(repo_name)
         data: dict[str, Any] = {}
         if path.exists():
@@ -1638,9 +1626,7 @@ class Store:
             row = conn.execute("SELECT * FROM plan_versions WHERE id = last_insert_rowid()").fetchone()
             return PlanVersion(**dict(row))
 
-    def update_plan_version_convergence(
-        self, session_id: str, round_number: int, convergence_score: float
-    ) -> None:
+    def update_plan_version_convergence(self, session_id: str, round_number: int, convergence_score: float) -> None:
         """Update the convergence score of an existing plan version (after check_convergence)."""
         with self._connect() as conn:
             conn.execute(

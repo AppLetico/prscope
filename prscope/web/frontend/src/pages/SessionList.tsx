@@ -69,7 +69,7 @@ export function SessionListPage() {
 
   useEffect(() => {
     const r = searchParams.get("repo");
-    setSelectedRepo(r || null);
+    queueMicrotask(() => setSelectedRepo(r || null));
   }, [searchParams]);
 
   const { data, isLoading, error } = useQuery({
@@ -77,7 +77,7 @@ export function SessionListPage() {
     queryFn: () => listSessions(null),
   });
 
-  const sessions = data?.items ?? [];
+  const sessions = useMemo(() => data?.items ?? [], [data?.items]);
   const repoOptions = useMemo(() => {
     const repos = [...new Set(sessions.map((s) => s.repo_name))].sort();
     return repos;

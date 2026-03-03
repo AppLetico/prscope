@@ -7,8 +7,9 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from collections.abc import Awaitable
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Literal
+from typing import Any, Callable, Literal
 
 from ...config import PlanningConfig
 from ...pricing import MODEL_CONTEXT_WINDOWS
@@ -140,15 +141,60 @@ DEFAULT_REQUIRED_PLAN_SECTION_PATTERNS: dict[str, str] = {
 }
 
 REQUIREMENT_STOPWORDS = {
-    "the", "and", "for", "with", "from", "that", "this", "into", "over", "under",
-    "mode", "plan", "planning", "project", "repo", "repository", "should", "must",
-    "will", "can", "about", "after", "before", "while", "when", "where", "what",
-    "then", "than", "use", "using", "add", "make", "more", "less", "only",
+    "the",
+    "and",
+    "for",
+    "with",
+    "from",
+    "that",
+    "this",
+    "into",
+    "over",
+    "under",
+    "mode",
+    "plan",
+    "planning",
+    "project",
+    "repo",
+    "repository",
+    "should",
+    "must",
+    "will",
+    "can",
+    "about",
+    "after",
+    "before",
+    "while",
+    "when",
+    "where",
+    "what",
+    "then",
+    "than",
+    "use",
+    "using",
+    "add",
+    "make",
+    "more",
+    "less",
+    "only",
 }
 
 NON_TRIVIAL_EXTENSIONS = {
-    ".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java", ".rb",
-    ".yaml", ".yml", ".toml", ".json", ".sql", ".sh",
+    ".py",
+    ".ts",
+    ".tsx",
+    ".js",
+    ".jsx",
+    ".go",
+    ".rs",
+    ".java",
+    ".rb",
+    ".yaml",
+    ".yml",
+    ".toml",
+    ".json",
+    ".sql",
+    ".sh",
 }
 
 TRIVIAL_FILENAMES = {"readme", "license", ".gitignore"}
@@ -171,11 +217,7 @@ class AuthorAgent:
     @staticmethod
     def _requirements_keywords(text: str) -> set[str]:
         tokens = re.split(r"[^a-z0-9]+", text.lower())
-        return {
-            token
-            for token in tokens
-            if len(token) >= 3 and token not in REQUIREMENT_STOPWORDS
-        }
+        return {token for token in tokens if len(token) >= 3 and token not in REQUIREMENT_STOPWORDS}
 
     @staticmethod
     def _path_tokens(path: str) -> set[str]:
@@ -237,10 +279,7 @@ class AuthorAgent:
             failures.append("need at least 1 requirement-relevant file read")
         if keywords and not any(
             (self._path_tokens(path) & keywords)
-            and (
-                int(meta.get("line_count", 0)) >= 20
-                or int(meta.get("file_size_bytes", 0)) >= 1000
-            )
+            and (int(meta.get("line_count", 0)) >= 20 or int(meta.get("file_size_bytes", 0)) >= 1000)
             for path, meta in read_history.items()
         ):
             failures.append("need at least 1 requirement-relevant substantive read")
@@ -278,21 +317,16 @@ class AuthorAgent:
         grounding_ratio = (len(referenced) - len(unverified)) / float(len(referenced))
         failures: list[str] = []
         if grounding_ratio < min_grounding_ratio:
-            failures.append(
-                f"grounding ratio {grounding_ratio:.2f} below required {min_grounding_ratio:.2f}"
-            )
+            failures.append(f"grounding ratio {grounding_ratio:.2f} below required {min_grounding_ratio:.2f}")
         # Cross-checking Files Changed vs Implementation Steps only applies once
         # we're in refiner mode where implementation detail sections are required.
         if draft_phase == "refiner":
             files_changed = extract_file_references(self._extract_section(plan_content, "Files Changed"))
-            implementation = extract_file_references(
-                self._extract_section(plan_content, "Implementation Steps")
-            )
+            implementation = extract_file_references(self._extract_section(plan_content, "Implementation Steps"))
             missing_impl_refs = sorted(files_changed - implementation)
             if missing_impl_refs:
                 failures.append(
-                    "Files Changed entries missing from Implementation Steps: "
-                    + ", ".join(missing_impl_refs)
+                    "Files Changed entries missing from Implementation Steps: " + ", ".join(missing_impl_refs)
                 )
         return failures, unverified, grounding_ratio
 
@@ -342,7 +376,9 @@ class AuthorAgent:
         if len(files_changed) == 1 and len(total_references) > 1:
             failures.append("under-scoped draft: one file in Files Changed but multiple referenced files")
         implementation = self._extract_section(plan_content, "Implementation Steps").lower()
-        if implementation and not any(token in implementation for token in ("interface", "signature", "contract", "api shape")):
+        if implementation and not any(
+            token in implementation for token in ("interface", "signature", "contract", "api shape")
+        ):
             failures.append("Implementation Steps missing interface/signature impact notes")
         test_strategy = self._extract_section(plan_content, "Test Strategy").lower()
         if test_strategy and not any(
@@ -356,7 +392,9 @@ class AuthorAgent:
         if rollback and not any(token in rollback for token in ("revert", "disable", "restore", "rollback action")):
             failures.append("Rollback Plan missing explicit rollback actions")
         architecture = self._extract_section(plan_content, "Architecture").lower()
-        if architecture and not any(token in architecture for token in ("metric", "log", "alert", "observe", "monitor")):
+        if architecture and not any(
+            token in architecture for token in ("metric", "log", "alert", "observe", "monitor")
+        ):
             failures.append("Architecture missing observability/monitoring specifics")
         return failures
 
@@ -409,9 +447,7 @@ class AuthorAgent:
             f"Context summary:\n{user_context[:1000]}"
         )
 
-    def _missing_required_sections(
-        self, plan_content: str, draft_phase: Literal["planner", "refiner"]
-    ) -> list[str]:
+    def _missing_required_sections(self, plan_content: str, draft_phase: Literal["planner", "refiner"]) -> list[str]:
         missing: list[str] = []
         if draft_phase == "planner":
             planner_required = {
@@ -578,11 +614,7 @@ class AuthorAgent:
                 continue
             name = str(getattr(item, "name", "") or "")
             arguments = str(getattr(item, "arguments", "") or "{}")
-            call_id = str(
-                getattr(item, "call_id", None)
-                or getattr(item, "id", None)
-                or f"call_{len(tool_calls)}"
-            )
+            call_id = str(getattr(item, "call_id", None) or getattr(item, "id", None) or f"call_{len(tool_calls)}")
             if not name:
                 continue
             tool_calls.append(
@@ -748,15 +780,12 @@ class AuthorAgent:
                     )
                 return response, model
             except asyncio.TimeoutError as exc:
-                last_error = RuntimeError(
-                    f"Model '{model}' timed out after {per_call_timeout_seconds}s"
-                )
+                last_error = RuntimeError(f"Model '{model}' timed out after {per_call_timeout_seconds}s")
                 await self._emit(
                     {
                         "type": "warning",
                         "message": (
-                            f"Author call timeout on {model} after "
-                            f"{per_call_timeout_seconds}s; trying fallback model."
+                            f"Author call timeout on {model} after {per_call_timeout_seconds}s; trying fallback model."
                         ),
                     }
                 )
@@ -777,10 +806,7 @@ class AuthorAgent:
                     break
 
         if last_error is not None:
-            raise RuntimeError(
-                "Configured planning author model failed. "
-                f"Last error: {last_error}"
-            ) from last_error
+            raise RuntimeError(f"Configured planning author model failed. Last error: {last_error}") from last_error
         raise RuntimeError("Unknown completion failure during authoring.")
 
     async def author_loop(
@@ -834,9 +860,7 @@ class AuthorAgent:
         total_tool_calls = 0
         best_non_empty_content: str = ""
         requirements_text = "\n".join(
-            str(message.get("content", ""))
-            for message in messages
-            if str(message.get("role", "")) == "user"
+            str(message.get("content", "")) for message in messages if str(message.get("role", "")) == "user"
         )
 
         try:
@@ -916,10 +940,7 @@ class AuthorAgent:
                         rejection_reasons.append(
                             {
                                 "reason": "BUDGET_EXCEEDED",
-                                "details": (
-                                    f"tool-call budget reached at {total_tool_calls}/"
-                                    f"{max_tool_calls}"
-                                ),
+                                "details": (f"tool-call budget reached at {total_tool_calls}/{max_tool_calls}"),
                             }
                         )
                         rejection_counts["rejected_for_budget"] += 1
@@ -1001,9 +1022,7 @@ class AuthorAgent:
                                 # Tool execution can include filesystem/subprocess work.
                                 # Run it off the event loop so API polling stays responsive.
                                 result = await asyncio.to_thread(self.tool_executor.execute, tc)
-                            tool_elapsed_ms = (
-                                asyncio.get_running_loop().time() - tool_started
-                            ) * 1000.0
+                            tool_elapsed_ms = (asyncio.get_running_loop().time() - tool_started) * 1000.0
                         except Exception as exc:  # noqa: BLE001
                             result = {
                                 "tool_call_id": getattr(tc, "id", ""),
@@ -1074,8 +1093,7 @@ class AuthorAgent:
                             {
                                 "type": "warning",
                                 "message": (
-                                    "Explorer gate still failing at final attempt; "
-                                    "accepting best-effort draft."
+                                    "Explorer gate still failing at final attempt; accepting best-effort draft."
                                 ),
                             }
                         )
@@ -1088,8 +1106,7 @@ class AuthorAgent:
                             {
                                 "role": "user",
                                 "content": (
-                                    "Final attempt: return a complete, non-empty markdown plan now. "
-                                    "Do not call tools."
+                                    "Final attempt: return a complete, non-empty markdown plan now. Do not call tools."
                                 ),
                             }
                         )
@@ -1120,8 +1137,7 @@ class AuthorAgent:
                             {
                                 "role": "user",
                                 "content": (
-                                    "Your previous response was empty. "
-                                    "Return a complete non-empty plan draft now."
+                                    "Your previous response was empty. Return a complete non-empty plan draft now."
                                 ),
                             }
                         )
@@ -1130,8 +1146,7 @@ class AuthorAgent:
                         {
                             "reason": "AUTHOR_FALLBACK",
                             "details": (
-                                "author exhausted attempts with empty final draft "
-                                f"after {total_tool_calls} tool calls"
+                                f"author exhausted attempts with empty final draft after {total_tool_calls} tool calls"
                             ),
                         }
                     )
@@ -1259,8 +1274,7 @@ class AuthorAgent:
                 avg_read_depth = None
                 if self.tool_executor.read_history:
                     avg_read_depth = sum(
-                        int(meta.get("line_count", 0))
-                        for meta in self.tool_executor.read_history.values()
+                        int(meta.get("line_count", 0)) for meta in self.tool_executor.read_history.values()
                     ) / float(len(self.tool_executor.read_history))
                 avg_call_spacing = None
                 if len(tool_call_timestamps) > 1:
@@ -1325,8 +1339,7 @@ class AuthorAgent:
                 {
                     "reason": "AUTHOR_FALLBACK",
                     "details": (
-                        "author exhausted attempts without producing a finalized draft "
-                        f"(tool_calls={total_tool_calls})"
+                        f"author exhausted attempts without producing a finalized draft (tool_calls={total_tool_calls})"
                     ),
                 }
             )

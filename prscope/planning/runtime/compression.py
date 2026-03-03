@@ -7,7 +7,6 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-
 CONSTRAINT_ID_RE = re.compile(r"\b[A-Z]{1,6}-\d{1,4}\b")
 
 
@@ -36,4 +35,3 @@ class CritiqueCompressor:
         summary = "\n".join(snippets)
         summary = summary[: self.max_summary_chars]
         return f"Older critique summary:\n{summary}\n\nLatest critique:\n{latest}"
-

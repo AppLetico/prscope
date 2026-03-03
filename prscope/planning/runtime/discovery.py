@@ -10,15 +10,15 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from collections.abc import Awaitable
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable
+from typing import Any, Callable
 
 from ...config import PlanningConfig
-from ...pricing import MODEL_CONTEXT_WINDOWS
 from ...memory import MemoryStore
-from .tools import CODEBASE_TOOLS, ToolExecutor
+from ...pricing import MODEL_CONTEXT_WINDOWS
 from .telemetry import completion_telemetry
-
+from .tools import CODEBASE_TOOLS, ToolExecutor
 
 DISCOVERY_SYSTEM_PROMPT = """You are a planning assistant helping scope a software implementation plan.
 
@@ -73,14 +73,14 @@ After 1-2 exchanges when you have enough context, return ONLY this JSON (no extr
 
 @dataclass
 class QuestionOption:
-    letter: str   # "A", "B", "C", "D"
+    letter: str  # "A", "B", "C", "D"
     text: str
     is_other: bool = False
 
 
 @dataclass
 class DiscoveryQuestion:
-    index: int    # 1-based question number shown in the UI
+    index: int  # 1-based question number shown in the UI
     text: str
     options: list[QuestionOption]
 
@@ -208,10 +208,7 @@ class DiscoveryManager:
     def _normalize_roles(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Map internal role names to OpenAI-accepted roles (author → assistant)."""
         role_map = {"author": "assistant"}
-        return [
-            {**m, "role": role_map.get(m.get("role", ""), m.get("role", ""))}
-            for m in messages
-        ]
+        return [{**m, "role": role_map.get(m.get("role", ""), m.get("role", ""))} for m in messages]
 
     def _build_memory_context(self) -> str:
         """Inject pre-built memory blocks so LLM has architecture overview upfront."""
@@ -257,7 +254,10 @@ class DiscoveryManager:
                 if not announced_scanning:
                     announced_scanning = True
                     await self._emit(
-                        {"type": "thinking", "message": "Scanning codebase and refining questions..."}
+                        {
+                            "type": "thinking",
+                            "message": "Scanning codebase and refining questions...",
+                        }
                     )
                 # Execute all tool calls and append results
                 conversation.append(
@@ -300,7 +300,11 @@ class DiscoveryManager:
                         result = await asyncio.to_thread(self.tool_executor.execute, tc)
                         tool_elapsed_ms = (asyncio.get_running_loop().time() - tool_started) * 1000.0
                     except Exception as exc:  # noqa: BLE001
-                        result = {"tool_call_id": getattr(tc, "id", ""), "name": "", "result": {"error": str(exc)}}
+                        result = {
+                            "tool_call_id": getattr(tc, "id", ""),
+                            "name": "",
+                            "result": {"error": str(exc)},
+                        }
                         tool_elapsed_ms = 0.0
                     await self._emit(
                         {
@@ -460,7 +464,7 @@ class DiscoveryManager:
                 if ch == "\\":
                     escaped = True
                     continue
-                if ch == "\"":
+                if ch == '"':
                     in_string = not in_string
                     continue
                 if in_string:
@@ -525,9 +529,7 @@ class DiscoveryManager:
         if turn_count >= self.config.discovery_max_turns:
             summary = await self.force_summary(conversation)
             return DiscoveryTurnResult(
-                reply=(
-                    "I have enough context to start drafting your plan now."
-                ),
+                reply=("I have enough context to start drafting your plan now."),
                 complete=True,
                 summary=summary,
             )
@@ -641,11 +643,7 @@ class DiscoveryManager:
         try:
             import litellm  # noqa: F401
         except ImportError:
-            return "\n".join(
-                m.get("content", "")
-                for m in conversation
-                if m.get("role") == "user"
-            )[:2000]
+            return "\n".join(m.get("content", "") for m in conversation if m.get("role") == "user")[:2000]
 
         messages = [
             {

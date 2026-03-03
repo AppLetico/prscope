@@ -16,11 +16,11 @@ from typing import Any
 from ...config import PlanningConfig, PrscopeConfig, RepoProfile
 from ...memory import MemoryStore, ParsedConstraint, load_skills
 from ...pricing import MODEL_CONTEXT_WINDOWS
-from ..scanners import get_scanner
 from ...profile import build_profile
 from ...store import PlanningSession, PullRequest, Store
 from ..core import ConvergenceResult, PlanningCore
 from ..render import export_plan_documents
+from ..scanners import get_scanner
 from .analytics_emitter import AnalyticsEmitter
 from .author import AuthorAgent, AuthorResult
 from .budget import ContextWindowExceeded, TokenBudgetManager, estimate_tokens
@@ -145,8 +145,7 @@ class PlanningRuntime:
             return ""
 
         header = (
-            "## Prior Planning Context\n"
-            "Historical context may be outdated. Validate against current requirements.\n\n"
+            "## Prior Planning Context\nHistorical context may be outdated. Validate against current requirements.\n\n"
         )
         body_blocks: list[str] = []
         total = len(header)
@@ -314,11 +313,7 @@ class PlanningRuntime:
             "Unresolved Major Issues:\n"
             + ("\n".join(f"- {item}" for item in major_issues) if major_issues else "- (none)")
             + "\n\nClarifications Received:\n"
-            + (
-                "\n".join(f"- {item}" for item in clarifications)
-                if clarifications
-                else "- (none)"
-            )
+            + ("\n".join(f"- {item}" for item in clarifications) if clarifications else "- (none)")
             + "\n\nFiles Inspected So Far:\n"
             + ("\n".join(f"- {item}" for item in inspected) if inspected else "- (none)")
         )
@@ -397,9 +392,7 @@ class PlanningRuntime:
             "content": truncated,
         }
 
-    async def _emit_event(
-        self, callback: Any | None, event: dict[str, Any], session_id: str
-    ) -> None:
+    async def _emit_event(self, callback: Any | None, event: dict[str, Any], session_id: str) -> None:
         emitter = AnalyticsEmitter(callback)
         event_type = str(event.get("type", "")).strip().lower()
         if event_type in {"tool_call", "tool_result", "complete"}:
@@ -543,10 +536,7 @@ class PlanningRuntime:
         constraints: list[ParsedConstraint] | None = None,
     ) -> str:
         lines = [
-            (
-                f"Critic review: {critic.major_issues_remaining} major, "
-                f"{critic.minor_issues_remaining} minor."
-            ),
+            (f"Critic review: {critic.major_issues_remaining} major, {critic.minor_issues_remaining} minor."),
         ]
         if critic.hard_constraint_violations:
             resolved_constraints = constraints if constraints is not None else self._constraints()
@@ -622,10 +612,7 @@ class PlanningRuntime:
                 event_callback,
                 {
                     "type": "thinking",
-                    "message": (
-                        "Memory ready for initial draft "
-                        f"({time.perf_counter() - memory_started:.1f}s)."
-                    ),
+                    "message": (f"Memory ready for initial draft ({time.perf_counter() - memory_started:.1f}s)."),
                 },
                 session_id,
             )
@@ -656,10 +643,7 @@ class PlanningRuntime:
                         event_callback,
                         {
                             "type": "warning",
-                            "message": (
-                                "Initial draft produced fallback content. "
-                                f"Reason: {fallback_details}"
-                            ),
+                            "message": (f"Initial draft produced fallback content. Reason: {fallback_details}"),
                         },
                         session_id,
                     )
@@ -883,6 +867,7 @@ class PlanningRuntime:
         event_callback: Any | None = None,
     ) -> str:
         """Build memory (with progress), add opening turn, set status to discovering. Returns opening message."""
+
         async def wrapped_event(event: dict[str, Any]) -> None:
             await self._emit_event(event_callback, event, session_id)
 
@@ -928,10 +913,7 @@ class PlanningRuntime:
 
             current_round = session.current_round
             core.add_turn("user", user_message, round_number=current_round)
-            conversation = [
-                {"role": turn.role, "content": turn.content}
-                for turn in core.get_conversation()
-            ]
+            conversation = [{"role": turn.role, "content": turn.content} for turn in core.get_conversation()]
             discovery_context = "".join(
                 [
                     self._skills_context(session_id),
@@ -979,9 +961,7 @@ class PlanningRuntime:
                     snapshot = core.transition_and_snapshot(
                         "discovering",
                         phase_message=None,
-                        pending_questions_json=(
-                            json.dumps(result.questions) if result.questions else None
-                        ),
+                        pending_questions_json=(json.dumps(result.questions) if result.questions else None),
                     )
                     await wrapped_event(snapshot)
 
@@ -1137,9 +1117,7 @@ class PlanningRuntime:
                 context_index = self._build_context_index(blocks)
                 manifesto_path = self._manifesto_relative_path()
                 constraints = self._constraints()
-                requirements = (session.requirements or "") + (
-                    f"\n\nUser input:\n{user_input}" if user_input else ""
-                )
+                requirements = (session.requirements or "") + (f"\n\nUser input:\n{user_input}" if user_input else "")
                 recall_context = self._build_recall_context(session_id, requirements)
                 if user_input:
                     core.add_turn("user", user_input, round_number=round_number)
@@ -1273,16 +1251,10 @@ class PlanningRuntime:
                     prior_critique=prior_critique_context,
                     model_override=selected_critic_model,
                 )
-                should_pause_for_clarification = (
-                    bool(critic_result.clarification_questions)
-                    and (
-                        critic_result.critic_confidence < 0.6
-                        or bool(critic_result.hard_constraint_violations)
-                        or (
-                            critic_result.vagueness_score > 0.25
-                            and len(self._session_reads(session_id)) == 0
-                        )
-                    )
+                should_pause_for_clarification = bool(critic_result.clarification_questions) and (
+                    critic_result.critic_confidence < 0.6
+                    or bool(critic_result.hard_constraint_violations)
+                    or (critic_result.vagueness_score > 0.25 and len(self._session_reads(session_id)) == 0)
                 )
                 if should_pause_for_clarification:
                     for question in critic_result.clarification_questions:
@@ -1555,9 +1527,7 @@ class PlanningRuntime:
                     citation_count=critic_result.citation_count,
                     constraint_violations=critic_result.hard_constraint_violations,
                     resolved_since_last_round=[],
-                    clarifications_this_round=len(
-                        [q for q in critic_result.clarification_questions if q.strip()]
-                    ),
+                    clarifications_this_round=len([q for q in critic_result.clarification_questions if q.strip()]),
                     call_cost_usd=self._session_cost_usd.get(session_id, 0.0),
                     issues_resolved=delta.issues_resolved,
                     issues_introduced=delta.issues_introduced,
@@ -1566,15 +1536,9 @@ class PlanningRuntime:
                     time_to_first_tool_call=time_to_first_tool_call,
                     grounding_ratio=author_result.grounding_ratio,
                     static_injection_tokens_pct=static_ratio,
-                    rejected_for_no_discovery=author_result.rejection_counts.get(
-                        "rejected_for_no_discovery", 0
-                    ),
-                    rejected_for_grounding=author_result.rejection_counts.get(
-                        "rejected_for_grounding", 0
-                    ),
-                    rejected_for_budget=author_result.rejection_counts.get(
-                        "rejected_for_budget", 0
-                    ),
+                    rejected_for_no_discovery=author_result.rejection_counts.get("rejected_for_no_discovery", 0),
+                    rejected_for_grounding=author_result.rejection_counts.get("rejected_for_grounding", 0),
+                    rejected_for_budget=author_result.rejection_counts.get("rejected_for_budget", 0),
                     average_read_depth_per_round=author_result.average_read_depth,
                     time_between_tool_calls=author_result.average_time_between_tool_calls,
                     rejection_reasons=(
@@ -1588,9 +1552,7 @@ class PlanningRuntime:
                 )
                 metrics = self.store.get_round_metrics(session_id)
                 confidence_points = [
-                    float(metric.critic_confidence)
-                    for metric in metrics
-                    if metric.critic_confidence is not None
+                    float(metric.critic_confidence) for metric in metrics if metric.critic_confidence is not None
                 ]
                 confidence_trend = self._confidence_trend(confidence_points)
                 converged_early = int(
@@ -1617,14 +1579,11 @@ class PlanningRuntime:
                     },
                     session_id,
                 )
-                if (
-                    convergence.converged
-                    and (
-                        plan_quality_score < 0.7
-                        or bool(critic_result.unsupported_claims)
-                        or bool(critic_result.missing_evidence)
-                        or not critic_result.operational_readiness
-                    )
+                if convergence.converged and (
+                    plan_quality_score < 0.7
+                    or bool(critic_result.unsupported_claims)
+                    or bool(critic_result.missing_evidence)
+                    or not critic_result.operational_readiness
                 ):
                     convergence = ConvergenceResult(
                         converged=False,
@@ -1713,9 +1672,7 @@ class PlanningRuntime:
         unplanned = merged_pr_files - planned_files
         round_metrics = self.store.get_round_metrics(session_id)
         confidence_points = [
-            float(metric.critic_confidence)
-            for metric in round_metrics
-            if metric.critic_confidence is not None
+            float(metric.critic_confidence) for metric in round_metrics if metric.critic_confidence is not None
         ]
         return {
             "planned_total": len(planned_files),

@@ -31,8 +31,7 @@ class TokenBudgetManager:
         required = sum(estimate_tokens(block) for block in required_blocks)
         if required > self.available_prompt_tokens:
             raise ContextWindowExceeded(
-                f"Required context exceeds model window: required={required}, "
-                f"available={self.available_prompt_tokens}"
+                f"Required context exceeds model window: required={required}, available={self.available_prompt_tokens}"
             )
 
     def injected_tokens(self, blocks: list[str]) -> int:
@@ -57,4 +56,3 @@ class TokenBudgetManager:
         head = max(1, target_chars - len(marker))
         trimmed = text[:head] + marker
         return trimmed, estimate_tokens(trimmed)
-

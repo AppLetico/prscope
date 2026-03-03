@@ -40,10 +40,10 @@ class RepomixScanner:
     def build_context(self, repo_path: Path, profile: dict[str, Any]) -> str:
         if not self.is_available():
             logger.warning(
-                "RepomixScanner: neither repomix nor npx found. "
-                "Install with: npm install -g repomix  — falling back."
+                "RepomixScanner: neither repomix nor npx found. Install with: npm install -g repomix  — falling back."
             )
             from .grep import GrepScanner
+
             return GrepScanner().build_context(repo_path, profile)
 
         with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as tmp:
@@ -54,9 +54,11 @@ class RepomixScanner:
             cmd_base = ["repomix"] if shutil.which("repomix") else ["npx", "--yes", "repomix"]
             cmd = [
                 *cmd_base,
-                "--output", str(out_path),
-                "--style", "plain",      # plain text, not XML
-                "--no-file-summary",     # skip the summary header block
+                "--output",
+                str(out_path),
+                "--style",
+                "plain",  # plain text, not XML
+                "--no-file-summary",  # skip the summary header block
                 str(repo_path),
             ]
             result = subprocess.run(
@@ -73,6 +75,7 @@ class RepomixScanner:
                     result.stderr[:500],
                 )
                 from .grep import GrepScanner
+
                 return GrepScanner().build_context(repo_path, profile)
 
             raw = out_path.read_text(encoding="utf-8", errors="ignore")
@@ -80,16 +83,19 @@ class RepomixScanner:
         except subprocess.TimeoutExpired:
             logger.warning("RepomixScanner: timed out — falling back.")
             from .grep import GrepScanner
+
             return GrepScanner().build_context(repo_path, profile)
         except Exception as exc:
             logger.warning("RepomixScanner: unexpected error (%s) — falling back.", exc)
             from .grep import GrepScanner
+
             return GrepScanner().build_context(repo_path, profile)
         finally:
             out_path.unlink(missing_ok=True)
 
         if not raw.strip():
             from .grep import GrepScanner
+
             return GrepScanner().build_context(repo_path, profile)
 
         # Prepend header and cap to avoid prompt bloat

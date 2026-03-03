@@ -16,12 +16,40 @@ IGNORED_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".prscop
 
 # File extensions that are always binary/non-text — skip entirely in search
 BINARY_EXTENSIONS = {
-    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg", ".ico",
-    ".pdf", ".zip", ".gz", ".tar", ".bz2", ".xz", ".7z",
-    ".db", ".sqlite", ".sqlite3", ".db-wal", ".db-shm",
-    ".wasm", ".dylib", ".so", ".dll", ".exe", ".bin",
-    ".ttf", ".woff", ".woff2", ".eot",
-    ".mp4", ".mp3", ".mov", ".avi", ".wav",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".webp",
+    ".svg",
+    ".ico",
+    ".pdf",
+    ".zip",
+    ".gz",
+    ".tar",
+    ".bz2",
+    ".xz",
+    ".7z",
+    ".db",
+    ".sqlite",
+    ".sqlite3",
+    ".db-wal",
+    ".db-shm",
+    ".wasm",
+    ".dylib",
+    ".so",
+    ".dll",
+    ".exe",
+    ".bin",
+    ".ttf",
+    ".woff",
+    ".woff2",
+    ".eot",
+    ".mp4",
+    ".mp3",
+    ".mov",
+    ".avi",
+    ".wav",
     ".lock",  # package lock files (huge, unreadable)
 }
 
@@ -318,9 +346,7 @@ class ToolExecutor:
                 path=str(parsed.arguments.get("path", "")),
                 max_lines=int(parsed.arguments.get("max_lines", 200)),
                 start_line=(
-                    int(parsed.arguments.get("start_line"))
-                    if parsed.arguments.get("start_line") is not None
-                    else None
+                    int(parsed.arguments.get("start_line")) if parsed.arguments.get("start_line") is not None else None
                 ),
                 around_line=(
                     int(parsed.arguments.get("around_line"))

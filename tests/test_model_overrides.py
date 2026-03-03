@@ -23,11 +23,7 @@ async def test_author_loop_forwards_model_override(tmp_path):
         del messages, allow_tools, max_output_tokens
         captured["model"] = model_override
         content = (
-            "# Plan Title\n\n"
-            "## Goals\n- G\n\n"
-            "## Non-Goals\n- N\n\n"
-            "## Files Changed\n- `a.py`\n\n"
-            "## Architecture\n- A\n"
+            "# Plan Title\n\n## Goals\n- G\n\n## Non-Goals\n- N\n\n## Files Changed\n- `a.py`\n\n## Architecture\n- A\n"
         )
         message = SimpleNamespace(content=content, tool_calls=[])
         return SimpleNamespace(choices=[SimpleNamespace(message=message)]), "gpt-4o-mini"

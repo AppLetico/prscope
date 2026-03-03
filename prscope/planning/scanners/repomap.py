@@ -18,16 +18,51 @@ logger = logging.getLogger(__name__)
 
 # Binary/generated extensions to exclude from the map
 _SKIP_EXTENSIONS = {
-    ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico", ".webp",
-    ".pdf", ".zip", ".gz", ".tar", ".bz2", ".wasm", ".dylib",
-    ".so", ".dll", ".exe", ".bin", ".ttf", ".woff", ".woff2",
-    ".db", ".sqlite", ".sqlite3", ".db-wal", ".db-shm",
-    ".mp4", ".mp3", ".mov", ".wav",
-    ".lock", ".min.js", ".min.css",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".svg",
+    ".ico",
+    ".webp",
+    ".pdf",
+    ".zip",
+    ".gz",
+    ".tar",
+    ".bz2",
+    ".wasm",
+    ".dylib",
+    ".so",
+    ".dll",
+    ".exe",
+    ".bin",
+    ".ttf",
+    ".woff",
+    ".woff2",
+    ".db",
+    ".sqlite",
+    ".sqlite3",
+    ".db-wal",
+    ".db-shm",
+    ".mp4",
+    ".mp3",
+    ".mov",
+    ".wav",
+    ".lock",
+    ".min.js",
+    ".min.css",
 }
 _SKIP_DIRS = {
-    ".git", "node_modules", ".venv", "venv", "__pycache__",
-    ".prscope", "dist", "build", ".next", "coverage",
+    ".git",
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".prscope",
+    "dist",
+    "build",
+    ".next",
+    "coverage",
 }
 
 
@@ -45,6 +80,7 @@ class RepoMapScanner:
     def is_available(self) -> bool:
         try:
             from aider.repomap import RepoMap  # noqa: F401
+
             return True
         except ImportError:
             return False
@@ -58,6 +94,7 @@ class RepoMapScanner:
                 "Run: pip install aider-chat  — falling back to file-tree summary."
             )
             from .grep import GrepScanner
+
             return GrepScanner().build_context(repo_path, profile)
 
         # Collect all candidate source files
@@ -77,6 +114,7 @@ class RepoMapScanner:
         if not source_files:
             logger.warning("RepoMapScanner: no source files found.")
             from .grep import GrepScanner
+
             return GrepScanner().build_context(repo_path, profile)
 
         try:
@@ -93,10 +131,12 @@ class RepoMapScanner:
         except Exception as exc:
             logger.warning("RepoMapScanner: RepoMap failed (%s) — falling back.", exc)
             from .grep import GrepScanner
+
             return GrepScanner().build_context(repo_path, profile)
 
         if not repo_map_text or not repo_map_text.strip():
             from .grep import GrepScanner
+
             return GrepScanner().build_context(repo_path, profile)
 
         # Prepend a header and cap size

@@ -21,7 +21,6 @@ from urllib.request import ProxyHandler, Request, build_opener
 
 import yaml
 
-
 DEFAULT_PROMPTS = [
     "Add a lightweight /health endpoint and tests for it.",
     "Add request ID propagation in server middleware and include it in structured logs, with tests.",
@@ -65,7 +64,7 @@ def _redact_home_path(raw_path: str | Path) -> str:
         return "~"
     prefix = f"{home}/"
     if raw.startswith(prefix):
-        return f"~/{raw[len(prefix):]}"
+        return f"~/{raw[len(prefix) :]}"
     return raw
 
 
@@ -215,17 +214,23 @@ def _summary(results: list[PromptRun]) -> dict[str, Any]:
     avg_time = statistics.mean(r.time_to_plan_s for r in finished) if finished else None
     avg_create = statistics.mean(r.create_elapsed_s for r in results) if results else None
     avg_quality = statistics.mean(r.quality_score for r in results) if results else None
-    avg_poll_latency_ms = statistics.mean(
-        r.avg_poll_latency_ms for r in results if r.avg_poll_latency_ms is not None
-    ) if results else None
-    avg_server_draft_elapsed_s = statistics.mean(
-        r.server_initial_draft_elapsed_s
-        for r in results
-        if r.server_initial_draft_elapsed_s is not None
-    ) if results else None
-    avg_client_detect_gap_s = statistics.mean(
-        r.client_detect_gap_s for r in results if r.client_detect_gap_s is not None
-    ) if results else None
+    avg_poll_latency_ms = (
+        statistics.mean(r.avg_poll_latency_ms for r in results if r.avg_poll_latency_ms is not None)
+        if results
+        else None
+    )
+    avg_server_draft_elapsed_s = (
+        statistics.mean(
+            r.server_initial_draft_elapsed_s for r in results if r.server_initial_draft_elapsed_s is not None
+        )
+        if results
+        else None
+    )
+    avg_client_detect_gap_s = (
+        statistics.mean(r.client_detect_gap_s for r in results if r.client_detect_gap_s is not None)
+        if results
+        else None
+    )
     slowest = max(
         (r for r in finished),
         key=lambda item: item.time_to_plan_s or 0,
@@ -268,9 +273,7 @@ def _summary(results: list[PromptRun]) -> dict[str, Any]:
         "avg_server_first_plan_elapsed_s": (
             round(
                 statistics.mean(
-                    r.server_first_plan_elapsed_s
-                    for r in results
-                    if r.server_first_plan_elapsed_s is not None
+                    r.server_first_plan_elapsed_s for r in results if r.server_first_plan_elapsed_s is not None
                 ),
                 3,
             )
@@ -608,9 +611,7 @@ def run_benchmark(
                     except (TypeError, ValueError):
                         author_call_timeouts = 0
                     try:
-                        author_fallback_warnings = int(
-                            draft_timing.get("author_fallback_warnings", 0) or 0
-                        )
+                        author_fallback_warnings = int(draft_timing.get("author_fallback_warnings", 0) or 0)
                     except (TypeError, ValueError):
                         author_fallback_warnings = 0
                     try:
@@ -626,9 +627,7 @@ def run_benchmark(
                     except (TypeError, ValueError):
                         server_llm_calls_total = 0
                     try:
-                        server_llm_latency_ms_total = float(
-                            draft_timing.get("llm_call_latency_ms_total", 0.0) or 0.0
-                        )
+                        server_llm_latency_ms_total = float(draft_timing.get("llm_call_latency_ms_total", 0.0) or 0.0)
                     except (TypeError, ValueError):
                         server_llm_latency_ms_total = 0.0
                     try:
@@ -702,9 +701,7 @@ def run_benchmark(
                         except (TypeError, ValueError):
                             author_call_timeouts = 0
                         try:
-                            author_fallback_warnings = int(
-                                draft_timing.get("author_fallback_warnings", 0) or 0
-                            )
+                            author_fallback_warnings = int(draft_timing.get("author_fallback_warnings", 0) or 0)
                         except (TypeError, ValueError):
                             author_fallback_warnings = 0
                         try:
@@ -826,8 +823,7 @@ def run_benchmark(
                     3,
                 )
                 if (
-                    server_first_plan_saved_at_unix_s is not None
-                    and server_initial_draft_started_at_unix_s is not None
+                    server_first_plan_saved_at_unix_s is not None and server_initial_draft_started_at_unix_s is not None
                 )
                 else None
             ),
@@ -874,9 +870,7 @@ def run_benchmark(
                 "server_initial_draft_elapsed_s": run.server_initial_draft_elapsed_s,
                 "server_first_plan_elapsed_s": run.server_first_plan_elapsed_s,
                 "client_detect_gap_s": run.client_detect_gap_s,
-                "client_detect_gap_from_server_first_plan_s": (
-                    run.client_detect_gap_from_server_first_plan_s
-                ),
+                "client_detect_gap_from_server_first_plan_s": (run.client_detect_gap_from_server_first_plan_s),
                 "timed_out": run.timed_out,
                 "fallback": run.fallback,
                 "quality_score": run.quality_score,
@@ -913,9 +907,7 @@ def run_benchmark(
                         "event": "suite_stop",
                         "reason": "stop_on_first_problem",
                         "prompt_index": idx,
-                        "problem": (
-                            "timed_out" if run.timed_out else "fallback" if run.fallback else "error"
-                        ),
+                        "problem": ("timed_out" if run.timed_out else "fallback" if run.fallback else "error"),
                     },
                 )
                 break
@@ -1129,4 +1121,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

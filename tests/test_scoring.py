@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from prscope.config import Feature, PrscopeConfig, ScoringConfig
-from prscope.scoring import score_pr, score_pr_rules, tokenize, match_keyword, match_path_glob
+from prscope.scoring import match_keyword, match_path_glob, score_pr, score_pr_rules, tokenize
 from prscope.store import PRFile, PullRequest
 
 
@@ -36,10 +36,18 @@ def test_score_pr_rules():
     )
 
     pr = PullRequest(
-        id=1, repo_id=1, number=42, state="closed",
-        title="Fix auth bug", body="Security patch",
-        author="alice", labels_json=None,
-        updated_at=None, merged_at=None, head_sha="sha1", html_url="",
+        id=1,
+        repo_id=1,
+        number=42,
+        state="closed",
+        title="Fix auth bug",
+        body="Security patch",
+        author="alice",
+        labels_json=None,
+        updated_at=None,
+        merged_at=None,
+        head_sha="sha1",
+        html_url="",
     )
     files = [PRFile(id=1, pr_id=1, path="src/auth/login.py", additions=5, deletions=2)]
 
@@ -60,10 +68,18 @@ def test_score_pr_skip_low_relevance():
     )
 
     pr = PullRequest(
-        id=1, repo_id=1, number=42, state="closed",
-        title="Update README", body="Documentation changes",
-        author="alice", labels_json=None,
-        updated_at=None, merged_at=None, head_sha="sha1", html_url="",
+        id=1,
+        repo_id=1,
+        number=42,
+        state="closed",
+        title="Update README",
+        body="Documentation changes",
+        author="alice",
+        labels_json=None,
+        updated_at=None,
+        merged_at=None,
+        head_sha="sha1",
+        html_url="",
     )
     files = [PRFile(id=1, pr_id=1, path="README.md", additions=10, deletions=0)]
 

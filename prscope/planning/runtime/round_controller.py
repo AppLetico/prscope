@@ -34,4 +34,3 @@ def compute_plan_delta(previous: CriticResult | None, current: CriticResult) -> 
         issues_introduced=introduced,
         net_improvement=-introduced,
     )
-

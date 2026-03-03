@@ -1,5 +1,5 @@
 import { ChevronRight, Search, Loader2, CheckCircle2 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { clsx } from "clsx";
 import type { ToolCallEntry } from "../types";
 
@@ -10,22 +10,17 @@ interface ToolCallStreamProps {
 }
 
 export function ToolCallStream({ toolCalls, defaultOpen = false, className }: ToolCallStreamProps) {
-  const [isOpen, setIsOpen] = useState(defaultOpen);
+  const [userOpen, setUserOpen] = useState<boolean | null>(null);
   const hasRunningCalls = toolCalls.some((call) => call.status === "running");
   const count = toolCalls.length;
-
-  useEffect(() => {
-    if (hasRunningCalls) {
-      setIsOpen(true);
-    }
-  }, [hasRunningCalls]);
+  const isOpen = hasRunningCalls ? true : (userOpen ?? defaultOpen);
 
   if (toolCalls.length === 0) return null;
 
   return (
     <div className={clsx("mt-2 mb-4", className)}>
       <button
-        onClick={() => setIsOpen(!isOpen)}
+        onClick={() => setUserOpen(!isOpen)}
         className="inline-flex items-center gap-2 rounded-md border border-zinc-800/80 bg-zinc-900/55 px-2.5 py-1 text-[11px] text-zinc-300 hover:border-zinc-700 hover:bg-zinc-900/75 transition-colors"
       >
         <ChevronRight className={clsx("w-3 h-3 text-zinc-500 transition-transform duration-200", isOpen && "rotate-90")} />

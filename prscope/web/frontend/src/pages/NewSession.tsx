@@ -65,7 +65,7 @@ export function NewSessionPage() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [setSearchParams]);
 
   useEffect(() => {
     let cancelled = false;

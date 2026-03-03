@@ -5,7 +5,8 @@ Structured event emission helper for planning runtime.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Awaitable, Callable
+from collections.abc import Awaitable
+from typing import Any, Callable
 
 
 class AnalyticsEmitter:
@@ -18,4 +19,3 @@ class AnalyticsEmitter:
         maybe = self.callback(event)
         if asyncio.iscoroutine(maybe):
             await maybe
-

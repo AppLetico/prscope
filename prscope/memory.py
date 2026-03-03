@@ -7,16 +7,17 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Awaitable
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Callable
 
 import yaml
 
 from .config import PlanningConfig, RepoProfile
-from .pricing import MODEL_CONTEXT_WINDOWS, estimate_cost_usd
 from .planning.scanners import ScannerBackend, get_scanner
+from .pricing import MODEL_CONTEXT_WINDOWS, estimate_cost_usd
 
 logger = logging.getLogger(__name__)
 
@@ -292,9 +293,7 @@ class MemoryStore:
             # rest of the system keeps working.
             if progress_callback:
                 await progress_callback("Scanning codebase...")
-            context = await asyncio.to_thread(
-                self._scanner.build_context, self.repo.resolved_path, profile
-            )
+            context = await asyncio.to_thread(self._scanner.build_context, self.repo.resolved_path, profile)
             if progress_callback:
                 await progress_callback("Building context...")
             (self.memory_dir / "context.md").write_text(context, encoding="utf-8")
@@ -310,9 +309,7 @@ class MemoryStore:
         # it into structured memory blocks.
         if progress_callback:
             await progress_callback("Scanning codebase...")
-        scanner_context = await asyncio.to_thread(
-            self._scanner.build_context, self.repo.resolved_path, profile
-        )
+        scanner_context = await asyncio.to_thread(self._scanner.build_context, self.repo.resolved_path, profile)
         semaphore = asyncio.Semaphore(max(self.config.memory_concurrency, 1))
         prompts = self._build_prompts(profile, scanner_context=scanner_context)
 
@@ -334,9 +331,7 @@ class MemoryStore:
                 return {"context": context_path.read_text(encoding="utf-8")}
         return {name: self.load_block(name) for name in MEMORY_BLOCKS}
 
-    def _build_prompts(
-        self, profile: dict[str, Any], scanner_context: str | None = None
-    ) -> dict[str, str]:
+    def _build_prompts(self, profile: dict[str, Any], scanner_context: str | None = None) -> dict[str, str]:
         files = profile.get("file_tree", {}).get("files", [])
         dirs = profile.get("file_tree", {}).get("directories", [])
         extensions = profile.get("file_tree", {}).get("extensions", {})
@@ -359,22 +354,10 @@ class MemoryStore:
             )
 
         return {
-            "architecture": (
-                "Write a concise architecture overview in markdown.\n\n"
-                f"{summary}"
-            ),
-            "modules": (
-                "Write a module index in markdown with key directories and responsibilities.\n\n"
-                f"{summary}"
-            ),
-            "patterns": (
-                "Write coding and design patterns in markdown inferred from repo structure.\n\n"
-                f"{summary}"
-            ),
-            "entrypoints": (
-                "Write operational entrypoints and execution paths in markdown.\n\n"
-                f"{summary}"
-            ),
+            "architecture": (f"Write a concise architecture overview in markdown.\n\n{summary}"),
+            "modules": (f"Write a module index in markdown with key directories and responsibilities.\n\n{summary}"),
+            "patterns": (f"Write coding and design patterns in markdown inferred from repo structure.\n\n{summary}"),
+            "entrypoints": (f"Write operational entrypoints and execution paths in markdown.\n\n{summary}"),
         }
 
     async def _complete(
@@ -409,14 +392,10 @@ class MemoryStore:
             if event_callback is not None:
                 usage_obj = getattr(response, "usage", None)
                 prompt_tokens = int(
-                    getattr(usage_obj, "prompt_tokens", None)
-                    or getattr(usage_obj, "input_tokens", 0)
-                    or 0
+                    getattr(usage_obj, "prompt_tokens", None) or getattr(usage_obj, "input_tokens", 0) or 0
                 )
                 completion_tokens = int(
-                    getattr(usage_obj, "completion_tokens", None)
-                    or getattr(usage_obj, "output_tokens", 0)
-                    or 0
+                    getattr(usage_obj, "completion_tokens", None) or getattr(usage_obj, "output_tokens", 0) or 0
                 )
                 model = self.config.author_model
                 context_window = MODEL_CONTEXT_WINDOWS.get(model)

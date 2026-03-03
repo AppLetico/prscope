@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 from prscope.github import GitHubClient, parse_since
 
@@ -53,7 +53,7 @@ def test_parse_since_invalid_defaults():
 def test_list_pulls_filters_merged():
     """Test that state='merged' filters to only merged PRs."""
     client = GitHubClient(token="test-token")
-    
+
     # Mock the _paginate method
     mock_items = [
         {
@@ -81,10 +81,10 @@ def test_list_pulls_filters_merged():
             "html_url": "https://example.com/pr/2",
         },
     ]
-    
+
     with patch.object(client, "_paginate", return_value=iter(mock_items)):
         prs = client.list_pulls("owner/repo", state="merged")
-    
+
     # Should only return the merged PR
     assert len(prs) == 1
     assert prs[0].number == 1
@@ -94,7 +94,7 @@ def test_list_pulls_filters_merged():
 def test_list_pulls_respects_since():
     """Test that since parameter filters by date."""
     client = GitHubClient(token="test-token")
-    
+
     mock_items = [
         {
             "number": 1,
@@ -121,11 +121,11 @@ def test_list_pulls_respects_since():
             "html_url": "https://example.com/pr/2",
         },
     ]
-    
+
     with patch.object(client, "_paginate", return_value=iter(mock_items)):
         # Only get PRs since June 2024
         prs = client.list_pulls("owner/repo", state="merged", since="2024-06-01")
-    
+
     # Should only return the recent PR
     assert len(prs) == 1
     assert prs[0].number == 1

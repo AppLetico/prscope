@@ -4,7 +4,7 @@
 # Use python3 on macOS, python elsewhere
 PYTHON := $(shell command -v python3 2>/dev/null || echo python)
 
-.PHONY: install dev test lint format check clean help web web-backend web-frontend web-kill sessions-delete reset
+.PHONY: install dev test lint format check lint-typecheck ci clean help web web-backend web-frontend web-kill sessions-delete reset
 
 # Default target
 help:
@@ -16,7 +16,9 @@ help:
 	@echo "  make lint         Run linter (ruff check)"
 	@echo "  make format       Format code (ruff format)"
 	@echo "  make check        Run lint + format check + tests"
-	@echo "  make clean        Remove build artifacts"
+	@echo "  make lint-typecheck  Run lint + format check + typecheck (backend + frontend, no tests)"
+	@echo "  make ci            Same as CI: lint + format check + tests + frontend lint + frontend build"
+	@echo "  make clean         Remove build artifacts"
 	@echo ""
 	@echo "Prscope Workflow Commands"
 	@echo ""
@@ -67,6 +69,17 @@ format:
 check: lint
 	ruff format --check .
 	pytest -q
+
+# Lint and typecheck only (no tests): backend ruff + frontend eslint + tsc
+lint-typecheck: lint
+	ruff format --check .
+	@cd prscope/web/frontend && npm run lint && npx tsc --noEmit
+
+# Full CI parity: what .github/workflows/ci.yml runs (lint, format check, tests, frontend lint + build)
+ci: lint
+	ruff format --check .
+	pytest -q
+	@cd prscope/web/frontend && npm run lint && npm run build
 
 # Clean build artifacts
 clean:

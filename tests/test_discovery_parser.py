@@ -188,4 +188,3 @@ D) Other — describe your preference
 
     assert result.complete is False
     assert len(result.questions) == 2
-

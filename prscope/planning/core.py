@@ -4,17 +4,17 @@ Pure planning core logic: state machine, versioning, and convergence checks.
 
 from __future__ import annotations
 
+import difflib
 import hashlib
+import json
 import re
 from dataclasses import dataclass
-import difflib
-from difflib import SequenceMatcher
 from datetime import datetime, timezone
-import json
+from difflib import SequenceMatcher
 from typing import Any
 
 from ..config import PlanningConfig
-from ..store import PlanVersion, PlanningSession, PlanningTurn, Store
+from ..store import PlanningSession, PlanningTurn, PlanVersion, Store
 
 
 @dataclass
@@ -154,8 +154,7 @@ class PlanningCore:
         allowed = self.VALID_COMMANDS.get(current.status, set())
         if command_type not in allowed:
             raise InvalidCommandError(
-                f"Command '{command_type}' is invalid for status '{current.status}'. "
-                f"Allowed: {sorted(allowed)}"
+                f"Command '{command_type}' is invalid for status '{current.status}'. Allowed: {sorted(allowed)}"
             )
 
     @staticmethod
@@ -215,13 +214,9 @@ class PlanningCore:
                 if allow_round_stability:
                     current_round = session.current_round
                 elif current_round is None or current_round <= session.current_round:
-                    raise InvalidTransitionError(
-                        "refining -> refining requires current_round > existing round"
-                    )
+                    raise InvalidTransitionError("refining -> refining requires current_round > existing round")
             elif current_round is not None and current_round != session.current_round:
-                raise InvalidTransitionError(
-                    "current_round can only change on refining -> refining transitions"
-                )
+                raise InvalidTransitionError("current_round can only change on refining -> refining transitions")
 
             next_pending_questions_json = session.pending_questions_json
             if pending_questions_json is not _UNSET:
@@ -230,9 +225,7 @@ class PlanningCore:
                 next_pending_questions_json = None
             if new_status == "discovering":
                 if next_pending_questions_json is not None and phase_message is not None:
-                    raise InvalidTransitionError(
-                        "discovery coherence violated: cannot show questions while processing"
-                    )
+                    raise InvalidTransitionError("discovery coherence violated: cannot show questions while processing")
                 if phase_message is not None:
                     next_pending_questions_json = None
 
@@ -378,9 +371,7 @@ class PlanningCore:
         if prev_s.todo_count > 0 and curr_s.todo_count < prev_s.todo_count * 0.8:
             regressions.append(f"TODOs dropped {prev_s.todo_count} -> {curr_s.todo_count}")
         if prev_s.file_path_count > 0 and curr_s.file_path_count < prev_s.file_path_count * 0.8:
-            regressions.append(
-                f"file references dropped {prev_s.file_path_count} -> {curr_s.file_path_count}"
-            )
+            regressions.append(f"file references dropped {prev_s.file_path_count} -> {curr_s.file_path_count}")
         if prev_s.has_goals and not curr_s.has_goals:
             regressions.append("Goals section removed")
         if prev_s.has_non_goals and not curr_s.has_non_goals:

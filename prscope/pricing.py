@@ -80,4 +80,3 @@ def estimate_cost_usd(model: str, prompt_tokens: int, completion_tokens: int) ->
     completion_cost = (max(completion_tokens, 0) / 1_000_000.0) * output_per_million
     total = prompt_cost + completion_cost
     return CostEstimate(prompt_cost_usd=prompt_cost, completion_cost_usd=completion_cost, total_cost_usd=total)
-

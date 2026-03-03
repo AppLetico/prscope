@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 from prscope.model_catalog import CATALOG
-from prscope.pricing import MODEL_PRICING, estimate_cost_usd
-from prscope.pricing import MODEL_CONTEXT_WINDOWS
-
+from prscope.pricing import MODEL_CONTEXT_WINDOWS, MODEL_PRICING, estimate_cost_usd
 
 # Keep this list intentionally small. If a model lacks a known context window,
 # add it here with a clear decision rather than silently drifting.
@@ -42,7 +40,6 @@ def test_catalog_models_have_context_window_metadata_or_are_explicitly_allowlist
     missing = sorted(
         model_id
         for model_id in catalog_model_ids
-        if model_id not in models_with_context_windows
-        and model_id not in ALLOWED_UNKNOWN_CONTEXT_WINDOWS
+        if model_id not in models_with_context_windows and model_id not in ALLOWED_UNKNOWN_CONTEXT_WINDOWS
     )
     assert missing == []

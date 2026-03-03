@@ -23,6 +23,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from .config import LLMConfig
+
 logger = logging.getLogger(__name__)
 
 # Suppress LiteLLM's verbose logging
@@ -32,6 +34,7 @@ logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 @dataclass
 class RelevanceDecision:
     """LLM's decision on whether to implement a PR."""
+
     decision: str  # "implement", "skip", "partial"
     confidence: float  # 0.0 - 1.0
     reasoning: str
@@ -42,9 +45,10 @@ class RelevanceDecision:
 @dataclass
 class LLMAnalysisResult:
     """Complete result from LLM analysis of a PR."""
+
     # Relevance decision
     relevance: RelevanceDecision
-    
+
     # Implementation details (only if decision == "implement")
     impacted_features: list[str] = field(default_factory=list)
     why_this_matters: str = ""
@@ -52,10 +56,10 @@ class LLMAnalysisResult:
     estimated_effort: str = ""  # "small", "medium", "large"
     tests: list[str] = field(default_factory=list)
     risks: list[str] = field(default_factory=list)
-    
+
     # Raw response for debugging
     raw_response: dict[str, Any] | None = None
-    
+
     def to_dict(self) -> dict[str, Any]:
         """Convert to dictionary for storage."""
         return {
@@ -73,7 +77,7 @@ class LLMAnalysisResult:
             "tests": self.tests,
             "risks": self.risks,
         }
-    
+
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> LLMAnalysisResult:
         """Create from dictionary."""
@@ -93,7 +97,7 @@ class LLMAnalysisResult:
             tests=data.get("tests", []),
             risks=data.get("risks", []),
         )
-    
+
     @classmethod
     def skip(cls, reason: str = "LLM analysis unavailable") -> LLMAnalysisResult:
         """Create a skip result."""
@@ -144,7 +148,7 @@ Before recommending "implement", ask: Does the LOCAL codebase even have this fea
 ### Third-Party Integrations
 If the PR mentions ANY of these, check if the local codebase actually uses them:
 - **Messaging**: Telegram, Slack, Discord, WhatsApp, Teams, Signal
-- **Email**: Gmail, Outlook, SendGrid, Mailgun  
+- **Email**: Gmail, Outlook, SendGrid, Mailgun
 - **Cloud**: AWS, GCP, Azure (specific services)
 - **Databases**: specific DB fixes (MongoDB, PostgreSQL, Redis)
 - **APIs**: specific third-party API integrations
@@ -166,7 +170,7 @@ For security fixes, first ask: Does the LOCAL codebase have the vulnerable featu
 Then check if similar protection already exists in local code.
 
 ### General Rule
-If the PR title mentions a specific technology/integration/feature that you don't 
+If the PR title mentions a specific technology/integration/feature that you don't
 see evidence of in the local codebase (README, code snippets, dependencies) → SKIP
 
 Respond ONLY with valid JSON in this exact format:
@@ -210,40 +214,42 @@ def build_analysis_prompt(
     files_summary = []
     for f in pr_files[:20]:
         files_summary.append(f"- {f.get('path', '')} (+{f.get('additions', 0)}/-{f.get('deletions', 0)})")
-    
+
     # Local profile summary
     profile_summary = {
         "total_files": local_profile.get("file_tree", {}).get("total_files", 0),
-        "top_extensions": dict(sorted(
-            local_profile.get("file_tree", {}).get("extensions", {}).items(),
-            key=lambda x: -x[1]
-        )[:5]),
+        "top_extensions": dict(
+            sorted(
+                local_profile.get("file_tree", {}).get("extensions", {}).items(),
+                key=lambda x: -x[1],
+            )[:5]
+        ),
         "dependencies": list(local_profile.get("dependencies", {}).keys()),
     }
-    
+
     # Build project context section
     # Use README from profile if no explicit description provided
     readme_content = local_profile.get("readme", "") if local_profile else ""
     effective_description = project_description or readme_content
-    
+
     project_section = ""
     if project_name or effective_description:
         # Truncate README for prompt efficiency
         if len(effective_description) > 3000:
             effective_description = effective_description[:3000] + "\n... (see full README)"
-        
+
         project_section = f"""
 ## Local Project Context
 
-**Project:** {project_name or 'Unknown'}
+**Project:** {project_name or "Unknown"}
 
 **Description:**
-{effective_description or '(No description provided)'}
+{effective_description or "(No description provided)"}
 
 ---
 
 """
-    
+
     prompt = f"""\
 {project_section}## Pull Request
 
@@ -264,45 +270,47 @@ def build_analysis_prompt(
 
 ## Pre-matched Features (by keyword/path rules)
 
-{', '.join(matched_features) if matched_features else 'None matched'}
+{", ".join(matched_features) if matched_features else "None matched"}
 """
 
     # Add local code context if available
     if local_code_context:
         prompt += "\n## Relevant Local Code (for comparison)\n\n"
-        prompt += "**IMPORTANT: Carefully review this code for existing implementations of the same functionality.**\n\n"
+        prompt += (
+            "**IMPORTANT: Carefully review this code for existing implementations of the same functionality.**\n\n"
+        )
         for ctx in local_code_context[:5]:  # Limit to 5 files
-            content = ctx.get('content', '')
+            content = ctx.get("content", "")
             # Show more content for security-related files
-            max_chars = 3500 if 'security' in ctx.get('path', '').lower() else 2000
+            max_chars = 3500 if "security" in ctx.get("path", "").lower() else 2000
             prompt += f"### {ctx.get('path', 'unknown')}\n```\n{content[:max_chars]}\n```\n\n"
-    
+
     # Add similarity results if available
     if similarity_results:
         prompt += "\n## Semantic Similarity Analysis\n\n"
         prompt += "The following local files were found to be semantically similar to this PR:\n\n"
         for sim in similarity_results[:5]:
             prompt += f"- **{sim.get('local_path')}** (similarity: {sim.get('similarity_score', 0):.2f}, type: {sim.get('overlap_type', 'unknown')})\n"
-            if sim.get('local_snippet'):
+            if sim.get("local_snippet"):
                 prompt += f"  ```\n  {sim.get('local_snippet', '')[:300]}...\n  ```\n"
         prompt += "\n**IMPORTANT**: If similarity is high (>0.8), carefully check if this is already implemented.\n"
-    
+
     # Add integration check warning if applicable
     if integration_check and integration_check.get("missing_from_local"):
         missing = integration_check["missing_from_local"]
         prompt += f"""
 ## ⚠️ INTEGRATION WARNING
 
-This PR mentions: **{', '.join(integration_check.get('mentioned_in_pr', []))}**
+This PR mentions: **{", ".join(integration_check.get("mentioned_in_pr", []))}**
 
-**NOT FOUND in local codebase:** {', '.join(missing)}
+**NOT FOUND in local codebase:** {", ".join(missing)}
 
-The local codebase does not appear to use {', '.join(missing)}. 
-If the PR is specifically about {', '.join(missing)} integration/features, 
+The local codebase does not appear to use {", ".join(missing)}.
+If the PR is specifically about {", ".join(missing)} integration/features,
 you should likely **SKIP** this PR as the integration doesn't exist locally.
 
 """
-    
+
     prompt += """
 ## Your Task
 
@@ -314,13 +322,13 @@ Analyze this PR and determine:
 Be conservative - only recommend "implement" for genuinely valuable, non-duplicate changes.
 If the PR is about a specific integration (Slack, Telegram, etc.) that doesn't exist locally, SKIP it.
 """
-    
+
     return prompt
 
 
 class LLMClient:
     """LiteLLM-based client for intelligent PR analysis."""
-    
+
     def __init__(
         self,
         model: str = "gpt-4o",
@@ -331,28 +339,27 @@ class LLMClient:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self._litellm = None
-    
+
     def _get_litellm(self):
         """Lazy import LiteLLM."""
         if self._litellm is None:
             try:
                 import litellm
+
                 self._litellm = litellm
             except ImportError:
-                raise ImportError(
-                    "LiteLLM is required for LLM features. "
-                    "Install with: pip install litellm"
-                )
+                raise ImportError("LiteLLM is required for LLM features. Install with: pip install litellm")
         return self._litellm
-    
+
     @property
     def enabled(self) -> bool:
         """Check if LLM is available (has required API key)."""
         try:
             self._get_litellm()
             model_lower = self.model.lower()
-            
+
             import os
+
             if model_lower.startswith(("gpt-", "o1", "o3")):
                 return bool(os.environ.get("OPENAI_API_KEY"))
             elif model_lower.startswith(("claude-",)):
@@ -365,7 +372,7 @@ class LLMClient:
                 return True
         except Exception:
             return False
-    
+
     def analyze_pr(
         self,
         pr_title: str,
@@ -381,7 +388,7 @@ class LLMClient:
     ) -> LLMAnalysisResult:
         """
         Analyze a PR with full context for intelligent decision-making.
-        
+
         Args:
             pr_title: PR title
             pr_body: PR body/description
@@ -390,15 +397,15 @@ class LLMClient:
             matched_features: Features matched by rules
             local_code_context: Relevant local code snippets
             similarity_results: Semantic similarity matches
-        
+
         Returns:
             LLMAnalysisResult with decision and implementation details
         """
         if not self.enabled:
             return LLMAnalysisResult.skip("LLM not enabled or API key missing")
-        
+
         litellm = self._get_litellm()
-        
+
         user_prompt = build_analysis_prompt(
             pr_title=pr_title,
             pr_body=pr_body,
@@ -411,7 +418,7 @@ class LLMClient:
             project_description=project_description,
             integration_check=integration_check,
         )
-        
+
         try:
             response = litellm.completion(
                 model=self.model,
@@ -422,17 +429,17 @@ class LLMClient:
                 temperature=self.temperature,
                 max_tokens=self.max_tokens,
             )
-            
+
             content = response.choices[0].message.content
-            
+
             # Parse JSON response
             if "```json" in content:
                 content = content.split("```json")[1].split("```")[0]
             elif "```" in content:
                 content = content.split("```")[1].split("```")[0]
-            
+
             data = json.loads(content.strip())
-            
+
             # Parse relevance decision
             rel_data = data.get("relevance", {})
             relevance = RelevanceDecision(
@@ -442,7 +449,7 @@ class LLMClient:
                 already_implemented=rel_data.get("already_implemented", False),
                 implementation_overlap=rel_data.get("implementation_overlap", "none"),
             )
-            
+
             return LLMAnalysisResult(
                 relevance=relevance,
                 impacted_features=data.get("impacted_features", matched_features),
@@ -453,7 +460,7 @@ class LLMClient:
                 risks=data.get("risks", []),
                 raw_response=data,
             )
-            
+
         except json.JSONDecodeError as e:
             logger.warning(f"Failed to parse LLM response: {e}")
             return LLMAnalysisResult.skip(f"Failed to parse LLM response: {e}")
@@ -464,20 +471,20 @@ class LLMClient:
 
 class NoOpLLM:
     """No-op LLM for when LLM is disabled."""
-    
+
     @property
     def enabled(self) -> bool:
         return False
-    
+
     def analyze_pr(self, *args, **kwargs) -> LLMAnalysisResult:
         return LLMAnalysisResult.skip("LLM is disabled")
 
 
-def get_llm_client(config: "LLMConfig" = None) -> LLMClient | NoOpLLM:  # type: ignore
+def get_llm_client(config: LLMConfig | None = None) -> LLMClient | NoOpLLM:
     """Get the configured LLM client."""
     if config is None or not config.enabled:
         return NoOpLLM()
-    
+
     return LLMClient(
         model=config.model,
         temperature=config.temperature,

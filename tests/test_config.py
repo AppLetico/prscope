@@ -56,11 +56,11 @@ llm:
     config = PrscopeConfig.load(tmp_path)
 
     assert config.local_repo == "./local"
-    
+
     # Mock get_repo_root to return tmp_path for relative path resolution
     with patch("prscope.config.get_repo_root", return_value=tmp_path):
         assert config.get_local_repo_path() == (tmp_path / "local").resolve()
-    
+
     assert config.sync.state == "open"
     assert config.sync.max_prs == 5
     assert config.sync.fetch_files is False

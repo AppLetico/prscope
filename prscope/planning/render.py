@@ -11,7 +11,7 @@ from typing import Any
 from jinja2 import Environment, FileSystemLoader
 
 from ..config import RepoProfile
-from ..store import PlanVersion, PlanningSession
+from ..store import PlanningSession, PlanVersion
 
 
 def _template_env() -> Environment:

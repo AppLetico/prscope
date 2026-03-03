@@ -16,9 +16,9 @@ from typing import Any, Optional
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from loguru import logger
 from pydantic import BaseModel, Field
 from sse_starlette.sse import EventSourceResponse
-from loguru import logger
 
 from ..config import PrscopeConfig, get_repo_root
 from ..model_catalog import get_model, list_models
@@ -126,16 +126,12 @@ class RuntimeRegistry:
             if "author call timeout on" in message:
                 timing["author_call_timeouts"] = int(timing.get("author_call_timeouts", 0)) + 1
             if "trying fallback model" in message or "author fallback used" in message:
-                timing["author_fallback_warnings"] = int(
-                    timing.get("author_fallback_warnings", 0)
-                ) + 1
+                timing["author_fallback_warnings"] = int(timing.get("author_fallback_warnings", 0)) + 1
             return
         if etype == "token_usage":
             timing["llm_calls_total"] = int(timing.get("llm_calls_total", 0)) + 1
             latency = float(event.get("llm_call_latency_ms", 0.0) or 0.0)
-            timing["llm_call_latency_ms_total"] = float(
-                timing.get("llm_call_latency_ms_total", 0.0)
-            ) + latency
+            timing["llm_call_latency_ms_total"] = float(timing.get("llm_call_latency_ms_total", 0.0)) + latency
             timing["llm_call_latency_ms_max"] = max(
                 float(timing.get("llm_call_latency_ms_max", 0.0)),
                 latency,
@@ -144,9 +140,7 @@ class RuntimeRegistry:
         if etype == "tool_result":
             timing["tool_calls_total"] = int(timing.get("tool_calls_total", 0)) + 1
             latency = float(event.get("duration_ms", 0.0) or 0.0)
-            timing["tool_exec_latency_ms_total"] = float(
-                timing.get("tool_exec_latency_ms_total", 0.0)
-            ) + latency
+            timing["tool_exec_latency_ms_total"] = float(timing.get("tool_exec_latency_ms_total", 0.0)) + latency
             timing["tool_exec_latency_ms_max"] = max(
                 float(timing.get("tool_exec_latency_ms_max", 0.0)),
                 latency,
@@ -283,10 +277,7 @@ def create_app() -> FastAPI:
         if model is None:
             raise HTTPException(
                 status_code=400,
-                detail=(
-                    f"Invalid {role} model '{model_id}'. "
-                    "Pick a model from /api/models."
-                ),
+                detail=(f"Invalid {role} model '{model_id}'. Pick a model from /api/models."),
             )
         if not bool(model.get("available")):
             reason = str(model.get("unavailable_reason") or "provider key unavailable")
@@ -374,7 +365,7 @@ def create_app() -> FastAPI:
                     "path": str(repo.resolved_path),
                 }
                 for repo in repos
-            ]
+            ],
         }
 
     @app.get("/api/sessions")
@@ -469,9 +460,7 @@ def create_app() -> FastAPI:
                         )
                         raise
 
-                task = asyncio.create_task(
-                    _run_initial_draft_task()
-                )
+                task = asyncio.create_task(_run_initial_draft_task())
                 task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
                 logger.info(
                     "api.sessions created mode=requirements session_id={} runtime_s={:.3f} create_s={:.3f} total_s={:.3f}",
@@ -506,6 +495,7 @@ def create_app() -> FastAPI:
                 critic_model=critic_model,
                 rebuild_memory=payload.rebuild_memory,
             )
+
             # Chat session starts as "preparing"; memory build runs in background, progress via SSE
             async def emit_setup_event(event: dict[str, Any]) -> None:
                 registry.note_event(session.id, event)
@@ -762,8 +752,16 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {
             "files": [
-                {"name": "prd.md", "kind": "prd", "url": f"/api/sessions/{session_id}/download/prd"},
-                {"name": "rfc.md", "kind": "rfc", "url": f"/api/sessions/{session_id}/download/rfc"},
+                {
+                    "name": "prd.md",
+                    "kind": "prd",
+                    "url": f"/api/sessions/{session_id}/download/prd",
+                },
+                {
+                    "name": "rfc.md",
+                    "kind": "rfc",
+                    "url": f"/api/sessions/{session_id}/download/rfc",
+                },
                 {
                     "name": "conversation.md",
                     "kind": "conversation",
@@ -843,4 +841,3 @@ def create_app() -> FastAPI:
         return EventSourceResponse(event_generator())
 
     return app
-

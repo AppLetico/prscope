@@ -20,9 +20,9 @@ from .repomix import RepomixScanner
 logger = logging.getLogger(__name__)
 
 _REGISTRY: dict[str, type[ScannerBackend]] = {
-    "grep": GrepScanner,       # type: ignore[type-abstract]
-    "repomap": RepoMapScanner, # type: ignore[type-abstract]
-    "repomix": RepomixScanner, # type: ignore[type-abstract]
+    "grep": GrepScanner,  # type: ignore[type-abstract]
+    "repomap": RepoMapScanner,  # type: ignore[type-abstract]
+    "repomix": RepomixScanner,  # type: ignore[type-abstract]
 }
 
 
@@ -60,11 +60,13 @@ def list_scanners() -> list[dict[str, object]]:
     result = []
     for name, cls in _REGISTRY.items():
         instance = cls()
-        result.append({
-            "name": name,
-            "available": instance.is_available(),
-            "class": cls.__name__,
-        })
+        result.append(
+            {
+                "name": name,
+                "available": instance.is_available(),
+                "class": cls.__name__,
+            }
+        )
     return result
 
 
