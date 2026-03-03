@@ -1,13 +1,23 @@
 # Prscope
 
+<p align="center">
+  <img src="prscope-banner.svg" alt="Prscope" width="800" />
+</p>
 
+<p align="center">
+  <b>PLAN. REFINE. SHIP.</b>
+  <br />
+  <i>A planning engine that turns requirements (or upstream PR context) into grounded PRD/RFC outputs for real codebases.</i>
+</p>
 
-**PLAN. REFINE. SHIP.**  
-*A planning engine that turns requirements (or upstream PR context) into grounded PRD/RFC outputs for real codebases.*
+<p align="center">
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License"></a>
+  <img src="https://img.shields.io/badge/version-0.1.0-blue.svg" alt="Version">
+  <img src="https://img.shields.io/badge/python-3.9+-blue.svg" alt="Python">
+  <img src="https://img.shields.io/badge/status-Alpha-yellow.svg" alt="Status">
+</p>
 
-
-
-h
+---
 
 ## Contributing
 
