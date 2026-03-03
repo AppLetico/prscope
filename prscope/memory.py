@@ -58,6 +58,49 @@ class ParsedConstraint:
     extends: str | None = None
 
 
+def load_skills(skills_dir: Path, max_chars: int) -> str:
+    """Load repo-local skill files with deterministic, boundary-safe truncation."""
+    if not skills_dir.exists():
+        logger.info("[skills] Loaded 0 skills (dir not found)")
+        return ""
+
+    files = sorted(skills_dir.glob("*.md"))
+    if not files:
+        logger.info("[skills] Loaded 0 skills")
+        return ""
+
+    blocks: list[str] = []
+    total_chars = 0
+
+    for file in files:
+        content = file.read_text(encoding="utf-8").strip()
+        block = f"### {file.name}\n\n{content}\n"
+        if total_chars == 0 and len(block) > max_chars:
+            logger.warning(
+                "[skills] Skipped %s - exceeds skills_max_chars=%d",
+                file.name,
+                max_chars,
+            )
+            continue
+        if total_chars + len(block) > max_chars:
+            break
+        blocks.append(block)
+        total_chars += len(block)
+
+    trimmed = len(files) - len(blocks)
+    logger.info(
+        "[skills] Loaded %d skills (%d chars)%s",
+        len(blocks),
+        total_chars,
+        f" - trimmed {trimmed} of {len(files)} due to skills_max_chars={max_chars}" if trimmed else "",
+    )
+
+    result = "\n---\n".join(blocks)
+    if trimmed:
+        result += "\n\n... (truncated due to token budget)"
+    return result
+
+
 class MemoryStore:
     """Builds and loads structured memory blocks for planning."""
 

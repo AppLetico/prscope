@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from prscope.store import Store
 
@@ -87,3 +90,108 @@ def test_planning_session_turn_and_version_persistence(tmp_path):
     assert len(versions) == 1
     assert versions[0].round == 1
     assert store.get_latest_critic_turn(session.id) is not None
+
+
+def test_search_sessions_repo_scope_and_snippet(tmp_path):
+    pytest.importorskip("rank_bm25")
+    db_path = tmp_path / "prscope.db"
+    store = Store(db_path=db_path)
+
+    s1 = store.create_planning_session(
+        repo_name="alpha",
+        title="Auth Refactor",
+        requirements="Refactor authentication flow with token rotation and endpoint updates",
+        seed_type="requirements",
+    )
+    store.save_plan_version(
+        session_id=s1.id,
+        round_number=1,
+        plan_content="A" * 400,
+        plan_sha=hashlib.sha256(b"a").hexdigest(),
+    )
+
+    s2 = store.create_planning_session(
+        repo_name="beta",
+        title="Queue Upgrade",
+        requirements="Improve queue processing throughput and retries for worker runtime",
+        seed_type="requirements",
+    )
+    store.save_plan_version(
+        session_id=s2.id,
+        round_number=1,
+        plan_content="queue summary",
+        plan_sha=hashlib.sha256(b"b").hexdigest(),
+    )
+
+    results = store.search_sessions(
+        query="refactor authentication flow token rotation endpoint updates",
+        repo_name="alpha",
+        limit=5,
+    )
+    assert len(results) == 1
+    assert results[0]["session_id"] == s1.id
+    assert results[0]["repo_name"] == "alpha"
+    assert results[0]["summary_snippet"].endswith("...")
+
+
+def test_search_sessions_applies_recency_boost(tmp_path):
+    pytest.importorskip("rank_bm25")
+    db_path = tmp_path / "prscope.db"
+    store = Store(db_path=db_path)
+
+    older = store.create_planning_session(
+        repo_name="alpha",
+        title="Auth Work",
+        requirements="Refactor authentication flow token rotation endpoint updates now",
+        seed_type="requirements",
+    )
+    newer = store.create_planning_session(
+        repo_name="alpha",
+        title="Auth Work",
+        requirements="Refactor authentication flow token rotation endpoint updates now",
+        seed_type="requirements",
+    )
+    plan_sha = hashlib.sha256(b"plan").hexdigest()
+    store.save_plan_version(older.id, 1, "same content", plan_sha)
+    store.save_plan_version(newer.id, 1, "same content", plan_sha)
+
+    with store._connect() as conn:  # noqa: SLF001 - test-only deterministic fixture
+        old_date = (datetime.now(timezone.utc) - timedelta(days=120)).isoformat()
+        new_date = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
+        conn.execute("UPDATE planning_sessions SET created_at = ? WHERE id = ?", (old_date, older.id))
+        conn.execute("UPDATE planning_sessions SET created_at = ? WHERE id = ?", (new_date, newer.id))
+
+    results = store.search_sessions(
+        query="refactor authentication flow token rotation endpoint updates",
+        repo_name="alpha",
+        limit=5,
+    )
+    assert len(results) >= 2
+    assert results[0]["session_id"] == newer.id
+
+
+def test_search_sessions_skips_low_signal_query(tmp_path):
+    db_path = tmp_path / "prscope.db"
+    store = Store(db_path=db_path)
+    store.create_planning_session(
+        repo_name="alpha",
+        title="Any",
+        requirements="Some requirements that exist",
+        seed_type="requirements",
+    )
+    assert store.search_sessions(query="too short query", repo_name="alpha", limit=5) == []
+
+
+def test_create_planning_session_persists_no_recall(tmp_path):
+    db_path = tmp_path / "prscope.db"
+    store = Store(db_path=db_path)
+    session = store.create_planning_session(
+        repo_name="alpha",
+        title="No recall plan",
+        requirements="Build an alternative architecture with no historical context",
+        seed_type="requirements",
+        no_recall=True,
+    )
+    loaded = store.get_planning_session(session.id)
+    assert loaded is not None
+    assert loaded.no_recall == 1

@@ -17,7 +17,7 @@ import os
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Generator
 from uuid import uuid4
@@ -26,7 +26,7 @@ from .config import get_prscope_dir
 
 
 DB_FILENAME = "prscope.db"
-CURRENT_SCHEMA_VERSION = 8
+CURRENT_SCHEMA_VERSION = 9
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -118,6 +118,7 @@ CREATE TABLE IF NOT EXISTS planning_sessions (
     seed_type TEXT NOT NULL,
     seed_ref TEXT,
     current_round INTEGER NOT NULL DEFAULT 0,
+    no_recall INTEGER NOT NULL DEFAULT 0,
     session_total_cost_usd REAL,
     max_prompt_tokens INTEGER,
     confidence_trend REAL,
@@ -315,6 +316,7 @@ class PlanningSession:
     seed_type: str
     seed_ref: str | None
     current_round: int
+    no_recall: int
     created_at: str
     updated_at: str
     session_total_cost_usd: float | None = None
@@ -558,6 +560,14 @@ class Store:
                 if not self._column_exists(conn, table, column):
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
             current = 8
+
+        # v8 -> v9: persist per-session no_recall mode
+        if current < 9:
+            if not self._column_exists(conn, "planning_sessions", "no_recall"):
+                conn.execute(
+                    "ALTER TABLE planning_sessions ADD COLUMN no_recall INTEGER NOT NULL DEFAULT 0"
+                )
+            current = 9
 
         self._set_schema_version(conn, current)
     
@@ -955,6 +965,7 @@ class Store:
         author_model: str | None = None,
         critic_model: str | None = None,
         seed_ref: str | None = None,
+        no_recall: bool = False,
         status: str = "drafting",
         session_id: str | None = None,
     ) -> PlanningSession:
@@ -967,9 +978,9 @@ class Store:
                 INSERT INTO planning_sessions
                     (id, repo_name, title, requirements, author_model, critic_model, status, seed_type, seed_ref,
                      current_round, session_total_cost_usd, max_prompt_tokens, confidence_trend,
-                     converged_early,
+                     converged_early, no_recall,
                      clarifications_log_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     sid,
@@ -986,6 +997,7 @@ class Store:
                     0,
                     0.0,
                     0,
+                    int(bool(no_recall)),
                     "[]",
                     now,
                     now,
@@ -1066,6 +1078,116 @@ class Store:
         with self._connect() as conn:
             rows = conn.execute(query, params).fetchall()
             return [PlanningSession(**dict(row)) for row in rows]
+
+    def search_sessions(
+        self,
+        query: str,
+        repo_name: str | None = None,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        """Search historical planning sessions with BM25 + recency boost."""
+        if len(query.split()) < 6:
+            return []
+        if limit <= 0:
+            return []
+
+        try:
+            from rank_bm25 import BM25Okapi
+        except ImportError:
+            return []
+
+        sql = """
+            SELECT
+                ps.id AS session_id,
+                ps.repo_name AS repo_name,
+                ps.title AS title,
+                ps.requirements AS requirements,
+                ps.created_at AS created_at,
+                COALESCE(pv.plan_content, '') AS plan_summary
+            FROM planning_sessions ps
+            LEFT JOIN plan_versions pv
+                ON pv.id = (
+                    SELECT pv2.id
+                    FROM plan_versions pv2
+                    WHERE pv2.session_id = ps.id
+                    ORDER BY pv2.round DESC, pv2.id DESC
+                    LIMIT 1
+                )
+            WHERE (? IS NULL OR ps.repo_name = ?)
+            ORDER BY ps.created_at ASC
+        """
+
+        with self._connect() as conn:
+            rows = conn.execute(sql, (repo_name, repo_name)).fetchall()
+        if not rows:
+            return []
+
+        def _parse_created(value: str) -> datetime:
+            raw = (value or "").strip()
+            if not raw:
+                return datetime.utcnow()
+            try:
+                parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            except ValueError:
+                return datetime.utcnow()
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+            return parsed
+
+        corpus_tokens: list[list[str]] = []
+        row_payloads: list[dict[str, Any]] = []
+        for row in rows:
+            payload = dict(row)
+            title = str(payload.get("title") or "")
+            requirements = str(payload.get("requirements") or "")
+            plan_summary = str(payload.get("plan_summary") or "")
+            document = f"{title} {requirements} {plan_summary}".strip().lower()
+            tokens = document.split()
+            corpus_tokens.append(tokens if tokens else [""])
+            payload["created_dt"] = _parse_created(str(payload.get("created_at") or ""))
+            row_payloads.append(payload)
+
+        query_tokens = query.lower().split()
+        if not query_tokens:
+            return []
+
+        bm25 = BM25Okapi(corpus_tokens)
+        scores = bm25.get_scores(query_tokens)
+        now = datetime.utcnow()
+
+        ranked: list[dict[str, Any]] = []
+        for payload, bm25_score in zip(row_payloads, scores):
+            created_dt: datetime = payload["created_dt"]
+            days_old = (now - created_dt).days
+            if days_old < 30:
+                multiplier = 1.2
+            elif days_old < 90:
+                multiplier = 1.1
+            else:
+                multiplier = 1.0
+            base_score = max(float(bm25_score), 0.0)
+            final_score = base_score * multiplier
+            summary_raw = str(payload.get("plan_summary") or "")
+            snippet = summary_raw.replace("\n", " ")[:300]
+            if len(summary_raw) > 300:
+                snippet += "..."
+            ranked.append(
+                {
+                    "session_id": str(payload.get("session_id") or ""),
+                    "title": str(payload.get("title") or ""),
+                    "repo_name": str(payload.get("repo_name") or ""),
+                    "created_at": str(payload.get("created_at") or ""),
+                    "score": final_score,
+                    "summary_snippet": snippet,
+                    "plan_summary": summary_raw,
+                    "_created_dt": created_dt,
+                }
+            )
+
+        ranked.sort(key=lambda item: (float(item["score"]), item["_created_dt"]), reverse=True)
+        for item in ranked:
+            item.pop("_created_dt", None)
+        return ranked[:limit]
 
     def update_planning_session(
         self,

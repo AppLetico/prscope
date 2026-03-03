@@ -516,6 +516,7 @@ class DiscoveryManager:
         conversation: list[dict[str, Any]],
         session_id: str = "default",
         model_override: str | None = None,
+        extra_context: str = "",
     ) -> DiscoveryTurnResult:
         turn_count = self._next_turn_count(session_id)
 
@@ -542,6 +543,8 @@ class DiscoveryManager:
         system_content = DISCOVERY_SYSTEM_PROMPT
         if memory_context:
             system_content += f"\n\n## Pre-built Codebase Memory\n{memory_context}"
+        if extra_context:
+            system_content += f"\n\n{extra_context}"
 
         messages = [{"role": "system", "content": system_content}, *conversation]
         await self._emit({"type": "thinking", "message": "Refining questions from available context..."})

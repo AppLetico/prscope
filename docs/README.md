@@ -6,6 +6,7 @@ Technical documentation for runtime behavior, operations, and troubleshooting.
 
 - [Agent Harness Guide](./agent-harness.md)
 - [Memory, Context, and Manifesto](./memory-context-manifesto.md)
+- [Skills and Session Recall](./skills-and-recall.md)
 
 ## Notes
 

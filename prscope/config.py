@@ -84,6 +84,10 @@ class PlanningConfig:
     validate_audit_log: bool = True
     # Codebase scanner backend: "grep" (default, no deps) | "repomap" (aider tree-sitter) | "repomix" (repomix CLI)
     scanner: str = "grep"
+    skills_max_chars: int = 3000
+    recall_prior_sessions: bool = False
+    recall_top_k: int = 2
+    recall_max_chars: int = 1500
     memory_block_max_chars: dict[str, int] = field(
         default_factory=lambda: {
             "architecture": 3000,
@@ -132,6 +136,10 @@ class RepoProfile:
         if self.manifesto_file:
             return Path(self.manifesto_file).expanduser().resolve()
         return self.resolved_path / ".prscope" / "manifesto.md"
+
+    @property
+    def skills_dir(self) -> Path:
+        return self.resolved_path / ".prscope" / "skills"
 
     @property
     def memory_dir(self) -> Path:
@@ -318,6 +326,10 @@ class PrscopeConfig:
             discovery_tool_rounds=planning_data.get("discovery_tool_rounds", 25),
             author_tool_rounds=planning_data.get("author_tool_rounds", 25),
             scanner=planning_data.get("scanner", "grep"),
+            skills_max_chars=int(planning_data.get("skills_max_chars", 3000)),
+            recall_prior_sessions=bool(planning_data.get("recall_prior_sessions", False)),
+            recall_top_k=max(1, int(planning_data.get("recall_top_k", 2))),
+            recall_max_chars=max(0, int(planning_data.get("recall_max_chars", 1500))),
             memory_block_max_chars=memory_caps,
             clarification_timeout_seconds=int(
                 planning_data.get("clarification_timeout_seconds", 600)

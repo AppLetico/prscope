@@ -33,6 +33,7 @@ See `CONTRIBUTING.md` for development workflow, performance benchmark requiremen
 - [Three Ways to Start a Plan](#three-ways-to-start-a-plan)
 - [Web UI Workflow](#web-ui-workflow)
 - [Planning Features](#planning-features)
+- [Memory Stack: Skills + Recall](#memory-stack-skills--recall)
 - [Full Configuration Reference](#full-configuration-reference)
 - [Manifesto Constraints](#manifesto-constraints)
 - [CLI Reference](#cli-reference)
@@ -211,6 +212,8 @@ For background operation, run `prscope web --background`.
 | ------------------------------ | ----------------------------------------------------------------------------------------------- |
 | **Structured codebase memory** | Auto-generates `architecture.md`, `modules.md`, `patterns.md`, `entrypoints.md` per repo        |
 | **Manifesto constraints**      | Hard/soft constraints in `.prscope/manifesto.md` enforced by the Critic                         |
+| **Skills memory**              | Always-on team patterns loaded from `.prscope/skills/*.md` with deterministic ordering          |
+| **Session recall**             | `prscope recall` searches prior sessions; optional auto-injection during planning                |
 | **Convergence detection**      | Multi-signal: hash equality, diff ratio, structural regression, critic `major_issues_remaining` |
 | **Tool-use enforcement**       | Author must verify file paths in the repo before finalizing; accessed paths tracked             |
 | **Diff view**                  | See exactly what the Critic forced to change each round                                         |
@@ -218,6 +221,49 @@ For background operation, run `prscope web --background`.
 | **Drift detection**            | `prscope plan status` compares planned vs merged files post-implementation                      |
 | **Multi-repo support**         | Named repo profiles each with isolated memory, manifesto, and output dir                        |
 
+
+---
+
+## Memory Stack: Skills + Recall
+
+Prscope uses a layered memory architecture for durable planning quality:
+
+1. **Manifesto** (philosophy + hard constraints)
+2. **Skills** (persistent team planning defaults)
+3. **Recall** (episodic memory from past planning sessions)
+4. **Memory blocks** (current codebase context)
+
+The runtime injects these in the fixed order above so historical precedent cannot override policy constraints.
+
+### Skills
+
+Add markdown files under `.prscope/skills/`:
+
+```bash
+mkdir -p .prscope/skills
+$EDITOR .prscope/skills/api-guidelines.md
+```
+
+Skills are loaded deterministically and truncated at file boundaries to fit budget.
+
+### Recall
+
+Search prior sessions:
+
+```bash
+prscope recall "auth token rotation endpoint compatibility"
+prscope recall "auth token rotation endpoint compatibility" --all-repos
+prscope recall "auth token rotation endpoint compatibility" --full
+```
+
+Start clean-slate sessions without recall anchoring:
+
+```bash
+prscope plan start --no-recall "Design a new auth subsystem"
+prscope plan chat --no-recall
+```
+
+For runtime details, see [`docs/skills-and-recall.md`](docs/skills-and-recall.md).
 
 ---
 
@@ -262,6 +308,10 @@ llm:
 planning:
   author_model: gpt-4o                        # any LiteLLM string
   critic_model: claude-3-5-sonnet-20241022    # any LiteLLM string
+  skills_max_chars: 3000                      # budget for .prscope/skills injection
+  recall_prior_sessions: false                # enable session recall injection
+  recall_top_k: 2                             # max recalled sessions considered
+  recall_max_chars: 1500                      # budget for injected recall context
   max_adversarial_rounds: 10
   convergence_threshold: 0.05
   output_dir: ./plans
@@ -306,7 +356,9 @@ prscope analytics [--repo <name>]         Show planning analytics and quality tr
 
 ```
 prscope plan chat                                  Start chat-first discovery
+prscope plan chat --no-recall                      Start discovery without prior-session recall
 prscope plan start "requirements"                  Start from text requirements
+prscope plan start --no-recall "requirements"      Start requirements mode without recall
 prscope plan start --from-pr owner/repo 42         Seed from upstream PR
 prscope plan resume <session-id>                   Resume in browser UI
 prscope plan list [--repo <name>]                  List sessions
@@ -328,6 +380,15 @@ prscope upstream history [--decision ...]           View evaluation history
 ```
 
 > Legacy top-level commands (`prscope sync`, `prscope evaluate`, etc.) still work but will print a deprecation notice pointing to `prscope upstream ...`.
+
+### Recall (episodic planning memory)
+
+```
+prscope recall "query terms with enough signal"         Search current repo by default
+prscope recall "query terms with enough signal" --repo my-repo
+prscope recall "query terms with enough signal" --all-repos
+prscope recall "query terms with enough signal" --full
+```
 
 ---
 

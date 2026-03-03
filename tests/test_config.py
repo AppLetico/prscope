@@ -116,3 +116,29 @@ repos:
     resolved = config.resolve_repo(None, cwd=(tmp_path / "repo-c" / "nested"))
     assert resolved.name == "gamma"
     assert resolved.resolved_path == (tmp_path / "repo-c").resolve()
+
+
+def test_config_loads_skills_and_recall_settings(tmp_path):
+    (tmp_path / "repo-d").mkdir()
+    config_path = tmp_path / "prscope.yml"
+    config_path.write_text(
+        """
+repos:
+  delta:
+    path: ./repo-d
+planning:
+  skills_max_chars: 4200
+  recall_prior_sessions: true
+  recall_top_k: 3
+  recall_max_chars: 1800
+        """.strip()
+    )
+
+    config = PrscopeConfig.load(tmp_path)
+    repo = config.get_repo("delta")
+
+    assert repo.skills_dir == (tmp_path / "repo-d" / ".prscope" / "skills").resolve()
+    assert config.planning.skills_max_chars == 4200
+    assert config.planning.recall_prior_sessions is True
+    assert config.planning.recall_top_k == 3
+    assert config.planning.recall_max_chars == 1800

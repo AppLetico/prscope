@@ -862,12 +862,14 @@ def plan_group() -> None:
 @click.argument("requirements", required=False)
 @click.option("--repo", "repo_name", help="Repo profile name")
 @click.option("--from-pr", "from_pr", nargs=2, type=str, help="Seed from upstream repo + PR number")
+@click.option("--no-recall", is_flag=True, help="Disable prior-session recall for this start")
 @click.option("--no-open", is_flag=True, help="Do not open browser after creating session")
 @click.option("--rebuild-memory", is_flag=True, help="Force memory rebuild")
 def plan_start(
     requirements: str | None,
     repo_name: str | None,
     from_pr: tuple[str, str] | None,
+    no_recall: bool,
     no_open: bool,
     rebuild_memory: bool,
 ) -> None:
@@ -880,6 +882,7 @@ def plan_start(
             runtime.start_from_pr(
                 upstream_repo=upstream_repo,
                 pr_number=int(pr_num_raw),
+                no_recall=no_recall,
                 rebuild_memory=rebuild_memory,
             )
         )
@@ -887,11 +890,17 @@ def plan_start(
         session = asyncio.run(
             runtime.start_from_requirements(
                 requirements=requirements,
+                no_recall=no_recall,
                 rebuild_memory=rebuild_memory,
             )
         )
     else:
-        session, opening = asyncio.run(runtime.start_from_chat(rebuild_memory=rebuild_memory))
+        session, opening = asyncio.run(
+            runtime.start_from_chat(
+                no_recall=no_recall,
+                rebuild_memory=rebuild_memory,
+            )
+        )
         click.echo(opening)
 
     click.echo(f"Created planning session: {session.id}")
@@ -901,16 +910,70 @@ def plan_start(
 
 @plan_group.command("chat")
 @click.option("--repo", "repo_name", help="Repo profile name")
+@click.option("--no-recall", is_flag=True, help="Disable prior-session recall for this chat session")
 @click.option("--no-open", is_flag=True, help="Do not open browser after creating session")
 @click.option("--rebuild-memory", is_flag=True, help="Force memory rebuild")
-def plan_chat(repo_name: str | None, no_open: bool, rebuild_memory: bool) -> None:
+def plan_chat(repo_name: str | None, no_recall: bool, no_open: bool, rebuild_memory: bool) -> None:
     """Start chat-first discovery mode."""
     _, _, runtime = _load_planning_runtime(repo_name)
-    session, opening = asyncio.run(runtime.start_from_chat(rebuild_memory=rebuild_memory))
+    session, opening = asyncio.run(
+        runtime.start_from_chat(no_recall=no_recall, rebuild_memory=rebuild_memory)
+    )
     click.echo(opening)
     click.echo(f"Created planning session: {session.id}")
     if not no_open:
         _open_web_session(session.id)
+
+
+@main.command("recall")
+@click.argument("query")
+@click.option("--repo", "repo_name", default=None, help="Limit search to a specific repo profile")
+@click.option("--all-repos", is_flag=True, help="Search across all repositories")
+@click.option("--limit", default=5, show_default=True, type=int, help="Maximum sessions to return")
+@click.option("--full", is_flag=True, help="Print full stored plan content for each match")
+def recall(query: str, repo_name: str | None, all_repos: bool, limit: int, full: bool) -> None:
+    """Search historical planning sessions."""
+    if repo_name and all_repos:
+        raise click.ClickException("Use either --repo or --all-repos, not both.")
+    if limit <= 0:
+        raise click.ClickException("--limit must be greater than 0.")
+
+    store = Store()
+    selected_repo: str | None = None
+    if repo_name:
+        selected_repo = repo_name
+    elif all_repos:
+        selected_repo = None
+    else:
+        try:
+            config = PrscopeConfig.load(get_repo_root())
+            selected_repo = config.resolve_repo(None, cwd=Path.cwd()).name
+        except Exception:
+            click.echo("[recall] No repo detected - searching across all repositories")
+            selected_repo = None
+
+    results = store.search_sessions(query=query, repo_name=selected_repo, limit=limit)
+    if not results:
+        click.echo("No matching planning sessions found.")
+        return
+
+    if full:
+        for idx, item in enumerate(results, start=1):
+            click.echo(
+                f"[{idx}] {item['session_id']} | {item['title']} | repo={item['repo_name']} | {item['created_at']}"
+            )
+            latest = store.get_plan_versions(str(item["session_id"]), limit=1)
+            click.echo(latest[0].plan_content if latest else "")
+            if idx < len(results):
+                click.echo("\n" + ("-" * 80) + "\n")
+        return
+
+    for idx, item in enumerate(results, start=1):
+        click.echo(f"[{idx}] {item['session_id'][:8]} | {item['title']}")
+        click.echo(
+            f"    Repo: {item['repo_name']}  |  Date: {str(item['created_at'])[:10]}  |  Score: {float(item['score']):.2f}"
+        )
+        click.echo(f"    Summary: {item['summary_snippet']}")
 
 
 @plan_group.command("resume")

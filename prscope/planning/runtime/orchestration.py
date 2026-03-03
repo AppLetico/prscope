@@ -6,13 +6,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
 from pathlib import Path
 from typing import Any
 
 from ...config import PlanningConfig, PrscopeConfig, RepoProfile
-from ...memory import MemoryStore, ParsedConstraint
+from ...memory import MemoryStore, ParsedConstraint, load_skills
 from ...pricing import MODEL_CONTEXT_WINDOWS
 from ..scanners import get_scanner
 from ...profile import build_profile
@@ -32,6 +33,7 @@ from .tools import ToolExecutor
 MEMORY_BLOCK_KEYS = {"architecture", "modules", "patterns", "entrypoints", "context"}
 # Keep startup responsive; deeper refinement can happen in subsequent rounds.
 INITIAL_DRAFT_TIMEOUT_SECONDS = 90
+logger = logging.getLogger(__name__)
 
 
 class PlanningRuntime:
@@ -60,6 +62,8 @@ class PlanningRuntime:
         self._clarification_gates: dict[str, ClarificationGate] = {}
         self._clarification_logs: dict[str, list[dict[str, Any]]] = {}
         self._session_working_summary: dict[str, str] = {}
+        self._session_skills_context: dict[str, str] = {}
+        self._session_no_recall: dict[str, bool] = {}
         self._compressor = CritiqueCompressor()
 
     def _resolve_author_model(
@@ -90,8 +94,76 @@ class PlanningRuntime:
         self._clarification_gates.pop(session_id, None)
         self._clarification_logs.pop(session_id, None)
         self._session_working_summary.pop(session_id, None)
+        self._session_skills_context.pop(session_id, None)
+        self._session_no_recall.pop(session_id, None)
         self.discovery.clear_session(session_id)
         self.tools.delete_session_artifacts(session_id)
+
+    def _skills_context(self, session_id: str) -> str:
+        cached = self._session_skills_context.get(session_id)
+        if cached is not None:
+            return cached
+        skills_body = load_skills(self.repo.skills_dir, self.planning_config.skills_max_chars)
+        if not skills_body:
+            self._session_skills_context[session_id] = ""
+            return ""
+        wrapped = (
+            "## Team Skills & Patterns\n"
+            "The following represent stable team patterns and engineering defaults.\n"
+            "Apply them unless explicitly overridden by requirements.\n\n"
+            "---\n"
+            f"{skills_body}\n"
+        )
+        self._session_skills_context[session_id] = wrapped
+        return wrapped
+
+    def _recall_disabled(self, session_id: str) -> bool:
+        if session_id in self._session_no_recall:
+            return bool(self._session_no_recall[session_id])
+        session = self.store.get_planning_session(session_id)
+        disabled = bool(getattr(session, "no_recall", 0)) if session is not None else False
+        self._session_no_recall[session_id] = disabled
+        return disabled
+
+    def _build_recall_context(self, session_id: str, query: str) -> str:
+        if not self.planning_config.recall_prior_sessions:
+            return ""
+        if self._recall_disabled(session_id):
+            return ""
+        if len(query.split()) < 6:
+            logger.info("[recall] Skipped - insufficient query signal")
+            return ""
+
+        ranked = self.store.search_sessions(
+            query=query,
+            repo_name=self.repo.name,
+            limit=self.planning_config.recall_top_k,
+        )
+        if not ranked:
+            return ""
+
+        header = (
+            "## Prior Planning Context\n"
+            "Historical context may be outdated. Validate against current requirements.\n\n"
+        )
+        body_blocks: list[str] = []
+        total = len(header)
+        max_chars = max(0, self.planning_config.recall_max_chars)
+        for item in ranked:
+            block = (
+                f"### Session: {item['title']} ({item['created_at'][:10]})\n"
+                f"Repo: {item['repo_name']}\n"
+                f"Relevance Score: {float(item['score']):.2f}\n\n"
+                "Key Summary:\n"
+                f"- {item['summary_snippet']}\n"
+            )
+            if max_chars > 0 and (total + len(block) > max_chars):
+                break
+            body_blocks.append(block)
+            total += len(block)
+        if not body_blocks:
+            return ""
+        return header + "\n".join(body_blocks)
 
     def _session_reads(self, session_id: str) -> set[str]:
         return self._session_read_paths.setdefault(session_id, set())
@@ -579,6 +651,7 @@ class PlanningRuntime:
         author_model: str | None = None,
         critic_model: str | None = None,
         title: str | None = None,
+        no_recall: bool = False,
         rebuild_memory: bool = False,
     ) -> PlanningSession:
         session = self.store.create_planning_session(
@@ -588,8 +661,10 @@ class PlanningRuntime:
             author_model=author_model or self.planning_config.author_model,
             critic_model=critic_model or self.planning_config.critic_model,
             seed_type="requirements",
+            no_recall=no_recall,
             status="drafting",
         )
+        self._session_no_recall[session.id] = no_recall
         return session
 
     async def continue_requirements_draft(
@@ -614,6 +689,7 @@ class PlanningRuntime:
         author_model: str | None = None,
         critic_model: str | None = None,
         title: str | None = None,
+        no_recall: bool = False,
         rebuild_memory: bool = False,
         event_callback: Any | None = None,
     ) -> PlanningSession:
@@ -622,6 +698,7 @@ class PlanningRuntime:
             author_model=author_model,
             critic_model=critic_model,
             title=title,
+            no_recall=no_recall,
             rebuild_memory=rebuild_memory,
         )
         return await self._continue_initial_draft(
@@ -669,6 +746,7 @@ class PlanningRuntime:
         pr_number: int,
         author_model: str | None = None,
         critic_model: str | None = None,
+        no_recall: bool = False,
         rebuild_memory: bool = False,
     ) -> PlanningSession:
         await self._prepare_memory(rebuild_memory=rebuild_memory)
@@ -695,8 +773,10 @@ class PlanningRuntime:
             critic_model=critic_model or self.planning_config.critic_model,
             seed_type="upstream_pr",
             seed_ref=f"{upstream_repo}#{pr_number}",
+            no_recall=no_recall,
             status="drafting",
         )
+        self._session_no_recall[session.id] = no_recall
         core = self._core(session.id)
         self.tools.set_session(session.id)
         author_result = await self._run_initial_draft(
@@ -714,6 +794,7 @@ class PlanningRuntime:
         self,
         author_model: str | None = None,
         critic_model: str | None = None,
+        no_recall: bool = False,
         rebuild_memory: bool = False,
     ) -> tuple[PlanningSession, str | None]:
         """Create a chat session with status 'preparing'. Call continue_chat_setup to build memory and get opening."""
@@ -724,8 +805,10 @@ class PlanningRuntime:
             author_model=author_model or self.planning_config.author_model,
             critic_model=critic_model or self.planning_config.critic_model,
             seed_type="chat",
+            no_recall=no_recall,
             status="preparing",
         )
+        self._session_no_recall[session.id] = no_recall
         return session, None
 
     async def continue_chat_setup(
@@ -783,12 +866,19 @@ class PlanningRuntime:
                 {"role": turn.role, "content": turn.content}
                 for turn in core.get_conversation()
             ]
+            discovery_context = "".join(
+                [
+                    self._skills_context(session_id),
+                    self._build_recall_context(session_id, user_message),
+                ]
+            )
             try:
                 selected_author_model = self._resolve_author_model(session, author_model_override)
                 result = await self.discovery.handle_turn(
                     conversation,
                     session_id=session_id,
                     model_override=selected_author_model,
+                    extra_context=discovery_context,
                 )
                 self._record_session_reads(session_id, self.tools.accessed_paths.copy())
                 core.add_turn("author", result.reply, round_number=current_round)
@@ -853,6 +943,8 @@ class PlanningRuntime:
         blocks = self.memory.load_all_blocks()
         manifesto = self._truncate_memory_block("manifesto", self.memory.load_manifesto())
         manifesto_excerpt = self._excerpt(manifesto, max_lines=40)
+        skills_block = self._skills_context(session.id)
+        recall_block = self._build_recall_context(session.id, requirements)
         context_index = self._build_context_index(blocks)
         manifesto_path = self._manifesto_relative_path()
         budget = TokenBudgetManager(context_window=128_000, max_completion_tokens=4000)
@@ -862,16 +954,26 @@ class PlanningRuntime:
             f"PROJECT MANIFESTO (excerpt):\n{manifesto_excerpt}\n\n", remaining
         )
         remaining = max(0, remaining - used_manifesto)
+        skills_allocated, used_skills = budget.allocate(skills_block, remaining)
+        remaining = max(0, remaining - used_skills)
+        recall_allocated, used_recall = budget.allocate(recall_block, remaining)
+        remaining = max(0, remaining - used_recall)
         context_index_block, _ = budget.allocate(
             f"CONTEXT INDEX:\n{context_index}\n\n",
             remaining,
         )
-        initial_ratio = budget.injection_ratio([requirements, manifesto_block, context_index_block])
+        initial_ratio = budget.injection_ratio(
+            [requirements, manifesto_block, skills_allocated, recall_allocated, context_index_block]
+        )
         if initial_ratio > budget.enforce_ratio:
             target_tokens = int(budget.context_window * budget.enforce_ratio)
             remaining = max(0, target_tokens - estimate_tokens(requirements))
             manifesto_block, used_manifesto = budget.allocate(manifesto_block, remaining)
             remaining = max(0, remaining - used_manifesto)
+            skills_allocated, used_skills = budget.allocate(skills_allocated, remaining)
+            remaining = max(0, remaining - used_skills)
+            recall_allocated, used_recall = budget.allocate(recall_allocated, remaining)
+            remaining = max(0, remaining - used_recall)
             context_index_block, _ = budget.allocate(context_index_block, remaining)
         messages = [
             {
@@ -881,6 +983,8 @@ class PlanningRuntime:
                     f"REQUIREMENTS:\n{requirements}\n\n"
                     f"{manifesto_block}"
                     f"Full manifesto available at: {manifesto_path}\n\n"
+                    f"{skills_allocated}"
+                    f"{recall_allocated}"
                     f"{context_index_block}"
                     "IMPORTANT:\n"
                     "- Do not assume file paths.\n"
@@ -946,12 +1050,14 @@ class PlanningRuntime:
                 blocks = self.memory.load_all_blocks()
                 manifesto = self._truncate_memory_block("manifesto", self.memory.load_manifesto())
                 manifesto_excerpt = self._excerpt(manifesto, max_lines=40)
+                skills_context = self._skills_context(session_id)
                 context_index = self._build_context_index(blocks)
                 manifesto_path = self._manifesto_relative_path()
                 constraints = self._constraints()
                 requirements = (session.requirements or "") + (
                     f"\n\nUser input:\n{user_input}" if user_input else ""
                 )
+                recall_context = self._build_recall_context(session_id, requirements)
                 if user_input:
                     core.add_turn("user", user_input, round_number=round_number)
                 prior_critic_turn = self.store.get_latest_critic_turn(session_id)
@@ -1164,6 +1270,10 @@ class PlanningRuntime:
                 remaining_prompt = budget.available_prompt_tokens - estimate_tokens(requirements)
                 manifesto_block, used = budget.allocate(manifesto_excerpt, remaining_prompt)
                 remaining_prompt = max(0, remaining_prompt - used)
+                skills_block, used = budget.allocate(skills_context, remaining_prompt)
+                remaining_prompt = max(0, remaining_prompt - used)
+                recall_block, used = budget.allocate(recall_context, remaining_prompt)
+                remaining_prompt = max(0, remaining_prompt - used)
                 context_index_block, used = budget.allocate(context_index, remaining_prompt)
                 remaining_prompt = max(0, remaining_prompt - used)
                 current_plan_block, used = budget.allocate(current.plan_content, remaining_prompt)
@@ -1186,6 +1296,8 @@ class PlanningRuntime:
                     requirements,
                     round_anchor,
                     manifesto_block,
+                    skills_block,
+                    recall_block,
                     context_index_block,
                     current_plan_block,
                     critique_block,
@@ -1214,6 +1326,10 @@ class PlanningRuntime:
                     remaining_prompt = max(0, remaining_prompt - used)
                     manifesto_block, used = budget.allocate(manifesto_block, remaining_prompt)
                     remaining_prompt = max(0, remaining_prompt - used)
+                    skills_block, used = budget.allocate(skills_block, remaining_prompt)
+                    remaining_prompt = max(0, remaining_prompt - used)
+                    recall_block, used = budget.allocate(recall_block, remaining_prompt)
+                    remaining_prompt = max(0, remaining_prompt - used)
                     context_index_block, _ = budget.allocate(context_index_block, remaining_prompt)
                 core.add_turn(
                     "critic",
@@ -1233,6 +1349,8 @@ class PlanningRuntime:
                                 f"{round_anchor}\n\n",
                                 f"PROJECT MANIFESTO (excerpt):\n{manifesto_block}\n\n",
                                 f"Full manifesto available at: {manifesto_path}\n\n",
+                                (f"{skills_block}\n\n" if skills_block else ""),
+                                (f"{recall_block}\n\n" if recall_block else ""),
                                 f"CONTEXT INDEX:\n{context_index_block}\n\n",
                                 f"Requirements:\n{requirements}\n\n",
                                 (
