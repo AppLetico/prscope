@@ -1,6 +1,7 @@
 import { Group, Panel, Separator } from "react-resizable-panels";
 import { useMemo } from "react";
 import type { ReactNode } from "react";
+import { useMediaQuery } from "../hooks/useMediaQuery";
 
 interface ResizableLayoutProps {
   left: ReactNode;
@@ -10,6 +11,8 @@ interface ResizableLayoutProps {
 const STORAGE_KEY = "planning_layout_v1";
 
 export function ResizableLayout({ left, right }: ResizableLayoutProps) {
+  const isMobile = useMediaQuery("(max-width: 768px)");
+
   const defaultLayout = useMemo(() => {
     try {
       const raw = localStorage.getItem(STORAGE_KEY);
@@ -26,7 +29,7 @@ export function ResizableLayout({ left, right }: ResizableLayoutProps) {
 
   return (
     <Group
-      orientation="horizontal"
+      orientation={isMobile ? "vertical" : "horizontal"}
       id={STORAGE_KEY}
       defaultLayout={defaultLayout}
       onLayoutChange={(next) => {
@@ -34,13 +37,13 @@ export function ResizableLayout({ left, right }: ResizableLayoutProps) {
       }}
       className="h-full w-full"
     >
-      <Panel id="left" defaultSize={60} minSize={30} className="h-full">
+      <Panel id="left" defaultSize={isMobile ? 50 : 60} minSize={20} className="h-full">
         {left}
       </Panel>
       
-      <Separator className="w-1 bg-transparent hover:bg-indigo-500/50 active:bg-indigo-500 transition-colors duration-150 cursor-col-resize z-10 relative border-l border-zinc-800/50" />
+      <Separator className={`bg-transparent hover:bg-indigo-500/50 active:bg-indigo-500 transition-colors duration-150 z-10 relative ${isMobile ? "h-1 cursor-row-resize border-t border-zinc-800" : "w-1 cursor-col-resize border-l border-zinc-800"}`} />
       
-      <Panel id="right" defaultSize={40} minSize={25} className="h-full">
+      <Panel id="right" defaultSize={isMobile ? 50 : 40} minSize={20} className="h-full">
         {right}
       </Panel>
     </Group>

@@ -50,6 +50,17 @@ def test_repos_endpoint_returns_configured_profiles(tmp_path, monkeypatch):
     assert payload["items"][0]["path"]
 
 
+def test_health_endpoint_returns_healthy(tmp_path, monkeypatch):
+    _write_minimal_config(tmp_path)
+    monkeypatch.setenv("PRSCOPE_CONFIG_ROOT", str(tmp_path))
+    app = create_app()
+    client = TestClient(app)
+
+    response = client.get("/health")
+    assert response.status_code == 200
+    assert response.json() == {"status": "healthy"}
+
+
 def test_create_session_rejects_unavailable_model(tmp_path, monkeypatch):
     _write_minimal_config(tmp_path)
     monkeypatch.setenv("PRSCOPE_CONFIG_ROOT", str(tmp_path))

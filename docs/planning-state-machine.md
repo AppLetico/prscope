@@ -43,46 +43,38 @@ They must be written through `PlanningCore.transition_and_snapshot()` only.
 
 Canonical statuses:
 
-- `created`
-- `preparing`
-- `discovering`
-- `drafting`
+- `draft`
 - `refining`
 - `converged`
 - `approved`
-- `exported`
 - `error`
 
 Stable user-visible checkpoints are typically:
 
-- `discovering` (Q&A)
+- `draft` (requirements capture and initial draft generation)
 - `refining` (manual critique rounds available)
 - `converged` (ready to approve or run another round)
-- `approved` / `exported`
+- `approved`
 
 ## Allowed Transitions
 
 Defined in `PlanningCore.ALLOWED_TRANSITIONS`:
 
-- `created -> discovering | error`
-- `preparing -> discovering | error`
-- `discovering -> drafting | error`
-- `drafting -> refining | error`
+- `draft -> draft | refining | error`
 - `refining -> refining | converged | error`
 - `converged -> refining | approved | error`
-- `approved -> exported | error`
-- `exported -> (terminal)`
-- `error -> (terminal)`
+- `approved -> approved | error`
+- `error -> draft`
 
 ## Valid Commands by State
 
-Defined in `PlanningCore.VALID_COMMANDS`:
+Executor command matrix (server-derived):
 
-- `discovering`: `message`
-- `refining`: `message`, `round`
-- `converged`: `round`, `approve`
-- `approved`: `export`
-- all other states: none
+- `draft`: `message`, `reset`
+- `refining`: `run_round`, `message`, `reset`
+- `converged`: `run_round`, `message`, `approve`, `reset`
+- `approved`: `export`, `reset`
+- while processing with live lease: `cancel` only
 
 ## Core Transition Function
 
@@ -113,10 +105,10 @@ Design intent: transition logic is "closed world." Illegal states should be unre
 Hard invariants enforced in core:
 
 - **Single write path**: no direct writes to protected fields outside transition kernel
-- **Discovery coherence**:
-  - if `status == discovering` and `pending_questions_json != null`, then `phase_message == null`
-  - if `status == discovering` and `phase_message != null`, then `pending_questions_json` is cleared
-- **Non-discovery question clearing**: pending questions are cleared for all non-`discovering` states
+- **Draft coherence**:
+  - if `status == draft` and `pending_questions_json != null`, then `phase_message == null`
+  - if `status == draft` and `phase_message != null`, then `pending_questions_json` is cleared
+- **Non-draft question clearing**: pending questions are cleared for all non-`draft` states
 - **Processing derivation**: `is_processing = status in WORK_STATES and phase_message is not null`
 - **Round monotonicity**:
   - `current_round` can only change on `refining -> refining`
@@ -124,17 +116,21 @@ Hard invariants enforced in core:
 
 ## Command Idempotency and Rejection Order
 
-Command endpoints (`message`, `round`, `approve`) require `command_id` and use this order:
+`POST /api/sessions/{id}/command` is canonical (wrapper endpoints route here) and uses executor reserve/finalize semantics:
 
-1. Idempotency replay check (`last_commands_json[command_type]`)
-2. Processing lock check (`is_processing`)
-3. Allowed command check (`VALID_COMMANDS`)
+1. Idempotency replay check (`planning_commands` by `(session_id, command_id)`)
+2. Allowed command revalidation (transactional, current DB status)
+3. Processing lock check (derived from running/finalizing command + lease)
+4. Reserve command row (`running`, `started_at`, `lease_expires_at`)
+5. Execute handler outside transaction with lease heartbeat
+6. Finalize transaction (`finalizing -> completed`) with persisted `result_snapshot_json`
 
 Rejections return `409` with structured payload including:
 
 - `status`
 - `phase_message`
 - `allowed_commands`
+- `reason` (`processing_lock`, `invalid_status`, `unknown_command`, `timeout`, `cancelled`)
 
 This keeps client behavior simple: the server explains what actions are valid next.
 
@@ -150,6 +146,22 @@ For state-relevant runtime activity:
 No event should be emitted that implies a state the DB does not yet hold.
 
 This is the key crash-safety rule for avoiding split-brain between live UI and persisted state.
+
+## Command Execution and Timeout Recovery
+
+Commands are now executor-backed and tracked in durable `planning_commands` command-log rows:
+
+- reserve phase inserts `running` command row and sets `current_command_id`
+- execute phase runs handler/pipeline outside DB transaction and renews lease
+- finalize phase persists snapshot and marks `completed`
+
+Timeout monitor behavior:
+
+1. scans expired `running` rows (`lease_expires_at < now`)
+2. marks them `failed` with `timeout` reason
+3. clears `current_command_id` only if pointing to timed-out row
+
+`finalizing` rows are never timed out by monitor.
 
 ## SSE Contract
 

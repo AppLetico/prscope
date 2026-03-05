@@ -18,7 +18,7 @@ import sqlite3
 from collections.abc import Generator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
@@ -26,7 +26,7 @@ from uuid import uuid4
 from .config import get_prscope_dir
 
 DB_FILENAME = "prscope.db"
-CURRENT_SCHEMA_VERSION = 10
+CURRENT_SCHEMA_VERSION = 15
 _UNSET = object()
 PROTECTED_SESSION_FIELDS = {
     "status",
@@ -34,8 +34,18 @@ PROTECTED_SESSION_FIELDS = {
     "pending_questions_json",
     "phase_message",
     "active_tool_calls_json",
+    "completed_tool_call_groups_json",
     "processing_started_at",
 }
+
+# ASYNC ROUND HARNESS - INVARIANT CONTRACT
+# 1. Session row is the sole workflow authority. Jobs are operational metadata.
+# 2. Jobs never write workflow fields (status/is_processing/phase/current_round).
+# 3. API transitions INTO processing; worker transitions OUT.
+# 4. Idempotent replay has zero side effects.
+# 5. Persist before emit.
+# 6. Rounds are atomic; partial rounds are failed (never resumed).
+# 7. Reconciliation: requeue stale jobs first, then reconcile sessions.
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -134,6 +144,8 @@ CREATE TABLE IF NOT EXISTS planning_sessions (
     processing_started_at TEXT,
     last_commands_json TEXT,
     active_tool_calls_json TEXT,
+    completed_tool_call_groups_json TEXT,
+    current_command_id TEXT,
     session_total_cost_usd REAL,
     max_prompt_tokens INTEGER,
     confidence_trend REAL,
@@ -141,6 +153,27 @@ CREATE TABLE IF NOT EXISTS planning_sessions (
     clarifications_log_json TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+
+-- Durable command log rows for executor semantics
+CREATE TABLE IF NOT EXISTS planning_commands (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    command TEXT,
+    command_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'queued',
+    payload_json TEXT NOT NULL,
+    result_snapshot_json TEXT,
+    started_at TEXT,
+    completed_at TEXT,
+    last_error TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    worker_id TEXT,
+    lease_expires_at TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY (session_id) REFERENCES planning_sessions(id),
+    UNIQUE(session_id, command_id)
 );
 
 -- Planning conversation turns
@@ -220,6 +253,8 @@ CREATE INDEX IF NOT EXISTS idx_versions_session_round ON plan_versions(session_i
 CREATE INDEX IF NOT EXISTS idx_sessions_status ON planning_sessions(status);
 CREATE INDEX IF NOT EXISTS idx_sessions_repo ON planning_sessions(repo_name);
 CREATE INDEX IF NOT EXISTS idx_round_metrics_session_round ON planning_round_metrics(session_id, round);
+CREATE INDEX IF NOT EXISTS idx_planning_commands_status_created ON planning_commands(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_planning_commands_session_status ON planning_commands(session_id, status);
 """
 
 
@@ -346,6 +381,8 @@ class PlanningSession:
     processing_started_at: str | None = None
     last_commands_json: str | None = None
     active_tool_calls_json: str | None = None
+    completed_tool_call_groups_json: str | None = None
+    current_command_id: str | None = None
     session_total_cost_usd: float | None = None
     max_prompt_tokens: int | None = None
     confidence_trend: float | None = None
@@ -363,6 +400,35 @@ class PlanningSession:
         if isinstance(parsed, list):
             return [item for item in parsed if isinstance(item, dict)]
         return []
+
+
+@dataclass
+class PlanningCommand:
+    """Durable command-log metadata for executor execution."""
+
+    id: str
+    session_id: str
+    command: str | None
+    command_id: str
+    status: str
+    payload_json: str
+    result_snapshot_json: str | None
+    started_at: str | None
+    completed_at: str | None
+    last_error: str | None
+    attempt_count: int
+    worker_id: str | None
+    lease_expires_at: str | None
+    created_at: str
+    updated_at: str
+
+    @property
+    def payload(self) -> dict[str, Any]:
+        try:
+            parsed = json.loads(self.payload_json)
+        except json.JSONDecodeError:
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
 
 
 @dataclass
@@ -603,12 +669,121 @@ class Store:
                 ("planning_sessions", "processing_started_at", "TEXT"),
                 ("planning_sessions", "last_commands_json", "TEXT"),
                 ("planning_sessions", "active_tool_calls_json", "TEXT"),
+                ("planning_sessions", "current_command_id", "TEXT"),
             )
             for table, column, sql_type in additions:
                 if not self._column_exists(conn, table, column):
                     conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
-            conn.execute("UPDATE planning_sessions SET status = 'discovering' WHERE status = 'discovery'")
+            conn.execute("UPDATE planning_sessions SET status = 'draft' WHERE status = 'discovery'")
             current = 10
+
+        # v10 -> v11: durable async command log rows
+        if current < 11:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS planning_commands (
+                    id TEXT PRIMARY KEY,
+                    session_id TEXT NOT NULL,
+                    command TEXT,
+                    command_id TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    payload_json TEXT NOT NULL,
+                    result_snapshot_json TEXT,
+                    started_at TEXT,
+                    completed_at TEXT,
+                    last_error TEXT,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    worker_id TEXT,
+                    lease_expires_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY (session_id) REFERENCES planning_sessions(id),
+                    UNIQUE(session_id, command_id)
+                )
+                """
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_planning_commands_status_created "
+                "ON planning_commands(status, created_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_planning_commands_session_status "
+                "ON planning_commands(session_id, status)"
+            )
+            current = 11
+
+        # v11 -> v12: command executor fields + lock/query index
+        if current < 12:
+            additions = (
+                ("planning_sessions", "current_command_id", "TEXT"),
+                ("planning_commands", "command", "TEXT"),
+                ("planning_commands", "result_snapshot_json", "TEXT"),
+                ("planning_commands", "started_at", "TEXT"),
+                ("planning_commands", "completed_at", "TEXT"),
+                ("planning_commands", "last_error", "TEXT"),
+            )
+            for table, column, sql_type in additions:
+                if not self._column_exists(conn, table, column):
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {sql_type}")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_planning_commands_session_status "
+                "ON planning_commands(session_id, status)"
+            )
+            current = 12
+
+        # v12 -> v13: naming harmonization planning_jobs -> planning_commands
+        if current < 13:
+            jobs_exists = (
+                conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'planning_jobs'").fetchone()
+                is not None
+            )
+            commands_exists = (
+                conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'planning_commands'"
+                ).fetchone()
+                is not None
+            )
+            if jobs_exists and not commands_exists:
+                conn.execute("ALTER TABLE planning_jobs RENAME TO planning_commands")
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_planning_commands_status_created "
+                "ON planning_commands(status, created_at)"
+            )
+            conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_planning_commands_session_status "
+                "ON planning_commands(session_id, status)"
+            )
+            current = 13
+
+        # v13 -> v14: normalize legacy planning status names to canonical artifact states
+        if current < 14:
+            conn.execute(
+                """
+                UPDATE planning_sessions
+                SET status = 'draft'
+                WHERE status IN ('created', 'preparing', 'discovery', 'discovering', 'drafting')
+                """
+            )
+            conn.execute(
+                """
+                UPDATE planning_sessions
+                SET status = 'approved'
+                WHERE status = 'exported'
+                """
+            )
+            current = 14
+
+        # v14 -> v15: persist completed tool call groups for refresh-safe UI history
+        if current < 15:
+            if not self._column_exists(conn, "planning_sessions", "completed_tool_call_groups_json"):
+                conn.execute("ALTER TABLE planning_sessions ADD COLUMN completed_tool_call_groups_json TEXT")
+            conn.execute(
+                """
+                UPDATE planning_sessions
+                SET completed_tool_call_groups_json = COALESCE(completed_tool_call_groups_json, '[]')
+                """
+            )
+            current = 15
 
         self._set_schema_version(conn, current)
 
@@ -617,7 +792,7 @@ class Store:
         """Context manager for database connection."""
         conn = sqlite3.connect(self.db_path, timeout=30.0)
         conn.row_factory = sqlite3.Row
-        # Improve concurrent read/write behavior for live API polling during drafting.
+        # Improve concurrent read/write behavior for live API polling during draft.
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA synchronous=NORMAL")
         conn.execute("PRAGMA busy_timeout=30000")
@@ -963,6 +1138,489 @@ class Store:
             return [Artifact(**dict(row)) for row in rows]
 
     # =========================================================================
+    # Planning commands (executor command log)
+    # =========================================================================
+
+    def _row_to_planning_command(self, row: sqlite3.Row | None) -> PlanningCommand | None:
+        if row is None:
+            return None
+        return PlanningCommand(**dict(row))
+
+    def create_planning_command(
+        self,
+        session_id: str,
+        command_id: str,
+        payload_json: str,
+        *,
+        command: str | None = None,
+    ) -> PlanningCommand:
+        """Create a queued command-log row for a session command."""
+        jid = str(uuid4())
+        now = self._now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO planning_commands
+                    (id, session_id, command, command_id, status, payload_json, result_snapshot_json,
+                     started_at, completed_at, last_error, attempt_count, worker_id,
+                     lease_expires_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'queued', ?, NULL, NULL, NULL, NULL, 0, NULL, NULL, ?, ?)
+                """,
+                (jid, session_id, command, command_id, payload_json, now, now),
+            )
+            row = conn.execute("SELECT * FROM planning_commands WHERE id = ?", (jid,)).fetchone()
+            command_row = self._row_to_planning_command(row)
+            if command_row is None:
+                raise ValueError("Failed to create planning command")
+            return command_row
+
+    def get_planning_command(self, command_row_id: str) -> PlanningCommand | None:
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM planning_commands WHERE id = ?", (command_row_id,)).fetchone()
+            return self._row_to_planning_command(row)
+
+    def get_planning_command_by_command_id(self, session_id: str, command_id: str) -> PlanningCommand | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM planning_commands
+                WHERE session_id = ? AND command_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (session_id, command_id),
+            ).fetchone()
+            return self._row_to_planning_command(row)
+
+    def get_active_planning_command(self, session_id: str) -> PlanningCommand | None:
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM planning_commands
+                WHERE session_id = ? AND status IN ('queued', 'running', 'finalizing')
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+            return self._row_to_planning_command(row)
+
+    def get_live_running_planning_command(self, session_id: str) -> PlanningCommand | None:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM planning_commands
+                WHERE session_id = ?
+                  AND status = 'running'
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at > ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (session_id, now),
+            ).fetchone()
+            return self._row_to_planning_command(row)
+
+    def claim_next_planning_command(self, worker_id: str, lease_seconds: int) -> PlanningCommand | None:
+        """Claim oldest queued job atomically and increment attempt_count."""
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
+        lease_expires = (now_dt + timedelta(seconds=max(1, int(lease_seconds)))).isoformat()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = conn.execute(
+                    """
+                    UPDATE planning_commands
+                    SET status = 'running',
+                        lease_expires_at = ?,
+                        worker_id = ?,
+                        attempt_count = attempt_count + 1,
+                        updated_at = ?
+                    WHERE id = (
+                        SELECT id
+                        FROM planning_commands
+                        WHERE status = 'queued'
+                        ORDER BY created_at ASC
+                        LIMIT 1
+                    )
+                      AND status = 'queued'
+                    RETURNING *
+                    """,
+                    (lease_expires, worker_id, now),
+                ).fetchone()
+                if row is not None:
+                    return PlanningCommand(**dict(row))
+                return None
+            except sqlite3.OperationalError as exc:
+                # Older SQLite builds may not support RETURNING.
+                if "RETURNING" not in str(exc).upper():
+                    raise
+                cur = conn.execute(
+                    """
+                    UPDATE planning_commands
+                    SET status = 'running',
+                        lease_expires_at = ?,
+                        worker_id = ?,
+                        attempt_count = attempt_count + 1,
+                        updated_at = ?
+                    WHERE id = (
+                        SELECT id
+                        FROM planning_commands
+                        WHERE status = 'queued'
+                        ORDER BY created_at ASC
+                        LIMIT 1
+                    )
+                      AND status = 'queued'
+                    """,
+                    (lease_expires, worker_id, now),
+                )
+                if int(cur.rowcount or 0) != 1:
+                    return None
+                row = conn.execute(
+                    """
+                    SELECT * FROM planning_commands
+                    WHERE status = 'running' AND worker_id = ? AND updated_at = ?
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (worker_id, now),
+                ).fetchone()
+                return self._row_to_planning_command(row)
+
+    def complete_planning_command_row(self, command_row_id: str) -> PlanningCommand | None:
+        now = self._now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE planning_commands
+                SET status = 'completed',
+                    lease_expires_at = NULL,
+                    completed_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now, now, command_row_id),
+            )
+            row = conn.execute("SELECT * FROM planning_commands WHERE id = ?", (command_row_id,)).fetchone()
+            return self._row_to_planning_command(row)
+
+    def fail_planning_command_row(self, command_row_id: str) -> PlanningCommand | None:
+        now = self._now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE planning_commands
+                SET status = 'failed',
+                    lease_expires_at = NULL,
+                    completed_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now, now, command_row_id),
+            )
+            row = conn.execute("SELECT * FROM planning_commands WHERE id = ?", (command_row_id,)).fetchone()
+            return self._row_to_planning_command(row)
+
+    def requeue_stale_planning_commands(self, max_attempts: int = 3) -> int:
+        """
+        Requeue expired running jobs (or fail when attempts exhausted).
+
+        NOTE: attempt_count increments only on claim, never on requeue.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            cur = conn.execute(
+                """
+                UPDATE planning_commands
+                SET status = CASE
+                        WHEN attempt_count >= ? THEN 'failed'
+                        ELSE 'queued'
+                    END,
+                    worker_id = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE status = 'running'
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at < ?
+                """,
+                (max(1, int(max_attempts)), now, now),
+            )
+            return int(cur.rowcount or 0)
+
+    def reserve_planning_command(
+        self,
+        *,
+        session_id: str,
+        command: str,
+        command_id: str,
+        payload_json: str,
+        lease_seconds: int,
+        allowed_commands_by_status: dict[str, set[str]] | None = None,
+    ) -> tuple[PlanningCommand | None, PlanningCommand | None, PlanningCommand | None, str | None]:
+        """
+        Reserve a command row atomically.
+
+        Returns (reserved, replay, active_conflict, reason).
+        """
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
+        lease_expires = (now_dt + timedelta(seconds=max(1, int(lease_seconds)))).isoformat()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            replay_row = conn.execute(
+                """
+                SELECT * FROM planning_commands
+                WHERE session_id = ? AND command_id = ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (session_id, command_id),
+            ).fetchone()
+            if replay_row is not None:
+                return None, PlanningCommand(**dict(replay_row)), None, "duplicate_command"
+
+            session_row = conn.execute(
+                "SELECT * FROM planning_sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if session_row is None:
+                return None, None, None, "session_not_found"
+            session = PlanningSession(**dict(session_row))
+            if allowed_commands_by_status is not None:
+                allowed = allowed_commands_by_status.get(session.status, set())
+                if command not in allowed and not (command == "cancel" and bool(session.current_command_id)):
+                    return None, None, None, "invalid_status"
+
+            active_row = conn.execute(
+                """
+                SELECT * FROM planning_commands
+                WHERE session_id = ?
+                  AND status IN ('running', 'finalizing')
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at > ?
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (session_id, now),
+            ).fetchone()
+            if active_row is not None:
+                if command != "cancel":
+                    return None, None, PlanningCommand(**dict(active_row)), "processing_lock"
+
+            jid = str(uuid4())
+            conn.execute(
+                """
+                INSERT INTO planning_commands
+                    (id, session_id, command, command_id, status, payload_json,
+                     result_snapshot_json, started_at, completed_at, last_error,
+                     attempt_count, worker_id, lease_expires_at, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 'running', ?, NULL, ?, NULL, NULL, 0, NULL, ?, ?, ?)
+                """,
+                (jid, session_id, command, command_id, payload_json, now, lease_expires, now, now),
+            )
+            conn.execute(
+                "UPDATE planning_sessions SET current_command_id = ?, updated_at = ? WHERE id = ?",
+                (jid, now, session_id),
+            )
+            row = conn.execute("SELECT * FROM planning_commands WHERE id = ?", (jid,)).fetchone()
+            return self._row_to_planning_command(row), None, None, None
+
+    def renew_planning_command_lease(self, command_row_id: str, lease_seconds: int) -> PlanningCommand | None:
+        now_dt = datetime.now(timezone.utc)
+        now = now_dt.isoformat()
+        lease_expires = (now_dt + timedelta(seconds=max(1, int(lease_seconds)))).isoformat()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE planning_commands
+                SET lease_expires_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                  AND status IN ('running', 'finalizing')
+                """,
+                (lease_expires, now, command_row_id),
+            )
+            row = conn.execute("SELECT * FROM planning_commands WHERE id = ?", (command_row_id,)).fetchone()
+            return self._row_to_planning_command(row)
+
+    def begin_planning_command_finalize(self, command_row_id: str) -> PlanningCommand | None:
+        now = self._now()
+        with self._connect() as conn:
+            try:
+                row = conn.execute(
+                    """
+                    UPDATE planning_commands
+                    SET status = 'finalizing',
+                        updated_at = ?
+                    WHERE id = ?
+                      AND status = 'running'
+                    RETURNING *
+                    """,
+                    (now, command_row_id),
+                ).fetchone()
+                if row is not None:
+                    return PlanningCommand(**dict(row))
+            except sqlite3.OperationalError as exc:
+                if "RETURNING" not in str(exc).upper():
+                    raise
+                conn.execute(
+                    """
+                    UPDATE planning_commands
+                    SET status = 'finalizing',
+                        updated_at = ?
+                    WHERE id = ?
+                      AND status = 'running'
+                    """,
+                    (now, command_row_id),
+                )
+            row = conn.execute("SELECT * FROM planning_commands WHERE id = ?", (command_row_id,)).fetchone()
+            return self._row_to_planning_command(row)
+
+    def complete_planning_command(
+        self,
+        *,
+        command_row_id: str,
+        result_snapshot_json: str,
+    ) -> PlanningCommand | None:
+        now = self._now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE planning_commands
+                SET status = 'completed',
+                    result_snapshot_json = ?,
+                    lease_expires_at = NULL,
+                    completed_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (result_snapshot_json, now, now, command_row_id),
+            )
+            conn.execute(
+                """
+                UPDATE planning_sessions
+                SET current_command_id = NULL,
+                    updated_at = ?
+                WHERE current_command_id = ?
+                """,
+                (now, command_row_id),
+            )
+            row = conn.execute("SELECT * FROM planning_commands WHERE id = ?", (command_row_id,)).fetchone()
+            return self._row_to_planning_command(row)
+
+    def fail_planning_command(self, command_row_id: str, *, reason: str | None = None) -> PlanningCommand | None:
+        now = self._now()
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE planning_commands
+                SET status = 'failed',
+                    last_error = ?,
+                    lease_expires_at = NULL,
+                    completed_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                  AND status IN ('running', 'finalizing')
+                """,
+                (reason, now, now, command_row_id),
+            )
+            conn.execute(
+                """
+                UPDATE planning_sessions
+                SET current_command_id = NULL,
+                    updated_at = ?
+                WHERE current_command_id = ?
+                """,
+                (now, command_row_id),
+            )
+            row = conn.execute("SELECT * FROM planning_commands WHERE id = ?", (command_row_id,)).fetchone()
+            return self._row_to_planning_command(row)
+
+    def cancel_active_planning_command(self, session_id: str) -> PlanningCommand | None:
+        now = self._now()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT * FROM planning_commands
+                WHERE session_id = ?
+                  AND status = 'running'
+                  AND command != 'cancel'
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            job_id = str(row["id"])
+            conn.execute(
+                """
+                UPDATE planning_commands
+                SET status = 'cancelled',
+                    last_error = 'cancelled',
+                    lease_expires_at = NULL,
+                    completed_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (now, now, job_id),
+            )
+            conn.execute(
+                """
+                UPDATE planning_sessions
+                SET current_command_id = NULL,
+                    updated_at = ?
+                WHERE current_command_id = ?
+                """,
+                (now, job_id),
+            )
+            updated = conn.execute("SELECT * FROM planning_commands WHERE id = ?", (job_id,)).fetchone()
+            return self._row_to_planning_command(updated)
+
+    def fail_expired_running_planning_commands(self) -> int:
+        now = datetime.now(timezone.utc).isoformat()
+        with self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                """
+                SELECT id FROM planning_commands
+                WHERE status = 'running'
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at < ?
+                """,
+                (now,),
+            ).fetchall()
+            if not rows:
+                return 0
+            ids = [str(row["id"]) for row in rows]
+            placeholders = ", ".join(["?"] * len(ids))
+            conn.execute(
+                f"""
+                UPDATE planning_commands
+                SET status = 'failed',
+                    last_error = 'timeout',
+                    lease_expires_at = NULL,
+                    completed_at = ?,
+                    updated_at = ?
+                WHERE id IN ({placeholders})
+                """,
+                [now, now, *ids],
+            )
+            conn.execute(
+                f"""
+                UPDATE planning_sessions
+                SET current_command_id = NULL,
+                    updated_at = ?
+                WHERE current_command_id IN ({placeholders})
+                """,
+                [now, *ids],
+            )
+            return len(ids)
+
+    # =========================================================================
     # Planning sessions and versions
     # =========================================================================
 
@@ -1001,7 +1659,7 @@ class Store:
         critic_model: str | None = None,
         seed_ref: str | None = None,
         no_recall: bool = False,
-        status: str = "drafting",
+        status: str = "draft",
         session_id: str | None = None,
     ) -> PlanningSession:
         """Create and persist a planning session."""
@@ -1014,10 +1672,11 @@ class Store:
                     (id, repo_name, title, requirements, author_model, critic_model, status, seed_type, seed_ref,
                      current_round, pending_questions_json, phase_message, is_processing,
                      processing_started_at, last_commands_json, active_tool_calls_json,
+                     completed_tool_call_groups_json, current_command_id,
                      session_total_cost_usd, max_prompt_tokens, confidence_trend,
                      converged_early, no_recall,
                      clarifications_log_json, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     sid,
@@ -1036,6 +1695,8 @@ class Store:
                     None,
                     "{}",
                     "[]",
+                    "[]",
+                    None,
                     0.0,
                     0,
                     0.0,
@@ -1247,6 +1908,8 @@ class Store:
         processing_started_at: str | None | object = _UNSET,
         last_commands_json: str | None | object = _UNSET,
         active_tool_calls_json: str | None | object = _UNSET,
+        completed_tool_call_groups_json: str | None | object = _UNSET,
+        current_command_id: str | None | object = _UNSET,
     ) -> PlanningSession:
         """Update mutable fields on a planning session."""
         if not _bypass_protection:
@@ -1263,6 +1926,8 @@ class Store:
                 protected_updates.add("processing_started_at")
             if active_tool_calls_json is not _UNSET:
                 protected_updates.add("active_tool_calls_json")
+            if completed_tool_call_groups_json is not _UNSET:
+                protected_updates.add("completed_tool_call_groups_json")
             if protected_updates:
                 raise RuntimeError(
                     "Direct write to protected fields: "
@@ -1321,6 +1986,12 @@ class Store:
         if active_tool_calls_json is not _UNSET:
             updates.append("active_tool_calls_json = ?")
             params.append(active_tool_calls_json)
+        if completed_tool_call_groups_json is not _UNSET:
+            updates.append("completed_tool_call_groups_json = ?")
+            params.append(completed_tool_call_groups_json)
+        if current_command_id is not _UNSET:
+            updates.append("current_command_id = ?")
+            params.append(current_command_id)
 
         updates.append("updated_at = ?")
         params.append(self._now())

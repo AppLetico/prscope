@@ -23,19 +23,28 @@ In `prscope`, the harness is the operational envelope around planning agents and
 Core components:
 
 - `prscope/web/api.py`
-  - Command endpoints (`message`, `round`, `approve`, `export`) with command idempotency
-  - Command gate order: idempotency -> processing lock -> allowed command validation
+  - Canonical command endpoint: `POST /api/sessions/{id}/command`
+  - Wrapper endpoints (`/message`, `/round`, `/approve`, `/export`, `/stop`) route through the same executor
+  - Command gate order: replay -> allowed revalidation -> processing lock -> reserve row
   - SSE endpoint with **snapshot-on-connect** (`session_state` emitted first)
 - `prscope/web/events.py`
   - Session-scoped, **multi-subscriber** emitter (`set` of queues per session)
 - `prscope/planning/core.py`
   - Canonical state machine (`ALLOWED_TRANSITIONS`, `VALID_COMMANDS`)
   - Only protected-state write path: `transition_and_snapshot()`
-  - Invariants for discovery coherence, processing derivation, and round monotonicity
+  - Invariants for draft coherence, processing derivation, and round monotonicity
+- `prscope/planning/executor.py`
+  - Two-phase command execution (`reserve` -> `execute` -> `finalize`)
+  - Centralized replay, locking, lease heartbeat, and snapshot persistence
+  - Command handlers return `HandlerResult` only (no direct snapshot/lock logic)
 - `prscope/planning/runtime/orchestration.py`
   - Integrates discovery/author/critic loops with core transitions
   - Enforces persist-then-emit sequencing for runtime events
   - Persists bounded active tool calls (`MAX_ACTIVE_TOOL_CALLS = 50`)
+- `prscope/planning/runtime/discovery.py`
+  - Generalized discovery engine (feature intent extraction + evidence-first questioning)
+  - Registry-scored framework detection and signal indexing
+  - Session-scoped bootstrap insights (`existing_feature`, `feature_label`, evidence paths)
 - `prscope/store.py`
   - Session schema fields for canonical UI state (`status`, `phase_message`, `pending_questions_json`, etc.)
   - Runtime guard preventing direct writes to protected state fields
@@ -53,7 +62,7 @@ The `planning_sessions` row is authoritative for UI state. Core fields:
 - `pending_questions_json`
 - `active_tool_calls_json`
 - `processing_started_at`
-- `last_commands_json`
+- `current_command_id`
 
 Turns (`planning_turns`) remain useful for traceability and debugging, but are not authoritative for live UI state.
 
@@ -78,23 +87,42 @@ Key design guarantees:
 
 Practical implication: if SSE is interrupted, the UI should still recover from the next GET + snapshot event without ambiguous intermediate logic.
 
+## Discovery Behavior Contract
+
+Discovery operates in this order:
+
+1. extract feature intent from the latest user request
+2. bootstrap-scan repository evidence (tools + grep/read snapshots)
+3. infer framework/signals from shared scan results
+4. decide whether feature likely exists
+5. ask only unresolved decision questions
+
+Expected behavior:
+
+- If evidence indicates a feature already exists, discovery should avoid "create new X" planning.
+- If framework evidence is present, discovery should avoid asking "which backend/framework?".
+- Clarifying questions should be batched and non-duplicative in UI rendering.
+
 ## Command Model
 
-Primary command endpoints:
+Primary command endpoint:
 
-- `POST /api/sessions/{session_id}/message`
-- `POST /api/sessions/{session_id}/round`
-- `POST /api/sessions/{session_id}/approve`
-- `POST /api/sessions/{session_id}/export`
+- `POST /api/sessions/{session_id}/command`
 
 Command safety:
 
-- Each command carries `command_id` (UUID) for idempotency
-- Last successful command IDs are tracked in `last_commands_json` by command type
-- Concurrent commands while processing return `409` with `allowed_commands`
-- Invalid command/state combinations also return `409` with structured details
+- All mutating commands carry `command_id` (UUID) for idempotent replay
+- Replay source of truth is durable `planning_commands.result_snapshot_json`
+- Concurrent commands while processing return `409` with `reason=processing_lock`
+- Invalid command/state combinations return `409` with `reason=invalid_status`
 
 This behavior is intentional: commands are rejected deterministically rather than queued implicitly.
+
+Executor details:
+
+- Reserve phase writes `planning_commands` row as `running` with lease
+- Execute phase runs handler/pipeline and renews lease heartbeat
+- Finalize phase writes canonical snapshot, marks command `completed`, clears `current_command_id`
 
 ## SSE Event Model
 
@@ -110,6 +138,7 @@ Primary events:
 - `complete`
 - `token_usage`
 - `clarification_needed`
+- `state_snapshot` events emitted by command finalize
 
 Event semantics:
 
@@ -128,8 +157,8 @@ High-value invariants:
 - Only `transition_and_snapshot()` mutates protected session state
 - `is_processing` is derived (`status in WORK_STATES` and `phase_message` is set)
 - `current_round` may change only during `refining -> refining`
-- In `discovering`, questions and processing message cannot coexist
-- Non-discovering states clear pending questions
+- In `draft`, questions and processing message cannot coexist
+- Non-draft states clear pending questions
 
 ## Tool Call Persistence Rules
 
@@ -142,6 +171,7 @@ High-value invariants:
 
 On app startup, before serving requests:
 
+- expired `planning_commands` rows are marked failed (`timeout`) idempotently
 - `PlanningCore.reconcile_stuck_sessions()` scans sessions with `is_processing = true`
 - Uses `processing_started_at` timeout to identify stale work
 - Transitions stale sessions to `error` via `transition_and_snapshot()`
@@ -156,8 +186,9 @@ Operator note: after a restart, stale sessions may surface as `error` and requir
 - `POST /api/sessions`
 - `GET /api/sessions/{session_id}`
 - `DELETE /api/sessions/{session_id}`
-- `POST /api/sessions/{session_id}/message`
-- `POST /api/sessions/{session_id}/round`
+- `POST /api/sessions/{session_id}/command`
+- `POST /api/sessions/{session_id}/message` (wrapper)
+- `POST /api/sessions/{session_id}/round` (wrapper)
 - `POST /api/sessions/{session_id}/clarify`
 - `POST /api/sessions/{session_id}/approve`
 - `POST /api/sessions/{session_id}/export`
@@ -207,7 +238,7 @@ python3 -m prscope.benchmark \
 
 ### Commands unexpectedly rejected
 
-- Inspect returned `409` payload (`status`, `phase_message`, `allowed_commands`).
+- Inspect returned `409` payload (`reason`, `status`, `phase_message`, `allowed_commands`).
 - Confirm the submitted `command_id` is unique for new attempts.
 
 ### Session appears stuck in processing

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 from collections.abc import Awaitable
 from dataclasses import asdict, dataclass, field
@@ -17,6 +18,8 @@ from ...config import PlanningConfig, RepoProfile
 from ...memory import ParsedConstraint
 from ...pricing import MODEL_CONTEXT_WINDOWS
 from .telemetry import completion_telemetry
+
+logger = logging.getLogger(__name__)
 
 
 class CriticParseError(RuntimeError):
@@ -67,6 +70,9 @@ class CriticResult:
     clarification_questions: list[str]
     prose: str
     parse_error: str | None = None
+    # Internal only — never persisted to DB or emitted over SSE.
+    # Tracks violations suppressed by the evidence gate for analytics.
+    suppressed_violations: list[str] = field(default_factory=list)
 
 
 CRITIC_SYSTEM_PROMPT = """You are an adversarial senior reviewer for implementation plans.
@@ -93,9 +99,18 @@ Rules:
 - critique_complete must be true only when major_issues_remaining is 0.
 - critique_complete must be false if unsupported_claims or missing_evidence is non-empty.
 - Use only valid hard-constraint IDs.
+- hard_constraint_violations must be an array of string IDs only, e.g.
+  ["HARD_CONSTRAINT_001"]. Do not emit objects in this field.
 - operational_readiness is true only when observability, rollback, and test strategy are concrete.
 - Every failure_modes/design_tradeoff_risks entry must include a "source" field pointing to a plan heading or file path.
 - Do NOT wrap JSON in markdown fences. Return a raw JSON object first.
+- Before listing a hard_constraint_violations entry, quote the specific plan line that proves the
+  violation using backticks. The quoted text must come directly from the plan, not from your own
+  analysis or reasoning. If you cannot quote a specific plan line, do NOT report that constraint
+  as violated.
+- If the plan text explicitly states an action is safe or excluded by the constraint
+  (e.g. a public /health endpoint is fine per HARD_CONSTRAINT_001, or adding a new route is
+  not restricted per HARD_CONSTRAINT_002), do NOT report a violation.
 
 Each entry in "failure_modes" MUST be a JSON object with exactly these fields:
 {
@@ -134,6 +149,8 @@ class CriticAgent:
         self.repo = repo
         self.event_callback = event_callback
         self.schema = CriticContractSchema()
+        # Lazily populated by _filter_spurious_violations on first call.
+        self._constraint_pattern_cache: dict[str, re.Pattern[str]] = {}
 
     async def _emit(self, event: dict[str, Any]) -> None:
         if self.event_callback is None:
@@ -292,6 +309,77 @@ class CriticAgent:
         headings = set(re.findall(r"##\s+[A-Za-z0-9 _-]+", prose))
         return len(file_paths | headings)
 
+    def _filter_spurious_violations(
+        self,
+        violations: list[str],
+        constraints: list[ParsedConstraint],
+        plan_text: str,
+        prose: str,
+        session_id: str = "",
+        round_number: int = 0,
+    ) -> tuple[list[str], list[str]]:
+        """Return (kept, suppressed) after evidence-gating each violation.
+
+        A violation is kept when:
+        - The constraint has no evidence_keywords (safe default — never filter custom constraints).
+        - At least one evidence keyword appears in the plan text (keyword match).
+        - The LLM's prose contains a backtick-quoted excerpt with an evidence keyword
+          AND plan_text is non-empty (quoted-evidence override).
+
+        Deduplicates the input list before filtering to handle LLMs that repeat IDs.
+        """
+        # Deduplicate while preserving order — LLMs occasionally return the same ID twice.
+        violations = list(dict.fromkeys(violations))
+
+        keyword_map: dict[str, list[str]] = {c.id: c.evidence_keywords for c in constraints if c.evidence_keywords}
+        # Build pattern cache lazily on first call; reused across all rounds.
+        # \b word boundaries prevent partial-token matches (e.g. api_key_manager vs api_key).
+        if not self._constraint_pattern_cache:
+            self._constraint_pattern_cache = {
+                vid: re.compile(
+                    r"`[^`\n]*\b(" + "|".join(map(re.escape, kws)) + r")\b[^`\n]*`",
+                    re.IGNORECASE,
+                )
+                for vid, kws in keyword_map.items()
+            }
+
+        kept: list[str] = []
+        suppressed: list[str] = []
+        text_lower = plan_text.lower()
+
+        for vid in violations:
+            keywords = keyword_map.get(vid)
+            if not keywords:
+                # No keywords defined for this constraint — always keep.
+                kept.append(vid)
+                continue
+            keyword_found = any(kw.lower() in text_lower for kw in keywords)
+            # Quoted-evidence override: the LLM is required by prompt to quote the
+            # offending plan line in backticks. Accept the violation when that quoted
+            # excerpt contains an evidence keyword — even if the plan text doesn't match
+            # directly. Guard: only apply when plan_text is non-empty to avoid accepting
+            # hallucinated quotes against a missing or malformed plan.
+            quoted_found = bool(
+                plan_text
+                and self._constraint_pattern_cache.get(vid)
+                and self._constraint_pattern_cache[vid].search(prose)
+            )
+            if keyword_found or quoted_found:
+                kept.append(vid)
+            else:
+                suppressed.append(vid)
+                logger.info(
+                    "[constraint_filter] suppressed_violation",
+                    extra={
+                        "session_id": session_id,
+                        "round": round_number,
+                        "constraint_id": vid,
+                        "keyword_found": keyword_found,
+                        "quoted_found": quoted_found,
+                    },
+                )
+        return kept, suppressed
+
     @staticmethod
     def _extract_first_json_object(raw: str) -> tuple[str, str]:
         start = raw.find("{")
@@ -327,7 +415,37 @@ class CriticAgent:
             raise CriticParseError("Unterminated JSON object in critic response")
         return raw[start:end], raw[end:].strip()
 
-    def _parse_critic_response(self, raw: str, valid_constraint_ids: set[str]) -> CriticResult:
+    @staticmethod
+    def _normalize_constraint_violations(raw_violations: list[Any]) -> list[str]:
+        violations: list[str] = []
+        for entry in raw_violations:
+            if isinstance(entry, str):
+                constraint_id = entry.strip()
+            elif isinstance(entry, dict):
+                candidate = entry.get("constraint_id") or entry.get("id")
+                if not isinstance(candidate, str):
+                    raise CriticParseError(
+                        "hard_constraint_violations object entries must include a string constraint_id"
+                    )
+                constraint_id = candidate.strip()
+            else:
+                raise CriticParseError(
+                    "hard_constraint_violations entries must be strings or objects with constraint_id"
+                )
+            if not constraint_id:
+                raise CriticParseError("hard_constraint_violations entries cannot be empty")
+            violations.append(constraint_id)
+        return violations
+
+    def _parse_critic_response(
+        self,
+        raw: str,
+        valid_constraint_ids: set[str],
+        constraints: list[ParsedConstraint] | None = None,
+        plan_content: str = "",
+        session_id: str = "",
+        round_number: int = 0,
+    ) -> CriticResult:
         json_text, prose = self._extract_first_json_object(raw)
         try:
             data = json.loads(json_text)
@@ -340,7 +458,7 @@ class CriticAgent:
             if not isinstance(data[field_name], expected_type):
                 raise CriticParseError(f"Wrong type for {field_name}: expected {expected_type.__name__}")
 
-        violations = [str(v) for v in data["hard_constraint_violations"]]
+        violations = self._normalize_constraint_violations(data["hard_constraint_violations"])
         unknown = set(violations) - valid_constraint_ids
         if unknown:
             # If no hard constraints are configured, tolerate invented IDs and
@@ -349,6 +467,22 @@ class CriticAgent:
                 violations = []
             else:
                 raise CriticParseError(f"Unknown constraint IDs in violations: {sorted(unknown)}")
+
+        # Evidence gate: filter out violations that have no evidence in the plan text.
+        suppressed_violations: list[str] = []
+        if constraints:
+            violations, suppressed_violations = self._filter_spurious_violations(
+                violations,
+                constraints,
+                plan_content,
+                prose,
+                session_id=session_id,
+                round_number=round_number,
+            )
+            if suppressed_violations and not violations:
+                # Every violation was suppressed — zero out the LLM's major issue count.
+                # Never decrement arithmetically; the count may include non-constraint issues.
+                data["major_issues_remaining"] = 0
 
         optional_values: dict[str, Any] = {}
         for field_name, (expected_type, default_value) in self.schema.optional_fields.items():
@@ -406,6 +540,7 @@ class CriticAgent:
             citation_count=self._citation_count(prose),
             clarification_questions=clarification_questions,
             prose=prose,
+            suppressed_violations=suppressed_violations,
         )
 
     async def run_critic(
@@ -421,6 +556,8 @@ class CriticAgent:
         temperature: float | None = None,
         strict_mode: bool = False,
         model_override: str | None = None,
+        session_id: str = "",
+        round_number: int = 0,
     ) -> CriticResult:
         try:
             import litellm  # noqa: F401
@@ -470,10 +607,11 @@ class CriticAgent:
         temp = 0.0 if temperature is None else temperature
         for attempt in range(max_retries + 1):
             try:
-                raw, response, model = self._llm_call(
+                raw, response, model = await asyncio.to_thread(
+                    self._llm_call,
                     messages,
-                    temperature=temp,
-                    model_override=model_override,
+                    temp,
+                    model_override,
                 )
                 telemetry = completion_telemetry(response, model=model)
                 context_window = MODEL_CONTEXT_WINDOWS.get(model)
@@ -532,7 +670,14 @@ class CriticAgent:
                     parse_error=str(exc),
                 )
             try:
-                return self._parse_critic_response(raw, valid_ids)
+                return self._parse_critic_response(
+                    raw,
+                    valid_ids,
+                    constraints=constraints,
+                    plan_content=plan_content,
+                    session_id=session_id,
+                    round_number=round_number,
+                )
             except CriticParseError as exc:
                 if strict_mode and attempt >= max_retries:
                     raise CriticContractError(f"Critic contract parse failure: {exc}") from exc
@@ -541,7 +686,8 @@ class CriticAgent:
                         {
                             "role": "user",
                             "content": (
-                                f"Formatting error: {exc}. Respond again with JSON first, then prose critique."
+                                f"Formatting error: {exc}. Respond again with JSON first, then prose critique. "
+                                "Important: hard_constraint_violations must be an array of constraint ID strings only."
                             ),
                         }
                     )

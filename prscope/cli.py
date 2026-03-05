@@ -1514,7 +1514,7 @@ def analytics(repo_name: str | None) -> None:
             confidence_trends.append(float(session.confidence_trend))
 
         metrics = store.get_round_metrics(session.id)
-        if session.status in {"converged", "approved", "exported"}:
+        if session.status in {"converged", "approved"}:
             rounds_to_convergence.append(session.current_round)
         for metric in metrics:
             total_rounds += 1

@@ -1,12 +1,8 @@
 export type SessionStatus =
-  | "created"
-  | "preparing"
-  | "discovering"
-  | "drafting"
+  | "draft"
   | "refining"
   | "converged"
   | "approved"
-  | "exported"
   | "error";
 
 export interface PlanningSession {
@@ -24,6 +20,7 @@ export interface PlanningSession {
   phase_message?: string | null;
   is_processing?: boolean;
   active_tool_calls?: ToolCallEntry[];
+  completed_tool_call_groups?: ToolCallEntry[][];
   created_at: string;
   updated_at: string;
   session_total_cost_usd?: number | null;
@@ -77,16 +74,26 @@ export interface ClarificationPrompt {
   question: string;
   context?: string;
   source?: string;
+  recommendations?: string[];
 }
 
 export interface ToolCallEntry {
-  id: number;
+  id: number | string;
   name: string;
   sessionStage?: string;
   path?: string;
   query?: string;
   status: "running" | "done";
   durationMs?: number;
+}
+
+export interface RoundMetric {
+  round: number;
+  major_issues?: number | null;
+  minor_issues?: number | null;
+  critic_confidence?: number | null;
+  convergence_score?: number | null;
+  call_cost_usd?: number | null;
 }
 
 export interface ModelCatalogItem {
@@ -114,6 +121,8 @@ export type UIEvent =
       current_round: number;
       pending_questions: DiscoveryQuestion[] | null;
       active_tool_calls: ToolCallEntry[];
+      completed_tool_call_groups: ToolCallEntry[][];
+      active_command_id?: string | null;
     }
   | {
       type: "tool_call";
@@ -121,12 +130,14 @@ export type UIEvent =
       path?: string;
       query?: string;
       session_stage?: string;
+      command_id?: string;
     }
   | {
       type: "tool_result";
       name: string;
       session_stage?: string;
       duration_ms?: number;
+      command_id?: string;
     }
   | {
       type: "context_compaction";
@@ -148,6 +159,12 @@ export type UIEvent =
       context_window_tokens?: number;
       context_usage_ratio?: number;
     }
-  | { type: "clarification_needed"; question: string; context?: string; source?: string }
+  | {
+      type: "clarification_needed";
+      question: string;
+      context?: string;
+      source?: string;
+      recommendations?: string[];
+    }
   | { type: "setup_progress"; step: string }
   | { type: "discovery_ready"; opening: string };

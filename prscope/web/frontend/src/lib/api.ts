@@ -5,6 +5,7 @@ import type {
   PlanningSession,
   PlanningTurn,
   RepoProfileSummary,
+  RoundMetric,
 } from "../types";
 
 const REPO_STORAGE_KEY = "prscope.web.repo";
@@ -14,6 +15,7 @@ export class ConflictError extends Error {
   status?: string;
   phase_message?: string | null;
   allowed_commands?: string[];
+  reason?: string;
 }
 
 function getRepoContext(): string | null {
@@ -108,6 +110,7 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
       const error = new ConflictError(detail || "Operation in progress");
       if (payload) {
         error.status = typeof payload.status === "string" ? payload.status : undefined;
+        error.reason = typeof payload.reason === "string" ? payload.reason : undefined;
         error.phase_message =
           payload.phase_message === null || typeof payload.phase_message === "string"
             ? (payload.phase_message as string | null)
@@ -157,6 +160,7 @@ export function getSession(sessionId: string) {
     plan_versions: PlanVersion[];
     current_plan: PlanVersion | null;
     tool_summary: { recent_tool_calls: string[] };
+    round_metrics?: RoundMetric[];
   }>(withRepoQuery(`/api/sessions/${sessionId}`));
 }
 
@@ -166,9 +170,9 @@ export function sendDiscoveryMessage(
   models?: { author_model?: string; critic_model?: string },
 ) {
   const command_id = crypto.randomUUID();
-  return request<{ result: DiscoveryTurnResult }>(`/api/sessions/${sessionId}/message`, {
+  return request<{ result?: DiscoveryTurnResult; accepted?: boolean; mode?: string }>(`/api/sessions/${sessionId}/command`, {
     method: "POST",
-    body: JSON.stringify({ message, command_id, ...models }),
+    body: JSON.stringify({ command: "message", command_id, message, ...models }),
   });
 }
 
@@ -179,12 +183,12 @@ export function runRound(
 ) {
   const command_id = crypto.randomUUID();
   return request<{
-    critic: Record<string, unknown>;
-    author: Record<string, unknown>;
-    convergence: { converged: boolean; reason: string; change_pct: number };
-  }>(`/api/sessions/${sessionId}/round`, {
+    status: string;
+    allowed_commands?: string[];
+    idempotent_replay?: boolean;
+  }>(`/api/sessions/${sessionId}/command`, {
     method: "POST",
-    body: JSON.stringify({ user_input, command_id, ...models }),
+    body: JSON.stringify({ command: "run_round", user_input, command_id, ...models }),
   });
 }
 
@@ -201,16 +205,17 @@ export function submitClarification(sessionId: string, answers: string[]) {
 
 export function approveSession(sessionId: string) {
   const command_id = crypto.randomUUID();
-  return request<{ approved: boolean }>(`/api/sessions/${sessionId}/approve`, {
+  return request<{ approved?: boolean; status?: string }>(`/api/sessions/${sessionId}/command`, {
     method: "POST",
-    body: JSON.stringify({ command_id }),
+    body: JSON.stringify({ command: "approve", command_id }),
   });
 }
 
 export function exportSession(sessionId: string) {
-  return request<{ files: Array<{ name: string; kind: string; url: string }> }>(`/api/sessions/${sessionId}/export`, {
+  const command_id = crypto.randomUUID();
+  return request<{ files: Array<{ name: string; kind: string; url: string }> }>(`/api/sessions/${sessionId}/command`, {
     method: "POST",
-    body: JSON.stringify({}),
+    body: JSON.stringify({ command: "export", command_id }),
   });
 }
 
@@ -233,11 +238,17 @@ export async function downloadFile(url: string, filename: string): Promise<void>
 }
 
 export function getDiff(sessionId: string) {
-  return request<{ diff: string }>(`/api/sessions/${sessionId}/diff`);
+  return request<{ diff: string }>(withRepoQuery(`/api/sessions/${sessionId}/diff`));
 }
 
 export function deleteSession(sessionId: string) {
   return request<{ deleted: boolean }>(`/api/sessions/${sessionId}`, {
     method: "DELETE",
+  });
+}
+
+export function stopSession(sessionId: string) {
+  return request<{ stopped: boolean; reason?: string }>(`/api/sessions/${sessionId}/stop`, {
+    method: "POST",
   });
 }

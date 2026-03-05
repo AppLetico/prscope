@@ -1,12 +1,244 @@
 @import "tailwindcss";
 @plugin "@tailwindcss/typography";
 
-:root {
-  font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
-  color: #f4f4f5; /* zinc-100 */
-  background: #09090b; /* zinc-950 */
+@theme {
+  --color-zinc-50: var(--theme-zinc-50);
+  --color-zinc-100: var(--theme-zinc-100);
+  --color-zinc-200: var(--theme-zinc-200);
+  --color-zinc-300: var(--theme-zinc-300);
+  --color-zinc-400: var(--theme-zinc-400);
+  --color-zinc-500: var(--theme-zinc-500);
+  --color-zinc-600: var(--theme-zinc-600);
+  --color-zinc-700: var(--theme-zinc-700);
+  --color-zinc-800: var(--theme-zinc-800);
+  --color-zinc-900: var(--theme-zinc-900);
+  --color-zinc-950: var(--theme-zinc-950);
+
+  --color-indigo-50: var(--theme-indigo-50);
+  --color-indigo-100: var(--theme-indigo-100);
+  --color-indigo-200: var(--theme-indigo-200);
+  --color-indigo-300: var(--theme-indigo-300);
+  --color-indigo-400: var(--theme-indigo-400);
+  --color-indigo-500: var(--theme-indigo-500);
+  --color-indigo-600: var(--theme-indigo-600);
+  --color-indigo-700: var(--theme-indigo-700);
+  --color-indigo-800: var(--theme-indigo-800);
+  --color-indigo-900: var(--theme-indigo-900);
+  --color-indigo-950: var(--theme-indigo-950);
+
+  --color-violet-50: var(--theme-violet-50);
+  --color-violet-100: var(--theme-violet-100);
+  --color-violet-200: var(--theme-violet-200);
+  --color-violet-300: var(--theme-violet-300);
+  --color-violet-400: var(--theme-violet-400);
+  --color-violet-500: var(--theme-violet-500);
+  --color-violet-600: var(--theme-violet-600);
+  --color-violet-700: var(--theme-violet-700);
+  --color-violet-800: var(--theme-violet-800);
+  --color-violet-900: var(--theme-violet-900);
+  --color-violet-950: var(--theme-violet-950);
+
+  --color-emerald-50: var(--theme-emerald-50);
+  --color-emerald-100: var(--theme-emerald-100);
+  --color-emerald-200: var(--theme-emerald-200);
+  --color-emerald-300: var(--theme-emerald-300);
+  --color-emerald-400: var(--theme-emerald-400);
+  --color-emerald-500: var(--theme-emerald-500);
+  --color-emerald-600: var(--theme-emerald-600);
+  --color-emerald-700: var(--theme-emerald-700);
+  --color-emerald-800: var(--theme-emerald-800);
+  --color-emerald-900: var(--theme-emerald-900);
+  --color-emerald-950: var(--theme-emerald-950);
+
+  --color-amber-50: var(--theme-amber-50);
+  --color-amber-100: var(--theme-amber-100);
+  --color-amber-200: var(--theme-amber-200);
+  --color-amber-300: var(--theme-amber-300);
+  --color-amber-400: var(--theme-amber-400);
+  --color-amber-500: var(--theme-amber-500);
+  --color-amber-600: var(--theme-amber-600);
+  --color-amber-700: var(--theme-amber-700);
+  --color-amber-800: var(--theme-amber-800);
+  --color-amber-900: var(--theme-amber-900);
+  --color-amber-950: var(--theme-amber-950);
+
+  --color-rose-50: var(--theme-rose-50);
+  --color-rose-100: var(--theme-rose-100);
+  --color-rose-200: var(--theme-rose-200);
+  --color-rose-300: var(--theme-rose-300);
+  --color-rose-400: var(--theme-rose-400);
+  --color-rose-500: var(--theme-rose-500);
+  --color-rose-600: var(--theme-rose-600);
+  --color-rose-700: var(--theme-rose-700);
+  --color-rose-800: var(--theme-rose-800);
+  --color-rose-900: var(--theme-rose-900);
+  --color-rose-950: var(--theme-rose-950);
 }
 
+:root {
+  font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  color: var(--color-zinc-100);
+  background: var(--color-zinc-950);
+
+  --theme-zinc-50: #fafafa;
+  --theme-zinc-100: #f4f4f5;
+  --theme-zinc-200: #e4e4e7;
+  --theme-zinc-300: #d4d4d8;
+  --theme-zinc-400: #a1a1aa;
+  --theme-zinc-500: #71717a;
+  --theme-zinc-600: #52525b;
+  --theme-zinc-700: #3f3f46;
+  --theme-zinc-800: #27272a;
+  --theme-zinc-900: #18181b;
+  --theme-zinc-950: #09090b;
+
+  --theme-indigo-50: #eef2ff;
+  --theme-indigo-100: #e0e7ff;
+  --theme-indigo-200: #c7d2fe;
+  --theme-indigo-300: #a5b4fc;
+  --theme-indigo-400: #818cf8;
+  --theme-indigo-500: #6366f1;
+  --theme-indigo-600: #4f46e5;
+  --theme-indigo-700: #4338ca;
+  --theme-indigo-800: #3730a3;
+  --theme-indigo-900: #312e81;
+  --theme-indigo-950: #1e1b4b;
+
+  --theme-violet-50: #f5f3ff;
+  --theme-violet-100: #ede9fe;
+  --theme-violet-200: #ddd6fe;
+  --theme-violet-300: #c4b5fd;
+  --theme-violet-400: #a78bfa;
+  --theme-violet-500: #8b5cf6;
+  --theme-violet-600: #7c3aed;
+  --theme-violet-700: #6d28d9;
+  --theme-violet-800: #5b21b6;
+  --theme-violet-900: #4c1d95;
+  --theme-violet-950: #2e1065;
+
+  --theme-emerald-50: #ecfdf5;
+  --theme-emerald-100: #d1fae5;
+  --theme-emerald-200: #a7f3d0;
+  --theme-emerald-300: #6ee7b7;
+  --theme-emerald-400: #34d399;
+  --theme-emerald-500: #10b981;
+  --theme-emerald-600: #059669;
+  --theme-emerald-700: #047857;
+  --theme-emerald-800: #065f46;
+  --theme-emerald-900: #064e3b;
+  --theme-emerald-950: #022c22;
+
+  --theme-amber-50: #fffbeb;
+  --theme-amber-100: #fef3c7;
+  --theme-amber-200: #fde68a;
+  --theme-amber-300: #fcd34d;
+  --theme-amber-400: #fbbf24;
+  --theme-amber-500: #f59e0b;
+  --theme-amber-600: #d97706;
+  --theme-amber-700: #b45309;
+  --theme-amber-800: #92400e;
+  --theme-amber-900: #78350f;
+  --theme-amber-950: #451a03;
+
+  --theme-rose-50: #fff1f2;
+  --theme-rose-100: #ffe4e6;
+  --theme-rose-200: #fecdd3;
+  --theme-rose-300: #fda4af;
+  --theme-rose-400: #fb7185;
+  --theme-rose-500: #f43f5e;
+  --theme-rose-600: #e11d48;
+  --theme-rose-700: #be123c;
+  --theme-rose-800: #9f1239;
+  --theme-rose-900: #881337;
+  --theme-rose-950: #4c0519;
+}
+
+.light {
+  --theme-zinc-50: #09090b;
+  --theme-zinc-100: #18181b;
+  --theme-zinc-200: #27272a;
+  --theme-zinc-300: #3f3f46;
+  --theme-zinc-400: #52525b;
+  --theme-zinc-500: #71717a;
+  --theme-zinc-600: #a1a1aa;
+  --theme-zinc-700: #d4d4d8;
+  --theme-zinc-800: #e4e4e7;
+  --theme-zinc-900: #ffffff;
+  --theme-zinc-950: #f4f4f5;
+
+  --theme-indigo-50: #1e1b4b;
+  --theme-indigo-100: #312e81;
+  --theme-indigo-200: #3730a3;
+  --theme-indigo-300: #4338ca;
+  --theme-indigo-400: #4f46e5;
+  --theme-indigo-500: #6366f1;
+  --theme-indigo-600: #818cf8;
+  --theme-indigo-700: #a5b4fc;
+  --theme-indigo-800: #c7d2fe;
+  --theme-indigo-900: #e0e7ff;
+  --theme-indigo-950: #eef2ff;
+
+  --theme-violet-50: #2e1065;
+  --theme-violet-100: #4c1d95;
+  --theme-violet-200: #5b21b6;
+  --theme-violet-300: #6d28d9;
+  --theme-violet-400: #7c3aed;
+  --theme-violet-500: #8b5cf6;
+  --theme-violet-600: #a78bfa;
+  --theme-violet-700: #c4b5fd;
+  --theme-violet-800: #ddd6fe;
+  --theme-violet-900: #ede9fe;
+  --theme-violet-950: #f5f3ff;
+
+  --theme-emerald-50: #022c22;
+  --theme-emerald-100: #064e3b;
+  --theme-emerald-200: #065f46;
+  --theme-emerald-300: #047857;
+  --theme-emerald-400: #059669;
+  --theme-emerald-500: #10b981;
+  --theme-emerald-600: #34d399;
+  --theme-emerald-700: #6ee7b7;
+  --theme-emerald-800: #a7f3d0;
+  --theme-emerald-900: #d1fae5;
+  --theme-emerald-950: #ecfdf5;
+
+  --theme-amber-50: #451a03;
+  --theme-amber-100: #78350f;
+  --theme-amber-200: #92400e;
+  --theme-amber-300: #b45309;
+  --theme-amber-400: #d97706;
+  --theme-amber-500: #f59e0b;
+  --theme-amber-600: #fbbf24;
+  --theme-amber-700: #fcd34d;
+  --theme-amber-800: #fde68a;
+  --theme-amber-900: #fef3c7;
+  --theme-amber-950: #fffbeb;
+
+  --theme-rose-50: #4c0519;
+  --theme-rose-100: #881337;
+  --theme-rose-200: #9f1239;
+  --theme-rose-300: #be123c;
+  --theme-rose-400: #e11d48;
+  --theme-rose-500: #f43f5e;
+  --theme-rose-600: #fb7185;
+  --theme-rose-700: #fda4af;
+  --theme-rose-800: #fecdd3;
+  --theme-rose-900: #ffe4e6;
+  --theme-rose-950: #fff1f2;
+}
+
+.chat-input-container {
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6), 0 2px 8px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+.chat-input-container:focus-within {
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.6), 0 2px 8px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(99, 102, 241, 0.2), inset 0 1px 0 rgba(255, 255, 255, 0.05);
+}
+.light .chat-input-container {
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.08), 0 2px 8px rgba(0, 0, 0, 0.04), inset 0 1px 0 rgba(255, 255, 255, 0.5);
+}
+.light .chat-input-container:focus-within {
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.08), 0 2px 8px rgba(0, 0, 0, 0.04), 0 0 0 1px rgba(99, 102, 241, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.5);
+}
 * {
   box-sizing: border-box;
 }
@@ -21,7 +253,7 @@ body,
 }
 
 body {
-  background-color: #09090b; /* zinc-950 */
+  background-color: var(--color-zinc-950);
 }
 
 /* Custom Scrollbars for Dark Theme */
@@ -33,11 +265,11 @@ body {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #3f3f46; /* zinc-700 */
+  background: var(--color-zinc-700);
   border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #52525b; /* zinc-600 */
+  background: var(--color-zinc-600);
 }
 
 /* Typography Overrides */
@@ -55,32 +287,48 @@ body {
   margin-top: 2em;
 }
 .prose a {
-  color: #818cf8; /* indigo-400 */
+  color: var(--color-indigo-400);
   text-decoration: none;
 }
 .prose a:hover {
   text-decoration: underline;
 }
 .prose code {
-  color: #e4e4e7; /* zinc-200 */
-  background-color: #27272a; /* zinc-800 */
+  color: var(--color-zinc-200);
+  background-color: var(--color-zinc-800);
   padding: 0.2em 0.4em;
   border-radius: 0.25rem;
   font-size: 0.875em;
 }
 .prose pre {
-  background-color: #18181b; /* zinc-900 */
-  border: 1px solid #27272a; /* zinc-800 */
+  background-color: var(--color-zinc-900);
+  border: 1px solid var(--color-zinc-800);
+}
+/* Reset inline-code styles for code inside pre so the padding/background
+   from .prose code doesn't add a phantom leading space to block code. */
+.prose pre code {
+  padding: 0;
+  background: none;
+  border-radius: 0;
+  font-size: 1em;
+  color: inherit;
+}
+
+/* Remove Tailwind Typography's backtick decorations from ALL code elements. */
+.prose code::before,
+.prose code::after,
+.prose pre code::before,
+.prose pre code::after {
+  content: none;
 }
 
 /* Chat message content: better hierarchy and spacing for long responses */
 .chat-message-prose {
-  --tw-prose-body: #e4e4e7;
-  --tw-prose-headings: #f4f4f5;
-  --tw-prose-links: #818cf8;
-  --tw-prose-code: #e4e4e7;
+  --tw-prose-body: var(--color-zinc-200);
+  --tw-prose-headings: var(--color-zinc-100);
+  --tw-prose-links: var(--color-indigo-400);
+  --tw-prose-code: var(--color-zinc-200);
 }
-.chat-message-prose h1,
 .chat-message-prose h2,
 .chat-message-prose h3 {
   font-weight: 600;
@@ -88,57 +336,97 @@ body {
   margin-bottom: 0.5em;
 }
 .chat-message-prose h1 { font-size: 1.125rem; line-height: 1.5; margin-top: 0; }
-.chat-message-prose h2 { font-size: 1rem; line-height: 1.5; margin-top: 1em; }
-.chat-message-prose h3 { font-size: 0.9375rem; line-height: 1.5; margin-top: 0.75em; }
+.chat-message-prose h2 { font-size: 1rem; line-height: 1.5; margin-top: 1.25em; color: var(--color-zinc-100); }
+.chat-message-prose h3 { font-size: 0.9375rem; line-height: 1.5; margin-top: 1em; color: var(--color-zinc-200); }
 .chat-message-prose p {
-  margin-top: 0.5em;
-  margin-bottom: 0.5em;
-  line-height: 1.625;
+  margin-top: 0.6em;
+  margin-bottom: 0.6em;
+  line-height: 1.7;
 }
-.chat-message-prose p:first-child { margin-top: 0; }
 .chat-message-prose p:last-child { margin-bottom: 0; }
 .chat-message-prose ul,
 .chat-message-prose ol {
-  margin-top: 0.75em;
-  margin-bottom: 0.75em;
+  margin-top: 0.6em;
+  margin-bottom: 0.6em;
   padding-left: 1.5rem;
-  line-height: 1.6;
+  line-height: 1.65;
 }
 .chat-message-prose li {
-  margin-top: 0.375em;
-  margin-bottom: 0.375em;
+  margin-top: 0.3em;
+  margin-bottom: 0.3em;
 }
 .chat-message-prose li > p { margin: 0; }
-.chat-message-prose ol {
-  list-style-type: decimal;
-}
-.chat-message-prose ul {
-  list-style-type: disc;
-}
+.chat-message-prose ol { list-style-type: decimal; }
+.chat-message-prose ul { list-style-type: disc; }
+
+/* Inline code */
 .chat-message-prose code {
   font-size: 0.8125rem;
-  padding: 0.15em 0.35em;
+  padding: 0.15em 0.4em;
   border-radius: 0.25rem;
-  background-color: #27272a;
-  color: #e4e4e7;
+  background-color: var(--color-zinc-800);
+  color: var(--color-violet-300);
+  font-weight: 400;
 }
+.chat-message-prose code::before,
+.chat-message-prose code::after {
+  content: none !important;
+}
+
+/* Block code: the custom <pre> component renders a div wrapper; the
+   SyntaxHighlighter renders its own <pre> inside. Reset prose pre defaults
+   on that inner <pre> so we don't get a double border or double background. */
+.chat-message-prose div > pre {
+  background: transparent;
+  border: none;
+  padding: 0;
+  margin: 0;
+  border-radius: 0;
+}
+.chat-message-prose div > pre code {
+  padding: 0;
+  background: none;
+  border-radius: 0;
+  font-size: inherit;
+  color: inherit;
+}
+
+/* Bare pre (unprocessed fenced blocks) */
 .chat-message-prose pre {
   margin-top: 0.75em;
   margin-bottom: 0.75em;
   padding: 0.75rem 1rem;
   border-radius: 0.5rem;
   overflow-x: auto;
+  background-color: var(--color-zinc-900);
+  border: 1px solid var(--color-zinc-800);
 }
 .chat-message-prose pre code {
   padding: 0;
   background: none;
   font-size: 0.8125rem;
+  color: inherit;
 }
-.chat-message-prose strong { font-weight: 600; color: #f4f4f5; }
+.chat-message-prose pre code::before,
+.chat-message-prose pre code::after {
+  content: none;
+}
+
+/* Blockquote */
+.chat-message-prose blockquote {
+  border-left: 3px solid var(--color-indigo-500);
+  padding-left: 1rem;
+  margin: 0.75em 0;
+  color: var(--color-zinc-400);
+  font-style: normal;
+}
+
+.chat-message-prose strong { font-weight: 600; color: var(--color-zinc-100); }
+.chat-message-prose em { color: var(--color-zinc-300); }
 .chat-message-prose hr {
   margin-top: 1em;
   margin-bottom: 1em;
-  border-color: #3f3f46;
+  border-color: var(--color-zinc-700);
 }
 
 .llm-status-glow {
@@ -184,6 +472,17 @@ body {
     llm-status-text-sweep 2.8s linear infinite;
 }
 
+.light .llm-status-motion {
+  background-image: linear-gradient(
+    110deg,
+    rgba(63, 63, 70, 0.88) 0%,
+    rgba(79, 70, 229, 0.92) 24%,
+    rgba(0, 0, 0, 1) 48%,
+    rgba(67, 56, 202, 0.9) 68%,
+    rgba(63, 63, 70, 0.88) 100%
+  );
+}
+
 @keyframes llm-status-text-sweep {
   from {
     background-position: 0% 50%;
@@ -191,4 +490,69 @@ body {
   to {
     background-position: 220% 50%;
   }
+}
+
+/* Override Tailwind Typography's prose-zinc and prose-invert to use our CSS variables */
+
+.prose-zinc {
+  --tw-prose-body: var(--color-zinc-300);
+  --tw-prose-headings: var(--color-zinc-50);
+  --tw-prose-lead: var(--color-zinc-400);
+  --tw-prose-links: var(--color-zinc-50);
+  --tw-prose-bold: var(--color-zinc-50);
+  --tw-prose-counters: var(--color-zinc-400);
+  --tw-prose-bullets: var(--color-zinc-600);
+  --tw-prose-hr: var(--color-zinc-700);
+  --tw-prose-quotes: var(--color-zinc-100);
+  --tw-prose-quote-borders: var(--color-zinc-700);
+  --tw-prose-captions: var(--color-zinc-400);
+  --tw-prose-kbd: var(--color-zinc-50);
+  --tw-prose-kbd-shadows: var(--color-zinc-50);
+  --tw-prose-code: var(--color-zinc-50);
+  --tw-prose-pre-code: var(--color-zinc-300);
+  --tw-prose-pre-bg: var(--color-zinc-900);
+  --tw-prose-th-borders: var(--color-zinc-600);
+  --tw-prose-td-borders: var(--color-zinc-700);
+}
+
+.prose-invert {
+  --tw-prose-invert-body: var(--color-zinc-300);
+  --tw-prose-invert-headings: var(--color-zinc-50);
+  --tw-prose-invert-lead: var(--color-zinc-400);
+  --tw-prose-invert-links: var(--color-zinc-50);
+  --tw-prose-invert-bold: var(--color-zinc-50);
+  --tw-prose-invert-counters: var(--color-zinc-400);
+  --tw-prose-invert-bullets: var(--color-zinc-600);
+  --tw-prose-invert-hr: var(--color-zinc-700);
+  --tw-prose-invert-quotes: var(--color-zinc-100);
+  --tw-prose-invert-quote-borders: var(--color-zinc-700);
+  --tw-prose-invert-captions: var(--color-zinc-400);
+  --tw-prose-invert-kbd: var(--color-zinc-50);
+  --tw-prose-invert-kbd-shadows: var(--color-zinc-50);
+  --tw-prose-invert-code: var(--color-zinc-50);
+  --tw-prose-invert-pre-code: var(--color-zinc-300);
+  --tw-prose-invert-pre-bg: var(--color-zinc-900);
+  --tw-prose-invert-th-borders: var(--color-zinc-600);
+  --tw-prose-invert-td-borders: var(--color-zinc-700);
+}
+
+.light .prose-invert {
+  --tw-prose-invert-body: var(--color-zinc-700);
+  --tw-prose-invert-headings: var(--color-zinc-900);
+  --tw-prose-invert-lead: var(--color-zinc-600);
+  --tw-prose-invert-links: var(--color-zinc-900);
+  --tw-prose-invert-bold: var(--color-zinc-900);
+  --tw-prose-invert-counters: var(--color-zinc-500);
+  --tw-prose-invert-bullets: var(--color-zinc-300);
+  --tw-prose-invert-hr: var(--color-zinc-200);
+  --tw-prose-invert-quotes: var(--color-zinc-900);
+  --tw-prose-invert-quote-borders: var(--color-zinc-200);
+  --tw-prose-invert-captions: var(--color-zinc-500);
+  --tw-prose-invert-kbd: var(--color-zinc-900);
+  --tw-prose-invert-kbd-shadows: var(--color-zinc-900);
+  --tw-prose-invert-code: var(--color-zinc-900);
+  --tw-prose-invert-pre-code: var(--color-zinc-200);
+  --tw-prose-invert-pre-bg: var(--color-zinc-800);
+  --tw-prose-invert-th-borders: var(--color-zinc-300);
+  --tw-prose-invert-td-borders: var(--color-zinc-200);
 }

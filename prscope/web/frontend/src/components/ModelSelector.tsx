@@ -17,9 +17,10 @@ interface ModelSelectorProps {
   label: string;
   icon?: React.ReactNode;
   className?: string;
+  dropUp?: boolean;
 }
 
-export function ModelSelector({ value, onChange, options, label, icon, className }: ModelSelectorProps) {
+export function ModelSelector({ value, onChange, options, label, icon, className, dropUp = false }: ModelSelectorProps) {
   const [isOpen, setIsOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
 
@@ -45,12 +46,12 @@ export function ModelSelector({ value, onChange, options, label, icon, className
   }, {} as Record<string, ModelOption[]>);
 
   return (
-    <div className="relative" ref={containerRef}>
+    <div className="relative min-w-0 shrink" ref={containerRef}>
       <button
         onClick={() => setIsOpen(!isOpen)}
         className={clsx(
           "flex items-center gap-2 h-8 px-2.5 rounded-md transition-all duration-200",
-          "text-xs font-medium focus:outline-none",
+          "text-xs font-medium focus:outline-none min-w-0",
           isOpen 
             ? "bg-zinc-800 text-zinc-100 shadow-inner" 
             : "text-zinc-400 hover:text-zinc-200",
@@ -59,9 +60,9 @@ export function ModelSelector({ value, onChange, options, label, icon, className
         title={`${label} model`}
       >
         {icon && <span className={clsx("shrink-0", isOpen ? "text-indigo-400" : "text-zinc-500")}>{icon}</span>}
-        <div className="flex flex-col items-start leading-none text-left">
+        <div className="flex flex-col items-start leading-none text-left min-w-0">
           <span className="text-[8px] text-zinc-500 uppercase tracking-wider font-semibold mb-0.5">{label}</span>
-          <span className="truncate max-w-[110px] text-[10px] font-mono">
+          <span className="truncate max-w-[80px] sm:max-w-[110px] text-[10px] font-mono">
             {selectedOption ? selectedOption.model_id : value || "Select model"}
           </span>
         </div>
@@ -69,10 +70,15 @@ export function ModelSelector({ value, onChange, options, label, icon, className
       </button>
 
       {isOpen && (
-        <div className="absolute top-full right-0 mt-2 w-72 max-h-[400px] overflow-y-auto bg-zinc-900/95 backdrop-blur-xl border border-zinc-800 rounded-lg shadow-2xl shadow-black/50 z-50 py-1.5 origin-top-right animate-in fade-in zoom-in-95 duration-100">
+        <div className={clsx(
+          "absolute left-0 w-72 max-h-[400px] overflow-y-auto bg-zinc-900/95 backdrop-blur-xl border border-zinc-800 rounded-lg shadow-2xl shadow-black/50 z-50 py-1.5 animate-in fade-in zoom-in-95 duration-100",
+          dropUp
+            ? "bottom-full mb-2 origin-bottom-left"
+            : "top-full mt-2 origin-top-right"
+        )}>
           {Object.entries(groupedOptions).map(([provider, providerOptions]) => (
             <div key={provider} className="mb-2 last:mb-0">
-              <div className="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider text-zinc-500 bg-zinc-900/90 sticky top-0 backdrop-blur-md z-10 border-b border-zinc-800/50">
+              <div className="px-3 py-1.5 text-[10px] font-bold uppercase tracking-wider text-zinc-500 bg-zinc-900/90 sticky top-0 backdrop-blur-md z-10 border-b border-zinc-800">
                 {provider}
               </div>
               <div className="flex flex-col py-1">

@@ -1,5 +1,7 @@
 # CI check
 
+For the prscope project do the following:
+
 Run lint and type checks (and optionally full CI) on the repo; fix any reported issues.
 
 ## Quick (lint + typecheck only, no tests)

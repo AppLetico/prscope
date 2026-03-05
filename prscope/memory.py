@@ -8,7 +8,7 @@ import asyncio
 import json
 import logging
 from collections.abc import Awaitable
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -57,6 +57,7 @@ class ParsedConstraint:
     severity: str = "hard"
     optional: bool = False
     extends: str | None = None
+    evidence_keywords: list[str] = field(default_factory=list)
 
 
 def load_skills(skills_dir: Path, max_chars: int) -> str:
@@ -181,6 +182,10 @@ class MemoryStore:
             severity = str(item.get("severity", "hard")).strip().lower()
             if severity not in {"hard", "soft"}:
                 severity = "hard"
+            raw_keywords = item.get("evidence_keywords", [])
+            evidence_keywords: list[str] = (
+                [str(k).strip() for k in raw_keywords if str(k).strip()] if isinstance(raw_keywords, list) else []
+            )
             parsed.append(
                 ParsedConstraint(
                     id=constraint_id,
@@ -188,6 +193,7 @@ class MemoryStore:
                     severity=severity,
                     optional=bool(item.get("optional", False)),
                     extends=str(extends_value) if extends_value else None,
+                    evidence_keywords=evidence_keywords,
                 )
             )
 

@@ -14,6 +14,8 @@ import { ArrowLeft, MessageSquare, FileText, Loader2 } from "lucide-react";
 import { clsx } from "clsx";
 import type { ModelCatalogItem, RepoProfileSummary } from "../types";
 
+import { ThemeToggle } from "../components/ThemeToggle";
+
 export function NewSessionPage() {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -133,27 +135,30 @@ export function NewSessionPage() {
 
   return (
     <main className="max-w-2xl mx-auto mt-16 px-6 pb-24">
-      <div className="mb-8">
-        <Link to="/" className="inline-flex items-center text-sm text-zinc-500 hover:text-zinc-300 transition-colors mb-6">
-          <ArrowLeft className="w-4 h-4 mr-1" />
-          Back to sessions
-        </Link>
-        <div className="flex items-center gap-4">
-          <img src="/logo.svg" alt="prscope" className="w-10 h-10 rounded-xl shadow-sm" />
-          <div>
-            <h1 className="text-3xl font-semibold tracking-tight text-zinc-100">New Plan</h1>
-            <p className="text-zinc-500 mt-2">Start a new planning session to scope out your next feature.</p>
-            {!activeRepo ? (
-              <p className="text-zinc-600 text-sm mt-2">
-                No explicit repo selected. Auto-detection is enabled.
-              </p>
-            ) : (
-              <p className="text-zinc-600 text-sm mt-2">
-                Repo: <span className="font-mono">{activeRepo}</span>
-              </p>
-            )}
+      <div className="mb-8 flex justify-between items-start">
+        <div>
+          <Link to="/" className="inline-flex items-center text-sm text-zinc-500 hover:text-zinc-300 transition-colors mb-6">
+            <ArrowLeft className="w-4 h-4 mr-1" />
+            Back to sessions
+          </Link>
+          <div className="flex items-center gap-4">
+            <img src="/logo.svg" alt="prscope" className="w-10 h-10 rounded-xl shadow-sm" />
+            <div>
+              <h1 className="text-3xl font-semibold tracking-tight text-zinc-100">New Plan</h1>
+              <p className="text-zinc-500 mt-2">Start a new planning session to scope out your next feature.</p>
+              {!activeRepo ? (
+                <p className="text-zinc-600 text-sm mt-2">
+                  No explicit repo selected. Auto-detection is enabled.
+                </p>
+              ) : (
+                <p className="text-zinc-600 text-sm mt-2">
+                  Repo: <span className="font-mono">{activeRepo}</span>
+                </p>
+              )}
+            </div>
           </div>
         </div>
+        <ThemeToggle />
       </div>
 
       <div className="space-y-8">
@@ -193,7 +198,7 @@ export function NewSessionPage() {
             <select
               value={activeRepo ?? ""}
               onChange={(event) => handleRepoChange(event.target.value || null)}
-              className="h-9 rounded-md border border-zinc-800 bg-zinc-950 px-2 text-zinc-200"
+              className="h-9 rounded-md border border-zinc-800 bg-zinc-900 px-2 text-zinc-200"
             >
               <option value="">
                 {cwd ? `Auto-detect (${cwd.name})` : "Auto-detect (current working directory)"}
@@ -210,7 +215,7 @@ export function NewSessionPage() {
             <select
               value={authorModel}
               onChange={(event) => setAuthorModel(event.target.value)}
-              className="h-9 rounded-md border border-zinc-800 bg-zinc-950 px-2 text-zinc-200"
+              className="h-9 rounded-md border border-zinc-800 bg-zinc-900 px-2 text-zinc-200"
             >
               {models.map((model) => (
                 <option
@@ -229,7 +234,7 @@ export function NewSessionPage() {
             <select
               value={criticModel}
               onChange={(event) => setCriticModel(event.target.value)}
-              className="h-9 rounded-md border border-zinc-800 bg-zinc-950 px-2 text-zinc-200"
+              className="h-9 rounded-md border border-zinc-800 bg-zinc-900 px-2 text-zinc-200"
             >
               {models.map((model) => (
                 <option
@@ -245,7 +250,7 @@ export function NewSessionPage() {
           </label>
         </div>
 
-        <div className="bg-zinc-900/30 border border-zinc-800/50 rounded-xl p-6 shadow-sm">
+        <div className="bg-zinc-900/30 border border-zinc-800 rounded-xl p-6 shadow-sm">
           {mode === "chat" ? (
             <div className="py-8 text-center flex flex-col items-center">
               <div className="w-12 h-12 bg-indigo-500/10 rounded-full flex items-center justify-center mb-4">
@@ -266,7 +271,7 @@ export function NewSessionPage() {
               </div>
               <textarea
                 ref={inputRef}
-                className="w-full min-h-[200px] p-4 rounded-lg border border-zinc-800 bg-zinc-950 text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 focus:border-transparent transition-all resize-y font-mono text-sm leading-relaxed"
+                className="w-full min-h-[200px] p-4 rounded-lg border border-zinc-800 bg-zinc-900 text-zinc-100 placeholder:text-zinc-600 focus:outline-none focus:ring-2 focus:ring-indigo-500/50 focus:border-transparent transition-all resize-y font-mono text-sm leading-relaxed"
                 placeholder="Describe the feature, bug fix, or refactor you want to plan..."
                 value={requirements}
                 onChange={(e) => setRequirements(e.target.value)}
@@ -281,7 +286,7 @@ export function NewSessionPage() {
             </div>
           ) : null}
 
-          <div className="mt-8 flex items-center justify-between border-t border-zinc-800/50 pt-6">
+          <div className="mt-8 flex items-center justify-between border-t border-zinc-800 pt-6">
             <div className="text-xs text-zinc-500 flex items-center gap-1">
               {mode === "requirements" && (
                 <>Press <kbd className="px-1.5 py-0.5 rounded bg-zinc-800 border border-zinc-700 font-mono text-[10px]">⌘</kbd> <kbd className="px-1.5 py-0.5 rounded bg-zinc-800 border border-zinc-700 font-mono text-[10px]">↵</kbd> to start</>

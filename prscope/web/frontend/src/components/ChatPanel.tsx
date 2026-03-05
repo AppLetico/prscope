@@ -2,10 +2,21 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import type { ClarificationPrompt, DiscoveryQuestion, PlanningTurn, ToolCallEntry } from "../types";
 import { OptionButtons } from "./OptionButtons";
 import { ToolCallStream } from "./ToolCallStream";
-import { Send, ArrowDown, Bot, User, Sparkles, Copy, Check } from "lucide-react";
+import { ModelSelector } from "./ModelSelector";
+import { Send, ArrowDown, Bot, User, Sparkles, BrainCircuit, RefreshCw, CheckCircle2, Copy, Check, Square, Loader2 } from "lucide-react";
 import { clsx } from "clsx";
 import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 import { Tooltip } from "./ui/Tooltip";
+import { chatMarkdownComponents } from "../lib/markdownComponents";
+import { extractFirstJsonObject, hasRunningToolCalls } from "./chatPanelUtils";
+
+interface ModelOption {
+  model_id: string;
+  provider: string;
+  available: boolean;
+  unavailable_reason?: string | null;
+}
 
 interface ChatPanelProps {
   turns: PlanningTurn[];
@@ -16,49 +27,31 @@ interface ChatPanelProps {
   phaseMessage?: string | null;
   warnings: string[];
   pendingClarification: ClarificationPrompt | null;
-  showCritiquePrompt: boolean;
   inputDisabled?: boolean;
+  isProcessing?: boolean;
+  authorModel?: string;
+  criticModel?: string;
+  modelOptions?: ModelOption[];
+  onAuthorModelChange?: (modelId: string) => void;
+  onCriticModelChange?: (modelId: string) => void;
+  canCritique?: boolean;
+  canApprove?: boolean;
+  critiquePending?: boolean;
+  contextPercent?: number | null;
+  contextWindowTokens?: number | null;
+  onCritique?: () => void;
+  onApprove?: () => void;
+  onStop?: () => void;
   onSubmit: (text: string) => Promise<void>;
-  onCritique: () => Promise<void> | void;
   onSubmitClarification: (answer: string) => Promise<void>;
 }
 
-function extractFirstJsonObject(raw: string): { parsed: Record<string, unknown>; start: number; end: number } | null {
-  const start = raw.indexOf("{");
-  if (start < 0) return null;
-  let depth = 0;
-  let inString = false;
-  let escaped = false;
-  for (let idx = start; idx < raw.length; idx += 1) {
-    const ch = raw[idx];
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (ch === "\\") {
-      escaped = true;
-      continue;
-    }
-    if (ch === "\"") {
-      inString = !inString;
-      continue;
-    }
-    if (inString) continue;
-    if (ch === "{") depth += 1;
-    if (ch === "}") {
-      depth -= 1;
-      if (depth === 0) {
-        const candidate = raw.slice(start, idx + 1);
-        try {
-          const parsed = JSON.parse(candidate) as Record<string, unknown>;
-          return { parsed, start, end: idx + 1 };
-        } catch {
-          return null;
-        }
-      }
-    }
-  }
-  return null;
+function isDiscoveryQuestionBlock(content: string): boolean {
+  const normalized = content.trim();
+  if (!normalized) return false;
+  const hasQuestionHeader = /(^|\n)\s*(Q\s*\d+|Question\s+\d+|\d+)\s*[:.)-]\s+/i.test(normalized);
+  const hasOptions = /(^|\n)\s*(?:[-*]\s*)?[A-D][).:-]\s+/im.test(normalized);
+  return hasQuestionHeader && hasOptions;
 }
 
 export function ChatPanel({
@@ -70,15 +63,29 @@ export function ChatPanel({
   phaseMessage = null,
   warnings,
   pendingClarification,
-  showCritiquePrompt,
   inputDisabled = false,
-  onSubmit,
+  isProcessing = false,
+  authorModel,
+  criticModel,
+  modelOptions = [],
+  onAuthorModelChange,
+  onCriticModelChange,
+  canCritique = false,
+  canApprove = false,
+  critiquePending = false,
+  contextPercent = null,
+  contextWindowTokens = null,
   onCritique,
+  onApprove,
+  onStop,
+  onSubmit,
   onSubmitClarification,
 }: ChatPanelProps) {
   const [input, setInput] = useState("");
   const [optimisticUserMessage, setOptimisticUserMessage] = useState<string | null>(null);
   const [clarificationInput, setClarificationInput] = useState("");
+  const [selectedClarificationRecommendation, setSelectedClarificationRecommendation] = useState<string | null>(null);
+  const [useCustomClarification, setUseCustomClarification] = useState(false);
   const [selectedAnswers, setSelectedAnswers] = useState<Record<number, string>>({});
   const [selectedIsOther, setSelectedIsOther] = useState<Record<number, boolean>>({});
   const [otherInputs, setOtherInputs] = useState<Record<number, string>>({});
@@ -198,6 +205,12 @@ export function ChatPanel({
     };
   }, [thinkingMessage]);
 
+  useEffect(() => {
+    setClarificationInput("");
+    setSelectedClarificationRecommendation(null);
+    setUseCustomClarification(false);
+  }, [pendingClarification?.question, pendingClarification?.context, pendingClarification?.source]);
+
   // Handle resize events to recalculate scroll anchoring
   useEffect(() => {
     const handleResize = () => {
@@ -299,15 +312,44 @@ export function ChatPanel({
     return raw;
   };
 
-  const warningSummary = warnings.reduce<Array<{ message: string; count: number }>>((acc, message) => {
-    const existing = acc.find((item) => item.message === message);
+  const warningSummary = warnings
+    .filter((message) => {
+      if (!pendingClarification) return true;
+      const normalized = message.toLowerCase();
+      // Clarification card is the primary UX; suppress duplicate clarification warnings.
+      return !normalized.includes("clarification");
+    })
+    .reduce<Array<{ message: string; count: number }>>((acc, message) => {
+      const existing = acc.find((item) => item.message === message);
     if (existing) {
       existing.count += 1;
     } else {
       acc.push({ message, count: 1 });
     }
     return acc;
-  }, []);
+    }, []);
+  const clarificationRecommendations = useMemo(() => {
+    if (!pendingClarification) return [];
+    if (pendingClarification.recommendations && pendingClarification.recommendations.length > 0) {
+      return pendingClarification.recommendations.slice(0, 5);
+    }
+    const question = pendingClarification.question.toLowerCase();
+    if (question.includes("rate limit") || question.includes("rate limiting") || question.includes("auth")) {
+      return [
+        "Keep it public, no endpoint-specific rate limit",
+        "Keep it public, rely on gateway/global rate limiting",
+        "Require auth and add endpoint-level rate limiting",
+      ];
+    }
+    if (question.startsWith("is ") || question.startsWith("are ") || question.startsWith("should ")) {
+      return ["Yes", "No", "Depends / partially"];
+    }
+    return ["Keep current approach", "Adjust scope", "Need more context"];
+  }, [pendingClarification]);
+  const clarificationAnswer = useMemo(() => {
+    if (useCustomClarification) return clarificationInput.trim();
+    return selectedClarificationRecommendation ?? clarificationInput.trim();
+  }, [clarificationInput, selectedClarificationRecommendation, useCustomClarification]);
   const showSubmittingStatus = submittingAnswers && !phaseMessage;
   const animatedThinkingMessage = useMemo(() => {
     if (!thinkingMessage) return null;
@@ -321,30 +363,25 @@ export function ChatPanel({
     ];
     return activityPhrases[(thinkingStatusTick - 1) % activityPhrases.length];
   }, [thinkingMessage, thinkingStatusTick]);
-  const liveStatusMessage = useMemo(() => {
-    if (activeToolCalls.length > 0) return null;
-    if (phaseMessage) return phaseMessage;
-    if (questions.length > 0) return null;
-    return animatedThinkingMessage;
-  }, [activeToolCalls.length, animatedThinkingMessage, phaseMessage, questions.length]);
-
-  const toolCallsByUserTurnIndex = useMemo(() => {
+  const toolCallsByAssistantTurnIndex = useMemo(() => {
     const mapping = new Map<number, ToolCallEntry[]>();
-    const userIndexes = turns
+    const assistantIndexes = turns
       .map((turn, idx) => ({ turn, idx }))
-      .filter(({ turn }) => turn.role === "user")
+      .filter(({ turn }) => turn.role !== "user")
       .map(({ idx }) => idx);
-    if (toolCallGroups.length === 0 || userIndexes.length === 0) {
+    if (toolCallGroups.length === 0 || assistantIndexes.length === 0) {
       return mapping;
     }
-    // Map each group to the corresponding user turn starting from the first,
-    // never right-aligning to avoid discovery groups appearing under answer turns.
-    const count = Math.min(toolCallGroups.length, userIndexes.length);
-    for (let i = 0; i < count; i += 1) {
-      const turnIdx = userIndexes[i];
-      if (turnIdx !== undefined) {
-        mapping.set(turnIdx, toolCallGroups[i]);
-      }
+    // Map groups in chronological order. When there are more tool groups than
+    // assistant turns, keep overflow attached to the latest assistant turn
+    // instead of dropping them.
+    for (let i = 0; i < toolCallGroups.length; i += 1) {
+      const targetAssistantPos = i < assistantIndexes.length ? i : assistantIndexes.length - 1;
+      const turnIdx = assistantIndexes[targetAssistantPos];
+      const group = toolCallGroups[i] ?? [];
+      if (turnIdx === undefined) continue;
+      const existing = mapping.get(turnIdx) ?? [];
+      mapping.set(turnIdx, [...existing, ...group]);
     }
     return mapping;
   }, [toolCallGroups, turns]);
@@ -356,15 +393,48 @@ export function ChatPanel({
     }
     return null;
   }, [turns]);
-  const showActiveToolStreamUnderOptimistic = activeToolCalls.length > 0 && Boolean(optimisticUserMessage);
+  const hasRunningActiveToolCalls = useMemo(
+    () => hasRunningToolCalls(activeToolCalls),
+    [activeToolCalls],
+  );
+  const showActiveToolStreamUnderOptimistic = hasRunningActiveToolCalls && Boolean(optimisticUserMessage);
+  const activeToolCallsOrphaned = useMemo(() => {
+    if (!hasRunningActiveToolCalls) return false;
+    if (optimisticUserMessage) return false;
+    if (latestUserTurnIndex === null) return true;
+    // Keep active tool calls anchored inline with the latest user turn.
+    // Only treat as orphaned when there is no user turn to attach to.
+    return false;
+  }, [hasRunningActiveToolCalls, optimisticUserMessage, latestUserTurnIndex]);
+  const showActiveToolStreamInlineAtLatestUserTurn = (
+    !optimisticUserMessage
+    && latestUserTurnIndex !== null
+    && hasRunningActiveToolCalls
+    && !activeToolCallsOrphaned
+  );
+  const hasVisibleActiveToolStream = (
+    showActiveToolStreamUnderOptimistic
+    || showActiveToolStreamInlineAtLatestUserTurn
+    || activeToolCallsOrphaned
+  );
+  const liveStatusMessage = useMemo(() => {
+    const hasRunningToolCalls = activeToolCalls.some((c) => c.status === "running");
+    // If a tool stream is already visible, avoid a second parallel status line.
+    if (hasVisibleActiveToolStream) return null;
+    if (phaseMessage && isProcessing && !hasRunningToolCalls) return phaseMessage;
+    if (animatedThinkingMessage) return animatedThinkingMessage;
+    if (hasRunningToolCalls) return "Running tools...";
+    if (isProcessing) return "Working...";
+    return null;
+  }, [phaseMessage, animatedThinkingMessage, activeToolCalls, isProcessing, hasVisibleActiveToolStream]);
 
   return (
-    <div className="h-full flex flex-col bg-zinc-900/30 relative">
+    <div className="h-full flex flex-col bg-zinc-950 relative">
       
       {/* Scrollable Message Area */}
-      <div 
-        ref={scrollRef} 
-        className="flex-1 overflow-y-auto px-6 pt-6 pb-40 scroll-smooth" 
+      <div
+        ref={scrollRef}
+        className="flex-1 overflow-y-auto px-4 md:px-6 pt-6 pb-[28rem] scroll-smooth"
         onScroll={onScroll}
       >
         <div className="max-w-2xl mx-auto space-y-6">
@@ -378,8 +448,13 @@ export function ChatPanel({
           {turns.map((turn, idx) => {
             const isUser = turn.role === "user";
             const turnKey = `${turn.role}-${idx}`;
+            const shouldCollapseDiscoveryQuestionText = (
+              turn.role === "author"
+              && questions.length > 0
+              && isDiscoveryQuestionBlock(turn.content)
+            );
             const displayContent = renderTurnContent(turn);
-            const turnToolCalls = isUser ? (toolCallsByUserTurnIndex.get(idx) ?? []) : [];
+            const turnToolCalls = !isUser ? (toolCallsByAssistantTurnIndex.get(idx) ?? []) : [];
             const criticJson = turn.role === "critic" ? extractFirstJsonObject(turn.content) : null;
             const criticPrelude = criticJson ? turn.content.slice(0, criticJson.start).trim() : "";
             const criticPostlude = criticJson ? turn.content.slice(criticJson.end).trim() : "";
@@ -437,8 +512,8 @@ export function ChatPanel({
                       {criticJson ? (
                         <div className="space-y-3">
                           {criticPrelude && (
-                            <div className="chat-message-prose prose prose-invert prose-sm max-w-none">
-                              <ReactMarkdown>{criticPrelude}</ReactMarkdown>
+                            <div className="chat-message-prose prose dark:prose-invert prose-zinc prose-sm max-w-none">
+                              <ReactMarkdown remarkPlugins={[remarkGfm]} components={chatMarkdownComponents}>{criticPrelude}</ReactMarkdown>
                             </div>
                           )}
                           <div className="rounded-lg border border-zinc-700/70 bg-zinc-900/40 p-3">
@@ -469,21 +544,25 @@ export function ChatPanel({
                             </details>
                           </div>
                           {criticPostlude && (
-                            <div className="chat-message-prose prose prose-invert prose-sm max-w-none">
+                            <div className="chat-message-prose prose dark:prose-invert prose-zinc prose-sm max-w-none">
                               <ReactMarkdown>{criticPostlude}</ReactMarkdown>
                             </div>
                           )}
                         </div>
                       ) : (
-                        <div className="chat-message-prose prose prose-invert prose-sm max-w-none">
-                          <ReactMarkdown>{displayContent}</ReactMarkdown>
+                        <div className="chat-message-prose prose dark:prose-invert prose-zinc prose-sm max-w-none">
+                          <ReactMarkdown remarkPlugins={[remarkGfm]} components={chatMarkdownComponents}>
+                            {shouldCollapseDiscoveryQuestionText
+                              ? `I found ${questions.length} clarifying question${questions.length === 1 ? "" : "s"}. Please answer the options below so I can draft the plan.`
+                              : displayContent}
+                          </ReactMarkdown>
                         </div>
                       )}
                     </div>
                   </div>
                 </div>
-                {isUser && turnToolCalls.length > 0 && (
-                  <div className="flex justify-start w-full pl-12">
+                {!isUser && turnToolCalls.length > 0 && (
+                  <div className="flex justify-start w-full">
                     <ToolCallStream toolCalls={turnToolCalls} />
                   </div>
                 )}
@@ -491,9 +570,10 @@ export function ChatPanel({
                   && !optimisticUserMessage
                   && idx === latestUserTurnIndex
                   && activeToolCalls.length > 0
-                  && !toolCallsByUserTurnIndex.has(idx) && (
-                  <div className="flex justify-start w-full pl-12">
-                    <ToolCallStream toolCalls={activeToolCalls} defaultOpen />
+                  && !toolCallsByAssistantTurnIndex.has(idx)
+                  && !activeToolCallsOrphaned && (
+                  <div className="flex justify-start w-full">
+                    <ToolCallStream toolCalls={activeToolCalls} defaultOpen forceRunning={isProcessing} />
                   </div>
                 )}
               </div>
@@ -509,79 +589,131 @@ export function ChatPanel({
                 </div>
                 <div className="flex min-w-0 max-w-[85%] flex-col items-end">
                   <div className="relative rounded-2xl px-4 py-3 text-sm shadow-sm overflow-hidden bg-indigo-500/10 border border-indigo-500/20 text-indigo-100 rounded-tr-sm opacity-60">
-                    <div className="chat-message-prose prose prose-invert prose-sm max-w-none">
-                      <ReactMarkdown>{optimisticUserMessage}</ReactMarkdown>
+                    <div className="chat-message-prose prose dark:prose-invert prose-zinc prose-sm max-w-none">
+                      <ReactMarkdown remarkPlugins={[remarkGfm]} components={chatMarkdownComponents}>{optimisticUserMessage}</ReactMarkdown>
                     </div>
                   </div>
                 </div>
               </div>
               {showActiveToolStreamUnderOptimistic && (
-                <div className="flex justify-start w-full pl-12">
-                  <ToolCallStream toolCalls={activeToolCalls} defaultOpen />
+                <div className="flex justify-start w-full">
+                  <ToolCallStream toolCalls={activeToolCalls} defaultOpen forceRunning={isProcessing} />
                 </div>
               )}
             </div>
           )}
-          <OptionButtons
-            questions={questions}
-            selectedAnswers={selectedAnswers}
-            selectedIsOther={selectedIsOther}
-            otherInputs={otherInputs}
-            onSelect={(questionIndex, optionText, isOther) => {
-              setSelectedAnswers((prev) => ({ ...prev, [questionIndex]: optionText }));
-              setSelectedIsOther((prev) => ({ ...prev, [questionIndex]: isOther }));
-              if (!isOther) {
-                setOtherInputs((prev) => ({ ...prev, [questionIndex]: "" }));
-              }
-            }}
-            onOtherInputChange={(questionIndex, value) => {
-              setOtherInputs((prev) => ({ ...prev, [questionIndex]: value }));
-            }}
-          />
-          {questions.length > 0 && (
-            <>
-              <div className="pl-9 mt-3">
-                <div className="flex items-center justify-between gap-3">
-                  <p className="text-xs text-zinc-500">
-                    {answeredCount}/{questions.length} answered
-                  </p>
-                  <button
-                    type="button"
-                    disabled={inputDisabled || !allQuestionsAnswered || submittingAnswers}
-                    onClick={() => void submitSelectedAnswers()}
-                    className="rounded-md bg-indigo-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-400 disabled:opacity-50 disabled:cursor-not-allowed"
-                  >
-                    {submittingAnswers ? "Submitting..." : "Submit all answers"}
-                  </button>
+          <div className="relative z-[60]">
+            <OptionButtons
+              questions={questions}
+              selectedAnswers={selectedAnswers}
+              selectedIsOther={selectedIsOther}
+              otherInputs={otherInputs}
+              onSelect={(questionIndex, optionText, isOther) => {
+                setSelectedAnswers((prev) => ({ ...prev, [questionIndex]: optionText }));
+                setSelectedIsOther((prev) => ({ ...prev, [questionIndex]: isOther }));
+                if (!isOther) {
+                  setOtherInputs((prev) => ({ ...prev, [questionIndex]: "" }));
+                }
+              }}
+              onOtherInputChange={(questionIndex, value) => {
+                setOtherInputs((prev) => ({ ...prev, [questionIndex]: value }));
+              }}
+            />
+            {questions.length > 0 && (
+              <>
+                <div className="pl-12 mt-3 mb-24">
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="text-xs text-zinc-500">
+                      {answeredCount}/{questions.length} answered
+                    </p>
+                    <button
+                      type="button"
+                      disabled={inputDisabled || !allQuestionsAnswered || submittingAnswers}
+                      onClick={() => void submitSelectedAnswers()}
+                      className="rounded-md bg-indigo-500 px-3 py-1.5 text-xs font-medium text-white hover:bg-indigo-400 disabled:opacity-50 disabled:cursor-not-allowed"
+                    >
+                      {submittingAnswers ? "Submitting..." : "Submit all answers"}
+                    </button>
+                  </div>
                 </div>
-              </div>
-              {showSubmittingStatus && (
-                <p className="pl-9 mt-2 text-xs text-zinc-400 llm-status-glow">
-                  <span className="llm-status-motion">Analyzing your answers and preparing the first draft</span>
-                </p>
-              )}
-            </>
-          )}
-          {pendingClarification && (
-            <div className="rounded-xl border border-indigo-500/30 bg-indigo-500/10 p-4 space-y-3">
+                {showSubmittingStatus && (
+                  <p className="pl-12 mt-2 text-xs text-zinc-400 llm-status-glow">
+                    <span className="llm-status-motion">Analyzing your answers and preparing the first draft</span>
+                  </p>
+                )}
+              </>
+            )}
+            {pendingClarification && (
+              <div className="ml-12 rounded-xl border border-indigo-500/30 bg-indigo-500/10 p-4 space-y-3">
               <p className="text-xs uppercase tracking-wide text-indigo-300">Clarification needed</p>
               <p className="text-sm text-zinc-100">{pendingClarification.question}</p>
               {pendingClarification.context && (
                 <p className="text-xs text-zinc-400">{pendingClarification.context}</p>
               )}
+              {clarificationRecommendations.length > 0 && (
+                <div className="space-y-2">
+                  <p className="text-[11px] uppercase tracking-wide text-zinc-400">
+                    Recommended answers
+                  </p>
+                  <div className="grid gap-2">
+                    {clarificationRecommendations.map((recommendation) => {
+                      const isSelected = !useCustomClarification
+                        && selectedClarificationRecommendation === recommendation;
+                      return (
+                        <button
+                          key={recommendation}
+                          type="button"
+                          onClick={() => {
+                            setUseCustomClarification(false);
+                            setClarificationInput("");
+                            setSelectedClarificationRecommendation(recommendation);
+                          }}
+                          className={clsx(
+                            "w-full rounded-md border px-3 py-2 text-left text-xs transition-colors",
+                            isSelected
+                              ? "border-indigo-400 bg-indigo-500/20 text-indigo-100"
+                              : "border-zinc-700 bg-zinc-900/50 text-zinc-300 hover:border-zinc-500 hover:text-zinc-100",
+                          )}
+                        >
+                          {recommendation}
+                        </button>
+                      );
+                    })}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setUseCustomClarification(true);
+                        setSelectedClarificationRecommendation(null);
+                      }}
+                      className={clsx(
+                        "w-full rounded-md border px-3 py-2 text-left text-xs transition-colors",
+                        useCustomClarification
+                          ? "border-indigo-400 bg-indigo-500/20 text-indigo-100"
+                          : "border-zinc-700 bg-zinc-900/50 text-zinc-300 hover:border-zinc-500 hover:text-zinc-100",
+                      )}
+                    >
+                      Other (custom answer)
+                    </button>
+                  </div>
+                </div>
+              )}
               <div className="flex gap-2">
                 <input
                   value={clarificationInput}
                   onChange={(e) => setClarificationInput(e.target.value)}
-                  placeholder="Type your answer..."
+                  placeholder="Type a custom answer..."
+                  disabled={!useCustomClarification && Boolean(selectedClarificationRecommendation)}
                   className="flex-1 rounded-md border border-zinc-700 bg-zinc-900 px-3 py-2 text-sm text-zinc-100"
                 />
                 <button
                   type="button"
-                  className="rounded-md bg-indigo-500 px-3 py-2 text-sm text-white hover:bg-indigo-400"
+                  disabled={!clarificationAnswer}
+                  className="rounded-md bg-indigo-500 px-3 py-2 text-sm text-white hover:bg-indigo-400 disabled:cursor-not-allowed disabled:opacity-50"
                   onClick={() => {
-                    const answer = clarificationInput;
+                    const answer = clarificationAnswer;
                     setClarificationInput("");
+                    setSelectedClarificationRecommendation(null);
+                    setUseCustomClarification(false);
                     void onSubmitClarification(answer);
                   }}
                 >
@@ -592,38 +724,26 @@ export function ChatPanel({
                   className="rounded-md border border-zinc-700 px-3 py-2 text-sm text-zinc-300 hover:bg-zinc-800"
                   onClick={() => {
                     setClarificationInput("");
+                    setSelectedClarificationRecommendation(null);
+                    setUseCustomClarification(false);
                     void onSubmitClarification("");
                   }}
                 >
                   Skip
                 </button>
               </div>
-            </div>
-          )}
-          {showCritiquePrompt && (
-            <div className="rounded-xl border border-indigo-500/40 bg-indigo-500/10 p-4">
-              <div className="flex items-center justify-between gap-4">
-                <div>
-                  <p className="text-xs uppercase tracking-wide text-indigo-300">Draft ready</p>
-                  <p className="mt-1 text-sm text-zinc-100">
-                    Initial plan is ready. Run a critique pass when you want the next refinement.
-                  </p>
-                </div>
-                <button
-                  type="button"
-                  className="shrink-0 rounded-md bg-indigo-500 px-3 py-2 text-xs font-medium text-white hover:bg-indigo-400"
-                  onClick={() => void onCritique()}
-                >
-                  Run Critique
-                </button>
               </div>
-            </div>
-          )}
-
-          {(liveStatusMessage || warningSummary.length > 0) && (
-            <div className="pl-12 mt-2 space-y-2 animate-in fade-in duration-200">
+            )}
+          </div>
+          {(activeToolCallsOrphaned || liveStatusMessage || warningSummary.length > 0) && (
+            <div className="mt-2 space-y-2 animate-in fade-in duration-200">
+              {activeToolCallsOrphaned && (
+                <div className="pl-0">
+                  <ToolCallStream toolCalls={activeToolCalls} defaultOpen forceRunning={isProcessing} />
+                </div>
+              )}
               {liveStatusMessage && (
-                <div className="flex items-center gap-2 text-xs text-zinc-300 llm-status-glow">
+                <div className="pl-12 flex items-center gap-2 text-xs text-zinc-300 llm-status-glow">
                   <div className="flex gap-1">
                     <div className="w-1 h-1 rounded-full bg-zinc-500 animate-bounce [animation-delay:-0.3s]"></div>
                     <div className="w-1 h-1 rounded-full bg-zinc-500 animate-bounce [animation-delay:-0.15s]"></div>
@@ -635,7 +755,7 @@ export function ChatPanel({
               {warningSummary.slice(-2).map((warning, idx) => (
                 <div
                   key={`warning-${idx}`}
-                  className="max-w-[90%] rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200/90"
+                  className="ml-12 max-w-[90%] rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200/90"
                 >
                   {warning.message}
                   {warning.count > 1 ? ` (x${warning.count})` : ""}
@@ -651,7 +771,7 @@ export function ChatPanel({
         <div className="absolute bottom-32 left-1/2 -translate-x-1/2 z-50 pointer-events-auto animate-in slide-in-from-bottom-2 fade-in duration-200">
           <button
             type="button"
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-zinc-800 border border-zinc-600 text-xs font-medium text-zinc-200 hover:text-white hover:bg-zinc-700 shadow-lg ring-1 ring-black/20 transition-all"
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-zinc-800 border border-zinc-600 text-xs font-medium text-zinc-200 hover:text-zinc-50 hover:bg-zinc-700 shadow-lg ring-1 ring-black/20 transition-all"
             onClick={scrollToBottom}
           >
             <ArrowDown className="w-3.5 h-3.5" />
@@ -661,11 +781,17 @@ export function ChatPanel({
       )}
 
       {/* Floating Input Area */}
-      <div className="absolute bottom-6 left-1/2 -translate-x-1/2 w-full max-w-2xl px-6">
-        <div className="bg-zinc-800/80 backdrop-blur-xl border border-zinc-700/80 rounded-2xl shadow-2xl p-2 flex items-end focus-within:ring-2 ring-indigo-500/50 focus-within:border-indigo-500/50 transition-all">
+      <div className="absolute bottom-6 left-1/2 -translate-x-1/2 w-full max-w-3xl px-4">
+        <div className={clsx(
+          "bg-zinc-900 border rounded-2xl transition-all duration-300 chat-input-container",
+          isProcessing
+            ? "border-amber-500/30"
+            : "border-zinc-700 focus-within:border-indigo-500/50"
+        )}>
+          {/* Textarea row */}
           <textarea
             ref={inputRef}
-            className="w-full max-h-48 min-h-[44px] bg-transparent text-zinc-100 placeholder:text-zinc-500 px-3 py-2.5 text-sm focus:outline-none resize-none overflow-y-auto"
+            className="w-full max-h-64 min-h-[56px] bg-transparent text-zinc-100 placeholder:text-zinc-500/80 px-5 pt-4 pb-3 text-[15px] focus:outline-none resize-none overflow-y-auto leading-relaxed"
             value={input}
             disabled={inputDisabled}
             onChange={(e) => setInput(e.target.value)}
@@ -675,33 +801,153 @@ export function ChatPanel({
                 void handleSubmit();
               }
             }}
-            placeholder="Type a message..."
+            placeholder={isProcessing ? "Working on it..." : "Type a message..."}
             rows={1}
             style={{ height: "auto" }}
             onInput={(e) => {
               const target = e.target as HTMLTextAreaElement;
               target.style.height = "auto";
-              target.style.height = `${Math.min(target.scrollHeight, 192)}px`;
+              target.style.height = `${Math.min(target.scrollHeight, 256)}px`;
             }}
           />
-          
-          <div className="flex items-center gap-2 shrink-0 p-1">
-            <Tooltip content="Send message (⌘ + ↵)">
-              <div className="hidden sm:flex items-center gap-1 text-[10px] font-mono text-zinc-500 select-none mr-1">
-                <kbd className={clsx("px-1.5 py-0.5 rounded border border-zinc-700 transition-colors", input.trim() && "bg-zinc-700 text-zinc-300")}>⌘</kbd>
-                <kbd className={clsx("px-1.5 py-0.5 rounded border border-zinc-700 transition-colors", input.trim() && "bg-zinc-700 text-zinc-300")}>↵</kbd>
-              </div>
-            </Tooltip>
-            <Tooltip content="Send message">
-              <button
-                type="button"
-                disabled={inputDisabled || !input.trim()}
-                className="p-2 rounded-xl bg-indigo-500 text-white hover:bg-indigo-400 disabled:opacity-50 disabled:hover:bg-indigo-500 transition-colors shadow-sm active:scale-95"
-                onClick={() => void handleSubmit()}
-              >
-                <Send className="w-4 h-4" />
-              </button>
-            </Tooltip>
+          {/* Footer row */}
+          <div className="flex flex-wrap sm:flex-nowrap items-center justify-between gap-2 sm:gap-3 px-3 pb-3 pt-2 border-t border-zinc-700">
+            {/* Left: model selectors or processing status */}
+            <div className="flex items-center gap-2 min-w-0 order-2 sm:order-1 w-full sm:w-auto">
+              {isProcessing ? (
+                <div className="flex items-center gap-2.5 px-3 py-1.5 bg-amber-500/10 border border-amber-500/20 rounded-xl shadow-[0_0_15px_rgba(245,158,11,0.1)] animate-in fade-in duration-300">
+                  <Loader2 className="w-3.5 h-3.5 text-amber-400 animate-spin" />
+                  <span className="text-[11px] text-amber-400/90 font-bold tracking-widest uppercase">Working</span>
+                </div>
+              ) : (
+                <div className="flex items-center bg-zinc-900/60 border border-zinc-700/40 rounded-xl p-1 shadow-inner min-w-0 w-full sm:w-auto">
+                  {authorModel !== undefined && onAuthorModelChange && (
+                    <ModelSelector
+                      label="Author"
+                      value={authorModel}
+                      onChange={onAuthorModelChange}
+                      options={modelOptions}
+                      icon={<Sparkles className="w-3.5 h-3.5" />}
+                      className="hover:bg-zinc-800/80 rounded-lg px-2 py-1 flex-1 sm:flex-none justify-center sm:justify-start"
+                      dropUp
+                    />
+                  )}
+                  {(canCritique || canApprove) && criticModel !== undefined && onCriticModelChange && authorModel !== undefined && (
+                    <>
+                      <div className="w-px h-5 bg-zinc-700/50 mx-1 shrink-0" />
+                      <ModelSelector
+                        label="Critic"
+                        value={criticModel}
+                        onChange={onCriticModelChange}
+                        options={modelOptions}
+                        icon={<BrainCircuit className="w-3.5 h-3.5" />}
+                        className="hover:bg-zinc-800/80 rounded-lg px-2 py-1 flex-1 sm:flex-none justify-center sm:justify-start"
+                        dropUp
+                      />
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Center: context dial */}
+            <div className="flex items-center justify-end shrink-0 order-1 sm:order-2 mr-auto sm:mr-0 sm:flex-1 pr-1">
+              <Tooltip content={`Context usage: ${(contextPercent ?? 0).toFixed(1)}%${contextWindowTokens ? ` of ${contextWindowTokens} max` : ''}`}>
+                <div className="relative w-5 h-5 flex items-center justify-center">
+                  <svg className="w-full h-full -rotate-90" viewBox="0 0 36 36">
+                    {/* Background track */}
+                    <circle
+                      cx="18"
+                      cy="18"
+                      r="14"
+                      fill="none"
+                      className={clsx(
+                        "transition-all duration-500",
+                        isProcessing ? "stroke-amber-500/20 animate-pulse" : "stroke-zinc-700/50"
+                      )}
+                      strokeWidth="4"
+                    />
+                    {/* Progress arc */}
+                    <circle
+                      cx="18"
+                      cy="18"
+                      r="14"
+                      fill="none"
+                      className={clsx(
+                        "transition-all duration-500 ease-out",
+                        (contextPercent ?? 0) >= 85 ? "stroke-rose-500" : (contextPercent ?? 0) >= 70 ? "stroke-amber-500" : "stroke-zinc-400"
+                      )}
+                      strokeWidth="4"
+                      strokeDasharray="88"
+                      strokeDashoffset={88 - (88 * Math.min(100, contextPercent ?? 0)) / 100}
+                      strokeLinecap="round"
+                    />
+                  </svg>
+                </div>
+              </Tooltip>
+            </div>
+
+            {/* Right: action buttons */}
+            <div className="flex items-center justify-end gap-2 shrink-0 order-1 sm:order-3">
+              {!isProcessing && canCritique && onCritique && (
+                <Tooltip content="Run critique pass">
+                  <button
+                    type="button"
+                    disabled={critiquePending}
+                    onClick={onCritique}
+                    className={clsx(
+                      "flex items-center gap-2 px-4 py-2 text-sm font-semibold rounded-xl transition-all duration-300 active:scale-95",
+                      critiquePending
+                        ? "bg-indigo-600/30 text-indigo-400/50 cursor-not-allowed"
+                        : "bg-indigo-500 text-white hover:bg-indigo-400 shadow-[0_4px_12px_rgba(99,102,241,0.3)] hover:shadow-[0_6px_16px_rgba(99,102,241,0.4)]"
+                    )}
+                  >
+                    <RefreshCw className={clsx("w-4 h-4", critiquePending && "animate-spin")} />
+                    Critique
+                  </button>
+                </Tooltip>
+              )}
+              {!isProcessing && canApprove && onApprove && (
+                <Tooltip content="Approve plan">
+                  <button
+                    type="button"
+                    onClick={onApprove}
+                    className="flex items-center gap-2 px-4 py-2 text-sm font-semibold rounded-xl bg-zinc-100 text-zinc-900 hover:bg-zinc-50 transition-all duration-300 shadow-[0_4px_12px_rgba(255,255,255,0.1)] hover:shadow-[0_6px_16px_rgba(255,255,255,0.15)] active:scale-95"
+                  >
+                    <CheckCircle2 className="w-4 h-4" />
+                    Approve
+                  </button>
+                </Tooltip>
+              )}
+              {isProcessing && onStop ? (
+                <Tooltip content="Stop current process">
+                  <button
+                    type="button"
+                    onClick={onStop}
+                    className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-zinc-800/80 border border-zinc-700/50 text-zinc-300 hover:bg-rose-500/10 hover:text-rose-400 hover:border-rose-500/30 transition-all duration-300 active:scale-95 animate-in fade-in duration-300"
+                  >
+                    <Square className="w-3.5 h-3.5 fill-current" />
+                    <span className="text-xs font-semibold tracking-wide uppercase">Stop</span>
+                  </button>
+                </Tooltip>
+              ) : (
+                <Tooltip content="Send message">
+                  <button
+                    type="button"
+                    disabled={inputDisabled || !input.trim()}
+                    className={clsx(
+                      "p-2.5 rounded-xl transition-all duration-300 active:scale-95",
+                      input.trim() && !inputDisabled
+                        ? "bg-indigo-500 text-white hover:bg-indigo-400 shadow-[0_4px_12px_rgba(99,102,241,0.3)] hover:shadow-[0_6px_16px_rgba(99,102,241,0.4)]"
+                        : "bg-zinc-800/80 text-zinc-500 cursor-not-allowed"
+                    )}
+                    onClick={() => void handleSubmit()}
+                  >
+                    <Send className="w-4 h-4" />
+                  </button>
+                </Tooltip>
+              )}
+            </div>
           </div>
         </div>
       </div>

@@ -789,7 +789,7 @@ def run_benchmark(
                     # This avoids false "halted" runs when the server is slow but still progressing.
                     continue
             # Keep detect-latency low while drafting; back off slightly once refining.
-            time.sleep(0.25 if status in {"drafting", "discovering", "discovery"} else 0.5)
+            time.sleep(0.25 if status == "draft" else 0.5)
 
         lower = content.lower()
         fallback = "fallback plan because the authoring model was unavailable" in lower

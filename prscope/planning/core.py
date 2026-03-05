@@ -54,33 +54,37 @@ class PlanningCore:
     """Deterministic planning state and convergence logic."""
 
     ALLOWED_TRANSITIONS: dict[str, set[str]] = {
-        "created": {"discovering", "error"},
-        "preparing": {"discovering", "error"},
-        "discovering": {"drafting", "error"},
-        "drafting": {"refining", "error"},
+        "draft": {"draft", "refining", "error"},
         "refining": {"refining", "converged", "error"},
         "converged": {"approved", "refining", "error"},
-        "approved": {"exported", "error"},
-        "exported": set(),
-        "error": set(),
+        "approved": {"approved", "error"},
+        "error": {"draft"},
     }
     VALID_COMMANDS: dict[str, set[str]] = {
-        "created": set(),
-        "preparing": set(),
-        "discovering": {"message"},
-        "drafting": set(),
-        "refining": {"message", "round"},
-        "converged": {"round", "approve"},
+        "draft": {"message"},
+        "refining": {"message", "run_round"},
+        "converged": {"run_round", "approve"},
         "approved": {"export"},
-        "exported": set(),
-        "error": set(),
+        "error": {"reset"},
     }
-    WORK_STATES: set[str] = {"discovering", "drafting", "refining"}
+    WORK_STATES: set[str] = {"draft", "refining"}
 
     def __init__(self, store: Store, session_id: str, config: PlanningConfig):
         self.store = store
         self.session_id = session_id
         self.config = config
+
+    @staticmethod
+    def _normalize_status(status: str) -> str:
+        legacy_to_canonical = {
+            "created": "draft",
+            "preparing": "draft",
+            "discovery": "draft",
+            "discovering": "draft",
+            "drafting": "draft",
+            "exported": "approved",
+        }
+        return legacy_to_canonical.get(status, status)
 
     def get_session(self):
         session = self.store.get_planning_session(self.session_id)
@@ -203,9 +207,8 @@ class PlanningCore:
             if row is None:
                 raise ValueError(f"Planning session not found: {self.session_id}")
             session = PlanningSession(**dict(row))
-            old_status = session.status
-            if old_status == "discovery":
-                old_status = "discovering"
+            old_status = self._normalize_status(session.status)
+            new_status = self._normalize_status(new_status)
             allowed = self.ALLOWED_TRANSITIONS.get(old_status, set())
             if new_status != old_status and new_status not in allowed:
                 raise InvalidTransitionError(f"Invalid transition {old_status} -> {new_status}")
@@ -221,9 +224,9 @@ class PlanningCore:
             next_pending_questions_json = session.pending_questions_json
             if pending_questions_json is not _UNSET:
                 next_pending_questions_json = pending_questions_json
-            if new_status != "discovering":
+            if new_status != "draft":
                 next_pending_questions_json = None
-            if new_status == "discovering":
+            if new_status == "draft":
                 if next_pending_questions_json is not None and phase_message is not None:
                     raise InvalidTransitionError("discovery coherence violated: cannot show questions while processing")
                 if phase_message is not None:
@@ -292,9 +295,6 @@ class PlanningCore:
         if session.status not in {"converged", "approved"}:
             raise InvalidTransitionError(f"Cannot approve from status: {session.status}")
         self.transition_and_snapshot("approved", phase_message=None)
-
-    def mark_exported(self) -> None:
-        self.transition("exported")
 
     @classmethod
     def reconcile_stuck_sessions(

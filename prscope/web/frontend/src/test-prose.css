@@ -1,0 +1,37 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+@theme {
+  --color-zinc-50: var(--theme-zinc-50);
+  --color-zinc-100: var(--theme-zinc-100);
+  --color-zinc-200: var(--theme-zinc-200);
+  --color-zinc-300: var(--theme-zinc-300);
+  --color-zinc-400: var(--theme-zinc-400);
+  --color-zinc-500: var(--theme-zinc-500);
+  --color-zinc-600: var(--theme-zinc-600);
+  --color-zinc-700: var(--theme-zinc-700);
+  --color-zinc-800: var(--theme-zinc-800);
+  --color-zinc-900: var(--theme-zinc-900);
+  --color-zinc-950: var(--theme-zinc-950);
+}
+
+.prose-invert {
+  --tw-prose-invert-body: var(--color-zinc-300);
+  --tw-prose-invert-headings: var(--color-zinc-50);
+  --tw-prose-invert-lead: var(--color-zinc-400);
+  --tw-prose-invert-links: var(--color-zinc-50);
+  --tw-prose-invert-bold: var(--color-zinc-50);
+  --tw-prose-invert-counters: var(--color-zinc-400);
+  --tw-prose-invert-bullets: var(--color-zinc-600);
+  --tw-prose-invert-hr: var(--color-zinc-700);
+  --tw-prose-invert-quotes: var(--color-zinc-100);
+  --tw-prose-invert-quote-borders: var(--color-zinc-700);
+  --tw-prose-invert-captions: var(--color-zinc-400);
+  --tw-prose-invert-kbd: var(--color-zinc-50);
+  --tw-prose-invert-kbd-shadows: var(--color-zinc-50);
+  --tw-prose-invert-code: var(--color-zinc-50);
+  --tw-prose-invert-pre-code: var(--color-zinc-300);
+  --tw-prose-invert-pre-bg: var(--color-zinc-900);
+  --tw-prose-invert-th-borders: var(--color-zinc-600);
+  --tw-prose-invert-td-borders: var(--color-zinc-700);
+}

@@ -1,9 +1,12 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link, useSearchParams } from "react-router-dom";
 import { listSessions, setRepoContext, getActiveRepoContext } from "../lib/api";
+import { cleanPlanTitle } from "../lib/planTitle";
 import { Plus, GitMerge, CircleDashed, FileText } from "lucide-react";
 import { Tooltip } from "../components/ui/Tooltip";
 import { useMemo, useState, useEffect } from "react";
+
+import { ThemeToggle } from "../components/ThemeToggle";
 
 function formatSessionDate(createdAt: string, updatedAt: string): { label: string; text: string } {
   const created = createdAt ? new Date(createdAt).getTime() : 0;
@@ -32,7 +35,7 @@ function formatSessionDate(createdAt: string, updatedAt: string): { label: strin
 }
 
 function StatusBadge({ status }: { status: string }) {
-  if (status === "converged" || status === "approved" || status === "exported") {
+  if (status === "converged" || status === "approved") {
     return (
       <Tooltip content="Plan has stabilized and is ready for review">
         <div className="flex items-center gap-1.5 cursor-default">
@@ -42,7 +45,7 @@ function StatusBadge({ status }: { status: string }) {
       </Tooltip>
     );
   }
-  if (status === "refining" || status === "discovering") {
+  if (status === "refining" || status === "draft") {
     return (
       <Tooltip content="Actively working on the plan">
         <div className="flex items-center gap-1.5 cursor-default">
@@ -98,7 +101,7 @@ export function SessionListPage() {
 
   return (
     <main className="max-w-4xl mx-auto mt-16 px-6 pb-24">
-      <div className="flex items-center justify-between mb-8">
+      <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4 sm:gap-0 mb-8">
         <div className="flex items-center gap-4">
           <img src="/logo.svg" alt="prscope" className="w-10 h-10 rounded-xl shadow-sm" />
           <div>
@@ -106,12 +109,12 @@ export function SessionListPage() {
             <p className="text-sm text-zinc-500 mt-1">Manage and review your implementation plans.</p>
           </div>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="w-full sm:w-auto flex items-center gap-3">
           <label className="text-sm text-zinc-500 whitespace-nowrap">Repo</label>
           <select
             value={selectedRepo ?? ""}
             onChange={(e) => handleRepoChange(e.target.value || null)}
-            className="bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm rounded-md pl-3 pr-8 py-2 appearance-none cursor-pointer hover:border-zinc-600 focus:outline-none focus:ring-1 focus:ring-indigo-500 focus:border-indigo-500"
+            className="flex-1 sm:flex-none bg-zinc-800 border border-zinc-700 text-zinc-200 text-sm rounded-md pl-3 pr-8 py-2 appearance-none cursor-pointer hover:border-zinc-600 focus:outline-none focus:ring-1 focus:ring-indigo-500 focus:border-indigo-500"
             style={{ backgroundImage: `url("data:image/svg+xml,%3csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 20 20'%3e%3cpath stroke='%239ca3af' stroke-linecap='round' stroke-linejoin='round' stroke-width='1.5' d='M6 8l4 4 4-4'/%3e%3c/svg%3e")`, backgroundPosition: "right 0.5rem center", backgroundRepeat: "no-repeat", backgroundSize: "1.5em 1.5em" }}
           >
             <option value="">All repos</option>
@@ -128,6 +131,7 @@ export function SessionListPage() {
             <Plus className="w-4 h-4" />
             New Plan
           </Link>
+          <ThemeToggle />
         </div>
       </div>
 
@@ -145,8 +149,8 @@ export function SessionListPage() {
       ) : null}
 
       {!isLoading && !error && sessions.length === 0 ? (
-        <div className="border border-dashed border-zinc-800 rounded-xl py-24 flex flex-col items-center justify-center text-center">
-          <div className="w-12 h-12 bg-zinc-900 rounded-full flex items-center justify-center mb-4 border border-zinc-800">
+        <div className="border border-dashed border-zinc-600 rounded-xl py-24 flex flex-col items-center justify-center text-center">
+          <div className="w-12 h-12 bg-zinc-900 rounded-full flex items-center justify-center mb-4 border border-zinc-600">
             <FileText className="w-6 h-6 text-zinc-500" />
           </div>
           <h3 className="text-zinc-200 font-medium mb-1">No plans yet</h3>
@@ -155,7 +159,7 @@ export function SessionListPage() {
           </p>
           <Link
             to={selectedRepo ? `/new?repo=${encodeURIComponent(selectedRepo)}` : "/new"}
-            className="inline-flex items-center gap-2 px-4 py-2 bg-zinc-100 hover:bg-white text-zinc-900 rounded-md text-sm font-medium transition-colors shadow-sm"
+            className="inline-flex items-center gap-2 px-4 py-2 bg-zinc-100 hover:bg-zinc-50 text-zinc-900 rounded-md text-sm font-medium transition-colors shadow-sm"
           >
             Create your first plan
           </Link>
@@ -163,7 +167,7 @@ export function SessionListPage() {
       ) : null}
 
       {!isLoading && !error && sessions.length > 0 ? (
-        <div className="border border-zinc-800/50 rounded-xl overflow-hidden bg-zinc-900/20">
+        <div className="border border-zinc-800 rounded-xl overflow-hidden bg-zinc-900/20">
           {displaySessions.length === 0 ? (
             <div className="py-12 text-center text-zinc-500 text-sm">
               No plans for this repo. Select &quot;All repos&quot; or create a new plan.
@@ -173,7 +177,7 @@ export function SessionListPage() {
             <Link
               key={session.id}
               to={`/sessions/${session.id}${session.repo_name ? `?repo=${encodeURIComponent(session.repo_name)}` : ""}`}
-              className="group flex items-center justify-between py-4 px-5 border-b border-zinc-800/50 last:border-0 hover:bg-zinc-800/40 transition-colors duration-150"
+              className="group flex items-center justify-between py-4 px-5 border-b border-zinc-800 last:border-0 hover:bg-zinc-800/40 transition-colors duration-150"
             >
               <div className="flex items-center gap-4">
                 <div className="w-8 h-8 rounded-md bg-zinc-800 flex items-center justify-center border border-zinc-700/50 group-hover:border-zinc-600 transition-colors">
@@ -181,9 +185,14 @@ export function SessionListPage() {
                 </div>
                 <div>
                   <div className="flex items-center gap-2">
-                    <span className="text-sm font-medium text-zinc-100 group-hover:text-white transition-colors">
-                      {session.title}
+                    <span className="text-sm font-medium text-zinc-100 group-hover:text-zinc-50 transition-colors">
+                      {cleanPlanTitle(session.title)}
                     </span>
+                    {session.current_round > 0 && (
+                      <span className="text-[10px] font-mono font-medium text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded border border-indigo-500/20">
+                        v{session.current_round}
+                      </span>
+                    )}
                   </div>
                   <div className="flex items-center gap-2 mt-1">
                     <span className="text-xs font-mono text-zinc-500">{session.repo_name}</span>

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -195,3 +196,151 @@ def test_create_planning_session_persists_no_recall(tmp_path):
     loaded = store.get_planning_session(session.id)
     assert loaded is not None
     assert loaded.no_recall == 1
+
+
+def test_planning_commands_claim_complete_and_idempotency(tmp_path):
+    db_path = tmp_path / "prscope.db"
+    store = Store(db_path=db_path)
+    session = store.create_planning_session(
+        repo_name="alpha",
+        title="Queue test",
+        requirements="r",
+        seed_type="requirements",
+        status="refining",
+    )
+    payload = {"repo_name": "alpha", "user_input": "run round"}
+
+    created = store.create_planning_command(
+        session_id=session.id,
+        command_id="cmd-1",
+        payload_json=json.dumps(payload),
+    )
+    assert created.status == "queued"
+    assert created.attempt_count == 0
+    assert created.payload["repo_name"] == "alpha"
+
+    by_command = store.get_planning_command_by_command_id(session.id, "cmd-1")
+    assert by_command is not None
+    assert by_command.id == created.id
+
+    claimed = store.claim_next_planning_command(worker_id="worker-a", lease_seconds=1800)
+    assert claimed is not None
+    assert claimed.id == created.id
+    assert claimed.status == "running"
+    assert claimed.attempt_count == 1
+    assert claimed.worker_id == "worker-a"
+    assert claimed.lease_expires_at is not None
+
+    active = store.get_active_planning_command(session.id)
+    assert active is not None
+    assert active.id == created.id
+    assert active.status == "running"
+
+    completed = store.complete_planning_command_row(created.id)
+    assert completed is not None
+    assert completed.status == "completed"
+    assert completed.lease_expires_at is None
+    assert store.get_active_planning_command(session.id) is None
+
+
+def test_requeue_stale_planning_commands_respects_max_attempts(tmp_path):
+    db_path = tmp_path / "prscope.db"
+    store = Store(db_path=db_path)
+    session = store.create_planning_session(
+        repo_name="alpha",
+        title="Requeue test",
+        requirements="r",
+        seed_type="requirements",
+        status="refining",
+    )
+    low = store.create_planning_command(session.id, "cmd-low", payload_json="{}")
+    high = store.create_planning_command(session.id, "cmd-high", payload_json="{}")
+
+    with store._connect() as conn:  # noqa: SLF001 - deterministic test fixture
+        old = (datetime.now(timezone.utc) - timedelta(seconds=10)).isoformat()
+        conn.execute(
+            """
+            UPDATE planning_commands
+            SET status = 'running',
+                attempt_count = 1,
+                worker_id = 'w1',
+                lease_expires_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (old, old, low.id),
+        )
+        conn.execute(
+            """
+            UPDATE planning_commands
+            SET status = 'running',
+                attempt_count = 3,
+                worker_id = 'w2',
+                lease_expires_at = ?,
+                updated_at = ?
+            WHERE id = ?
+            """,
+            (old, old, high.id),
+        )
+
+    changed = store.requeue_stale_planning_commands(max_attempts=3)
+    assert changed == 2
+
+    low_after = store.get_planning_command(low.id)
+    high_after = store.get_planning_command(high.id)
+    assert low_after is not None and low_after.status == "queued"
+    assert high_after is not None and high_after.status == "failed"
+    # attempt_count changes only on claim, never on requeue.
+    assert low_after.attempt_count == 1
+    assert high_after.attempt_count == 3
+
+
+def test_reserve_finalize_and_replay_planning_command(tmp_path):
+    db_path = tmp_path / "prscope.db"
+    store = Store(db_path=db_path)
+    session = store.create_planning_session(
+        repo_name="alpha",
+        title="Executor test",
+        requirements="r",
+        seed_type="requirements",
+        status="refining",
+    )
+    allowed = {"refining": {"run_round"}}
+    reserved, replay, active, reason = store.reserve_planning_command(
+        session_id=session.id,
+        command="run_round",
+        command_id="cmd-exec-1",
+        payload_json="{}",
+        lease_seconds=120,
+        allowed_commands_by_status=allowed,
+    )
+    assert reason is None
+    assert replay is None
+    assert active is None
+    assert reserved is not None
+    assert reserved.status == "running"
+    assert reserved.started_at is not None
+
+    finalized = store.begin_planning_command_finalize(reserved.id)
+    assert finalized is not None
+    assert finalized.status == "finalizing"
+
+    completed = store.complete_planning_command(
+        command_row_id=reserved.id,
+        result_snapshot_json=json.dumps({"status": "refining"}),
+    )
+    assert completed is not None
+    assert completed.status == "completed"
+    assert completed.result_snapshot_json is not None
+
+    _r2, replay2, _a2, reason2 = store.reserve_planning_command(
+        session_id=session.id,
+        command="run_round",
+        command_id="cmd-exec-1",
+        payload_json="{}",
+        lease_seconds=120,
+        allowed_commands_by_status=allowed,
+    )
+    assert reason2 == "duplicate_command"
+    assert replay2 is not None
+    assert replay2.id == reserved.id

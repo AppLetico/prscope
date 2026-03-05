@@ -19,10 +19,20 @@ import {
   runRound,
   sendDiscoveryMessage,
   setStoredModelSelection,
+  stopSession,
   submitClarification,
 } from "../lib/api";
+import { cleanPlanTitle } from "../lib/planTitle";
 import type { ClarificationPrompt, PlanningSession, ToolCallEntry, UIEvent } from "../types";
 import { AlertCircle, Check, Loader2 } from "lucide-react";
+import {
+  isTerminalCompletedSnapshot,
+  shouldFinalizeFromTerminalSnapshot,
+} from "./planningViewUtils";
+
+function normalizeActivityText(value: string): string {
+  return value.replace(/\.{3,}\s*$/u, "").trim();
+}
 
 export function PlanningViewPage() {
   const { id = "" } = useParams();
@@ -51,11 +61,37 @@ export function PlanningViewPage() {
     phase_message: string | null;
     is_processing: boolean;
     active_tool_calls: ToolCallEntry[];
+    completed_tool_call_groups: ToolCallEntry[][];
   } | null>(null);
   const activeToolCallsRef = useRef<ToolCallEntry[]>([]);
+  const activeToolRunIdRef = useRef<string | null>(null);
+  const nextLocalToolRunIdRef = useRef<number>(0);
+  const lastFinalizedToolGroupSignatureRef = useRef<string>("");
   const lastEventAtMs = useRef<number>(0);
   const lastRefetchAtMs = useRef<number>(0);
   const lastContextNoticeAtMs = useRef<number>(0);
+
+  const ensureRunId = useCallback((preferred?: string | null) => {
+    if (preferred && preferred.trim()) return preferred;
+    if (activeToolRunIdRef.current) return activeToolRunIdRef.current;
+    nextLocalToolRunIdRef.current += 1;
+    return `local-tool-run-${nextLocalToolRunIdRef.current}`;
+  }, []);
+
+  const finalizeToolCalls = useCallback((calls: ToolCallEntry[], runIdHint?: string | null) => {
+    if (calls.length === 0) return false;
+    const runId = runIdHint ?? activeToolRunIdRef.current ?? "unknown-run";
+    const finalized = calls.map((call) => (
+      call.status === "running" ? { ...call, status: "done" as const } : call
+    ));
+    const signature = `${runId}:${JSON.stringify(finalized)}`;
+    if (signature === lastFinalizedToolGroupSignatureRef.current) {
+      return false;
+    }
+    lastFinalizedToolGroupSignatureRef.current = signature;
+    setToolCallGroups((groups) => [...groups, finalized].slice(-50));
+    return true;
+  }, []);
 
   useEffect(() => {
     if (lastEventAtMs.current === 0) {
@@ -96,7 +132,9 @@ export function PlanningViewPage() {
     criticModel || session?.critic_model || storedModels.critic_model || fallbackModel;
   const refetchSession = sessionQuery.refetch;
   const questions = sessionState?.pending_questions ?? [];
-  const phaseMessage = sessionState?.phase_message ?? null;
+  const phaseMessage = sessionState?.phase_message
+    ? normalizeActivityText(sessionState.phase_message)
+    : null;
   const isProcessing = sessionState?.is_processing ?? false;
   const effectiveStatus = sessionState?.status ?? session?.status;
   const effectiveRound = sessionState?.current_round ?? session?.current_round ?? 0;
@@ -110,11 +148,15 @@ export function PlanningViewPage() {
       phase_message: session.phase_message ?? null,
       is_processing: Boolean(session.is_processing),
       active_tool_calls: session.active_tool_calls ?? [],
+      completed_tool_call_groups: session.completed_tool_call_groups ?? [],
     };
     const nextCalls = session.active_tool_calls ?? [];
+    const nextCompletedGroups = session.completed_tool_call_groups ?? [];
     queueMicrotask(() => {
       setSessionState(nextState);
       setActiveToolCalls(nextCalls);
+      activeToolCallsRef.current = nextCalls;
+      setToolCallGroups((prev) => (prev.length > 0 ? prev : nextCompletedGroups));
     });
   }, [
     session,
@@ -125,19 +167,18 @@ export function PlanningViewPage() {
     session?.phase_message,
     session?.is_processing,
     session?.active_tool_calls,
+    session?.completed_tool_call_groups,
   ]);
 
   const flushActiveToolCalls = useCallback(() => {
     setActiveToolCalls((prev) => {
       if (prev.length === 0) return prev;
-      const finalized = prev.map((call) => (
-        call.status === "running" ? { ...call, status: "done" as const } : call
-      ));
+      finalizeToolCalls(prev, activeToolRunIdRef.current);
       activeToolCallsRef.current = [];
-      setToolCallGroups((groups) => [...groups, finalized].slice(-50));
+      activeToolRunIdRef.current = null;
       return [];
     });
-  }, []);
+  }, [finalizeToolCalls]);
 
   // Hydrate cost/tokens from session when loading an existing session (SSE only sends live events)
   useEffect(() => {
@@ -153,6 +194,23 @@ export function PlanningViewPage() {
   const handleEvent = useCallback((event: UIEvent) => {
     lastEventAtMs.current = Date.now();
     if (event.type === "session_state") {
+      const eventRunId = event.active_command_id?.trim() || null;
+      const snapshotCalls = event.active_tool_calls ?? [];
+      if (activeToolCallsRef.current.length > 0 && snapshotCalls.length === 0) {
+        // Some backend flows clear active calls in session_state before a
+        // terminal complete event is processed on the client.
+        finalizeToolCalls(activeToolCallsRef.current, eventRunId ?? activeToolRunIdRef.current);
+        activeToolCallsRef.current = [];
+      }
+      if (
+        eventRunId
+        && activeToolRunIdRef.current
+        && eventRunId !== activeToolRunIdRef.current
+        && activeToolCallsRef.current.length > 0
+      ) {
+        flushActiveToolCalls();
+      }
+      activeToolRunIdRef.current = eventRunId;
       setSessionState({
         status: event.status,
         current_round: event.current_round,
@@ -160,8 +218,32 @@ export function PlanningViewPage() {
         phase_message: event.phase_message,
         is_processing: event.is_processing,
         active_tool_calls: event.active_tool_calls,
+        completed_tool_call_groups: event.completed_tool_call_groups,
       });
-      setActiveToolCalls(event.active_tool_calls ?? []);
+      if ((event.completed_tool_call_groups?.length ?? 0) > 0) {
+        setToolCallGroups((prev) => (prev.length > 0 ? prev : event.completed_tool_call_groups));
+      }
+      const terminalCompletedSnapshot = isTerminalCompletedSnapshot(event.is_processing, snapshotCalls);
+      if (terminalCompletedSnapshot) {
+        if (shouldFinalizeFromTerminalSnapshot(event.is_processing, snapshotCalls, activeToolCallsRef.current.length)) {
+          // Recovery path: some flows end without explicit "complete".
+          // Only finalize from terminal snapshot when we still have active
+          // in-memory calls; otherwise this would duplicate an already-finalized group.
+          finalizeToolCalls(snapshotCalls, eventRunId);
+        }
+        // Never keep done-only terminal snapshots in active state.
+        setActiveToolCalls([]);
+        activeToolCallsRef.current = [];
+        activeToolRunIdRef.current = null;
+      } else {
+        setActiveToolCalls(snapshotCalls);
+        activeToolCallsRef.current = snapshotCalls;
+      }
+      // session_state is canonical; clear transient thinking text once
+      // the server reports stable/non-processing state.
+      if (!event.is_processing) {
+        setThinkingMessage(null);
+      }
       return;
     }
     if (event.type === "thinking") {
@@ -169,11 +251,20 @@ export function PlanningViewPage() {
       return;
     }
     if (event.type === "tool_call") {
+      const eventRunId = ensureRunId(event.command_id);
+      if (
+        activeToolRunIdRef.current
+        && activeToolRunIdRef.current !== eventRunId
+        && activeToolCallsRef.current.length > 0
+      ) {
+        flushActiveToolCalls();
+      }
+      activeToolRunIdRef.current = eventRunId;
       setActiveToolCalls((prev) => {
         const next = [
           ...prev,
           {
-            id: Date.now() + prev.length,
+            id: `${eventRunId}-${Date.now()}-${prev.length}`,
             name: event.name,
             sessionStage: event.session_stage,
             path: event.path,
@@ -187,6 +278,15 @@ export function PlanningViewPage() {
       return;
     }
     if (event.type === "tool_result") {
+      const eventRunId = ensureRunId(event.command_id);
+      if (
+        activeToolRunIdRef.current
+        && activeToolRunIdRef.current !== eventRunId
+        && activeToolCallsRef.current.length > 0
+      ) {
+        flushActiveToolCalls();
+      }
+      activeToolRunIdRef.current = eventRunId;
       setActiveToolCalls((prev) => {
         const updated = [...prev];
         for (let idx = updated.length - 1; idx >= 0; idx -= 1) {
@@ -206,7 +306,7 @@ export function PlanningViewPage() {
         const next = [
           ...updated,
           {
-            id: Date.now() + updated.length,
+            id: `${eventRunId}-${Date.now()}-${updated.length}`,
             name: event.name,
             sessionStage: event.session_stage,
             status: "done" as const,
@@ -221,11 +321,11 @@ export function PlanningViewPage() {
     if (event.type === "complete") {
       setThinkingMessage(null);
       flushActiveToolCalls();
-      setPendingClarification(null);
       setWarnings([]);
       return;
     }
     if (event.type === "plan_ready") {
+      setThinkingMessage(null);
       flushActiveToolCalls();
       if (event.round === 0) {
         setShowCritiquePrompt(true);
@@ -291,6 +391,7 @@ export function PlanningViewPage() {
         question: event.question,
         context: event.context,
         source: event.source,
+        recommendations: event.recommendations,
       });
       return;
     }
@@ -303,15 +404,13 @@ export function PlanningViewPage() {
       void refetchSession();
       return;
     }
-  }, [flushActiveToolCalls, maxPromptTokens, refetchSession, sessionCostUsd]);
+  }, [ensureRunId, finalizeToolCalls, flushActiveToolCalls, maxPromptTokens, refetchSession, sessionCostUsd]);
 
   useSessionEvents(id, handleEvent, Boolean(session));
 
   useEffect(() => {
     const status = effectiveStatus;
-    const isActive = status === "drafting"
-      || status === "discovering"
-      || status === "refining";
+    const isActive = status === "draft" || status === "refining";
     if (!isActive) {
       return;
     }
@@ -319,7 +418,7 @@ export function PlanningViewPage() {
       const now = Date.now();
       const eventStale = now - lastEventAtMs.current > 8000;
       const recentlyRefetched = now - lastRefetchAtMs.current < 4000;
-      const shouldForceRefresh = (status === "drafting" || status === "refining") && !recentlyRefetched;
+      const shouldForceRefresh = (status === "draft" || status === "refining") && !recentlyRefetched;
       if ((eventStale || shouldForceRefresh) && !recentlyRefetched) {
         lastRefetchAtMs.current = now;
         void sessionQuery.refetch();
@@ -338,17 +437,22 @@ export function PlanningViewPage() {
         author_model: selectedAuthorModel || undefined,
         critic_model: selectedCriticModel || undefined,
       };
-      if (status === "discovering") {
+      if (status === "draft") {
         await sendDiscoveryMessage(id, text, models);
+        await sessionQuery.refetch();
+      } else if (status === "refining" || status === "converged") {
+        await sendDiscoveryMessage(id, text, models);
+        await sessionQuery.refetch();
       } else {
-        setShowCritiquePrompt(false);
-        await runRound(id, text, models);
+        setError("Messages are only accepted during draft, refinement, or converged feedback.");
+        return;
       }
       if (sessionQuery.data?.session.repo_name) {
         setStoredModelSelection(models, sessionQuery.data.session.repo_name);
       }
     } catch (err) {
       if (err instanceof ConflictError) {
+        setError(err.phase_message || err.message);
         return;
       }
       setError(String(err));
@@ -405,11 +509,28 @@ export function PlanningViewPage() {
 
   const onToggleDiff = async () => {
     if (!showDiff) {
-      const response = await getDiff(id);
-      setDiff(response.diff || "No diff available.");
+      try {
+        const response = await getDiff(id);
+        setDiff(response.diff || "No diff available.");
+      } catch (err) {
+        setError(String(err));
+        return;
+      }
     }
     setShowDiff((v) => !v);
   };
+
+  useEffect(() => {
+    if (!showDiff || !id) return;
+    void (async () => {
+      try {
+        const response = await getDiff(id);
+        setDiff(response.diff || "No diff available.");
+      } catch (err) {
+        setError(String(err));
+      }
+    })();
+  }, [showDiff, id, sessionQuery.data?.current_plan?.round]);
 
   const onDelete = async () => {
     if (!window.confirm("Delete this plan? This cannot be undone.")) return;
@@ -422,24 +543,25 @@ export function PlanningViewPage() {
     }
   };
 
+  const onStop = async () => {
+    try {
+      setError(null);
+      await stopSession(id);
+      await sessionQuery.refetch();
+    } catch (err) {
+      setError(String(err));
+    }
+  };
+
   const contextPercent = contextUsageRatio !== null ? contextUsageRatio * 100 : null;
-  const activeStatus = effectiveStatus;
-  const isActiveSession = activeStatus === "discovering"
-    || activeStatus === "drafting"
-    || activeStatus === "refining";
-  const hasRunningToolCalls = activeToolCalls.some((call) => call.status === "running");
-  const isPlanActivelyUpdating = Boolean(phaseMessage || thinkingMessage || hasRunningToolCalls);
-  const leftPanelActivityMessage = useMemo(() => {
-    if (!isActiveSession || !isPlanActivelyUpdating) return null;
-    if (phaseMessage) return phaseMessage;
-    if (thinkingMessage) return thinkingMessage;
-    if (activeStatus === "drafting") return "Drafting first plan";
-    return null;
-  }, [activeStatus, isActiveSession, isPlanActivelyUpdating, phaseMessage, thinkingMessage]);
   const planContent = useMemo(() => {
     if (showDiff) return diff;
     return sessionQuery.data?.current_plan?.plan_content ?? "";
   }, [showDiff, diff, sessionQuery.data?.current_plan?.plan_content]);
+  const versionedTitle = useMemo(() => {
+    if (!session) return "";
+    return cleanPlanTitle(session.title);
+  }, [session]);
 
   if (!session && !sessionQuery.isLoading) {
     return (
@@ -450,35 +572,27 @@ export function PlanningViewPage() {
     );
   }
 
-  if (session?.status === "preparing") {
+  if (
+    effectiveStatus === "draft"
+    && isProcessing
+    && setupSteps.length > 0
+    && turns.length === 0
+    && !(sessionQuery.data?.current_plan?.plan_content ?? "").trim()
+  ) {
     return (
       <main className="h-screen flex flex-col bg-zinc-950 overflow-hidden">
         {session ? (
           <ActionBar
             repoName={session.repo_name}
-            title={session.title}
+            title={versionedTitle}
             round={session.current_round}
             status={session.status}
             convergenceScore={undefined}
-            canCritique={false}
-            canApprove={false}
-            canExport={false}
-            onCritique={() => {}}
-            onApprove={() => {}}
-            onExport={() => {}}
-            onToggleDiff={() => onToggleDiff()}
-            isDiffMode={showDiff}
-            authorModel={selectedAuthorModel}
-            criticModel={selectedCriticModel}
-            modelOptions={modelItems}
-            onAuthorModelChange={setAuthorModel}
-            onCriticModelChange={setCriticModel}
             sessionCostUsd={0}
             maxPromptTokens={0}
             contextWindowTokens={null}
             contextPercent={null}
             contextCompactionEnabled={false}
-            critiquePending={false}
           />
         ) : null}
         <div className="flex-1 flex flex-col items-center justify-center p-8">
@@ -521,49 +635,17 @@ export function PlanningViewPage() {
         <>
           <ActionBar
             repoName={session.repo_name}
-            title={session.title}
+            title={versionedTitle}
             round={effectiveRound}
             status={effectiveStatus ?? session.status}
             convergenceScore={sessionQuery.data?.current_plan?.convergence_score ?? undefined}
-            canCritique={!isProcessing && (effectiveStatus === "refining" || effectiveStatus === "converged")}
-            canApprove={!isProcessing && (effectiveStatus === "converged" || effectiveStatus === "approved")}
-            canExport={
-              Boolean(sessionQuery.data?.current_plan)
-              && (effectiveStatus === "approved" || effectiveStatus === "exported")
-            }
-            onCritique={() => void onCritique()}
-            onApprove={() => void onApprove()}
-            onExport={() => void onExport()}
-            onToggleDiff={() => void onToggleDiff()}
-            isDiffMode={showDiff}
-            authorModel={selectedAuthorModel}
-            criticModel={selectedCriticModel}
-            modelOptions={modelItems}
-            onAuthorModelChange={(modelId) => {
-              setAuthorModel(modelId);
-              if (session.repo_name) {
-                setStoredModelSelection(
-                  { author_model: modelId, critic_model: selectedCriticModel || undefined },
-                  session.repo_name,
-                );
-              }
-            }}
-            onCriticModelChange={(modelId) => {
-              setCriticModel(modelId);
-              if (session.repo_name) {
-                setStoredModelSelection(
-                  { author_model: selectedAuthorModel || undefined, critic_model: modelId },
-                  session.repo_name,
-                );
-              }
-            }}
             sessionCostUsd={sessionCostUsd}
             maxPromptTokens={maxPromptTokens}
             contextWindowTokens={contextWindowTokens}
             contextPercent={contextPercent}
             contextCompactionEnabled={contextCompactionEnabled}
-            critiquePending={showCritiquePrompt}
             onDelete={onDelete}
+            roundMetrics={sessionQuery.data?.round_metrics}
           />
           
           {error && (
@@ -586,8 +668,12 @@ export function PlanningViewPage() {
                   content={planContent}
                   isDiffMode={showDiff}
                   status={effectiveStatus ?? session.status}
-                  activityMessage={leftPanelActivityMessage}
-                  isRefreshing={sessionQuery.isFetching && isPlanActivelyUpdating}
+                  canExport={
+                    Boolean(sessionQuery.data?.current_plan)
+                    && effectiveStatus === "approved"
+                  }
+                  onToggleDiff={() => void onToggleDiff()}
+                  onExport={() => void onExport()}
                 />
               )}
               right={
@@ -600,10 +686,38 @@ export function PlanningViewPage() {
                   phaseMessage={phaseMessage}
                   warnings={warnings}
                   pendingClarification={pendingClarification}
-                  showCritiquePrompt={showCritiquePrompt}
                   inputDisabled={isProcessing}
+                  isProcessing={isProcessing}
+                  authorModel={selectedAuthorModel}
+                  criticModel={selectedCriticModel}
+                  modelOptions={modelItems}
+                  onAuthorModelChange={(modelId) => {
+                    setAuthorModel(modelId);
+                    if (session.repo_name) {
+                      setStoredModelSelection(
+                        { author_model: modelId, critic_model: selectedCriticModel || undefined },
+                        session.repo_name,
+                      );
+                    }
+                  }}
+                  onCriticModelChange={(modelId) => {
+                    setCriticModel(modelId);
+                    if (session.repo_name) {
+                      setStoredModelSelection(
+                        { author_model: selectedAuthorModel || undefined, critic_model: modelId },
+                        session.repo_name,
+                      );
+                    }
+                  }}
+                  canCritique={!isProcessing && (effectiveStatus === "refining" || effectiveStatus === "converged")}
+                  canApprove={!isProcessing && effectiveStatus === "converged"}
+                  critiquePending={showCritiquePrompt}
+                  contextPercent={contextPercent}
+                  contextWindowTokens={contextWindowTokens}
+                  onCritique={() => void onCritique()}
+                  onApprove={() => void onApprove()}
+                  onStop={() => void onStop()}
                   onSubmit={submitMessage}
-                  onCritique={onCritique}
                   onSubmitClarification={handleClarificationSubmit}
                 />
               }

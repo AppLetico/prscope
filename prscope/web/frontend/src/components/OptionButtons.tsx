@@ -34,18 +34,18 @@ export function OptionButtons({
     <div className="mt-6 space-y-6">
       {questions.map((q) => (
         <div key={q.index} className="animate-in slide-in-from-bottom-2 fade-in duration-300 ease-out">
-          <div className="flex gap-3 mb-3">
-            <div className="mt-0.5">
-              <div className="w-6 h-6 rounded-full bg-indigo-500/10 flex items-center justify-center border border-indigo-500/20">
-                <HelpCircle className="w-3.5 h-3.5 text-indigo-400" />
+          <div className="flex gap-4 mb-3">
+            <div className="shrink-0 mt-1 flex justify-center w-8">
+              <div className="w-8 h-8 rounded-full bg-indigo-500/10 flex items-center justify-center border border-indigo-500/20">
+                <HelpCircle className="w-4 h-4 text-indigo-400" />
               </div>
             </div>
-            <p className="text-sm font-medium text-zinc-200 leading-relaxed">
+            <p className="text-sm font-medium text-zinc-200 leading-relaxed mt-1.5">
               {toDisplayText(q.text)}
             </p>
           </div>
           
-          <div className="flex flex-col gap-2 pl-9">
+          <div className="flex flex-col gap-2 pl-12">
             {q.options.map((opt) => (
               <button
                 key={`${q.index}-${opt.letter}`}

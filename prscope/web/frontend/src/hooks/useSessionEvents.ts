@@ -1,12 +1,32 @@
 import { useEffect } from "react";
 import type { DiscoveryQuestion, SessionStatus, ToolCallEntry, UIEvent } from "../types";
 
+const SESSION_STATUS_VALUES: ReadonlySet<SessionStatus> = new Set([
+  "draft",
+  "refining",
+  "converged",
+  "approved",
+  "error",
+]);
+
+function parseSessionStatus(value: unknown): SessionStatus {
+  if (typeof value === "string" && SESSION_STATUS_VALUES.has(value as SessionStatus)) {
+    return value as SessionStatus;
+  }
+  return "error";
+}
+
 function normalizeEvent(rawType: string, rawPayload: Record<string, unknown>): UIEvent | null {
   if (rawType === "session_state") {
+    const activeCommandRaw = rawPayload.active_command;
+    const activeCommand =
+      typeof activeCommandRaw === "object" && activeCommandRaw !== null
+        ? (activeCommandRaw as Record<string, unknown>)
+        : null;
     return {
       type: "session_state",
       v: 1,
-      status: String(rawPayload.status ?? "discovering") as SessionStatus,
+      status: parseSessionStatus(rawPayload.status),
       phase_message: rawPayload.phase_message ? String(rawPayload.phase_message) : null,
       is_processing: Boolean(rawPayload.is_processing),
       current_round: Number(rawPayload.current_round ?? 0),
@@ -16,6 +36,13 @@ function normalizeEvent(rawType: string, rawPayload: Record<string, unknown>): U
       active_tool_calls: Array.isArray(rawPayload.active_tool_calls)
         ? (rawPayload.active_tool_calls as ToolCallEntry[])
         : [],
+      completed_tool_call_groups: Array.isArray(rawPayload.completed_tool_call_groups)
+        ? (rawPayload.completed_tool_call_groups as ToolCallEntry[][])
+        : [],
+      active_command_id:
+        activeCommand && typeof activeCommand.command_id === "string"
+          ? activeCommand.command_id
+          : null,
     };
   }
   if (rawType === "thinking") {
@@ -28,6 +55,7 @@ function normalizeEvent(rawType: string, rawPayload: Record<string, unknown>): U
       path: rawPayload.path ? String(rawPayload.path) : undefined,
       query: rawPayload.query ? String(rawPayload.query) : undefined,
       session_stage: rawPayload.session_stage ? String(rawPayload.session_stage) : undefined,
+      command_id: rawPayload.command_id ? String(rawPayload.command_id) : undefined,
     };
   }
   if (rawType === "tool_result") {
@@ -36,6 +64,7 @@ function normalizeEvent(rawType: string, rawPayload: Record<string, unknown>): U
       name: String(rawPayload.name ?? "tool"),
       session_stage: rawPayload.session_stage ? String(rawPayload.session_stage) : undefined,
       duration_ms: rawPayload.duration_ms !== undefined ? Number(rawPayload.duration_ms) : undefined,
+      command_id: rawPayload.command_id ? String(rawPayload.command_id) : undefined,
     };
   }
   if (rawType === "complete") {
@@ -94,11 +123,16 @@ function normalizeEvent(rawType: string, rawPayload: Record<string, unknown>): U
     };
   }
   if (rawType === "clarification_needed") {
+    const recommendations = Array.isArray(rawPayload.recommendations)
+      ? rawPayload.recommendations
+        .filter((value): value is string => typeof value === "string")
+      : undefined;
     return {
       type: "clarification_needed",
       question: String(rawPayload.question ?? ""),
       context: rawPayload.context ? String(rawPayload.context) : undefined,
       source: rawPayload.source ? String(rawPayload.source) : undefined,
+      recommendations,
     };
   }
   if (rawType === "setup_progress") {

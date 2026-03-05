@@ -9,6 +9,7 @@ import json
 import logging
 import re
 import time
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -34,7 +35,11 @@ from .tools import ToolExecutor
 MEMORY_BLOCK_KEYS = {"architecture", "modules", "patterns", "entrypoints", "context"}
 # Keep startup responsive; deeper refinement can happen in subsequent rounds.
 INITIAL_DRAFT_TIMEOUT_SECONDS = 90
+REFINEMENT_AUTHOR_TIMEOUT_SECONDS = 420
+REFINEMENT_MAX_TOOL_CALLS = 10
 MAX_ACTIVE_TOOL_CALLS = 50
+MAX_COMPLETED_TOOL_CALL_GROUPS = 50
+CRITIC_MAX_CLARIFICATION_QUESTIONS_PER_ROUND = 1
 logger = logging.getLogger(__name__)
 
 
@@ -63,6 +68,7 @@ class PlanningRuntime:
         self._session_read_paths: dict[str, set[str]] = {}
         self._clarification_gates: dict[str, ClarificationGate] = {}
         self._clarification_logs: dict[str, list[dict[str, Any]]] = {}
+        self._suppressed_critic_clarifications: dict[str, int] = {}
         self._session_working_summary: dict[str, str] = {}
         self._session_skills_context: dict[str, str] = {}
         self._session_no_recall: dict[str, bool] = {}
@@ -95,6 +101,7 @@ class PlanningRuntime:
         self._session_read_paths.pop(session_id, None)
         self._clarification_gates.pop(session_id, None)
         self._clarification_logs.pop(session_id, None)
+        self._suppressed_critic_clarifications.pop(session_id, None)
         self._session_working_summary.pop(session_id, None)
         self._session_skills_context.pop(session_id, None)
         self._session_no_recall.pop(session_id, None)
@@ -174,6 +181,41 @@ class PlanningRuntime:
             return
         self._session_reads(session_id).update(read_paths)
 
+    def _critic_evidence_context(self, session_id: str) -> str:
+        read_paths = sorted(path for path in self._session_reads(session_id) if path)
+        if not read_paths:
+            return "Author evidence reads this round: (none recorded)"
+        limited = read_paths[:20]
+        bullets = "\n".join(f"- {path}" for path in limited)
+        suffix = "\n- ... (truncated)" if len(read_paths) > len(limited) else ""
+        return f"Author evidence reads this round (for critic grounding):\n{bullets}{suffix}"
+
+    @staticmethod
+    def _has_concrete_critic_evidence_gap(critic: CriticResult) -> bool:
+        """
+        Treat evidence gaps as actionable only when they cite concrete code locations.
+        This prevents generic clarification prompts that do not help convergence.
+        """
+
+        candidates = [*critic.missing_evidence, *critic.unsupported_claims]
+        if not candidates:
+            return False
+
+        file_path_hint = re.compile(
+            r"(`[^`\n]+`)|(\b[\w./-]+\.(py|ts|tsx|js|jsx|md|json|yml|yaml|toml|sql|sh)\b)",
+            re.IGNORECASE,
+        )
+        change_hint = re.compile(
+            r"\b(line|section|heading|function|class|field|file|path|endpoint|test)\b", re.IGNORECASE
+        )
+        for raw in candidates:
+            text = str(raw).strip()
+            if not text:
+                continue
+            if file_path_hint.search(text) and change_hint.search(text):
+                return True
+        return False
+
     def _clarification_gate(self, session_id: str) -> ClarificationGate:
         gate = self._clarification_gates.get(session_id)
         if gate is None:
@@ -182,6 +224,16 @@ class PlanningRuntime:
         return gate
 
     def provide_clarification(self, session_id: str, answers: list[str]) -> None:
+        if answers:
+            logs = self._clarification_logs.setdefault(session_id, [])
+            pending_indices = [idx for idx, item in enumerate(logs) if not str(item.get("answer", "")).strip()]
+            for idx, answer in zip(pending_indices, answers):
+                logs[idx]["answer"] = answer
+                logs[idx]["timed_out"] = False
+            self.store.update_planning_session(
+                session_id,
+                clarifications_log_json=json.dumps(logs),
+            )
         self._clarification_gate(session_id).provide_answer(answers)
 
     def abort_clarification(self, session_id: str) -> None:
@@ -300,10 +352,12 @@ class PlanningRuntime:
         ]
         major_issues = self._cap_lines([issue for issue in major_issues if issue.strip()], 5)
         clarifications = [
-            self._single_line(item.get("answer", ""))
+            self._single_line(str(item.get("answer", "")))
             for item in self._clarification_logs.get(session_id, [])
-            if int(item.get("round", -1)) == round_number and str(item.get("answer", "")).strip()
+            if str(item.get("answer", "")).strip()
         ]
+        if len(clarifications) > 10:
+            clarifications = clarifications[-10:]
         clarifications = self._cap_lines(clarifications, 5)
         inspected = sorted(self._session_reads(session_id))
         inspected = self._cap_lines(inspected, 10)
@@ -436,6 +490,18 @@ class PlanningRuntime:
                     active = [item for item in parsed if isinstance(item, dict)]
             except json.JSONDecodeError:
                 active = []
+        completed_groups: list[list[dict[str, Any]]] = []
+        if getattr(session, "completed_tool_call_groups_json", None):
+            try:
+                parsed_completed = json.loads(str(session.completed_tool_call_groups_json))
+                if isinstance(parsed_completed, list):
+                    completed_groups = [
+                        [entry for entry in group if isinstance(entry, dict)]
+                        for group in parsed_completed
+                        if isinstance(group, list)
+                    ]
+            except json.JSONDecodeError:
+                completed_groups = []
 
         now_iso = datetime.now(timezone.utc).isoformat()
         if event_type == "tool_call":
@@ -477,6 +543,15 @@ class PlanningRuntime:
                     }
                 )
         elif event_type == "complete":
+            finalized_group = [
+                {**item, "status": "done"} if str(item.get("status", "")) == "running" else item
+                for item in active
+                if isinstance(item, dict)
+            ]
+            if finalized_group:
+                completed_groups.append(finalized_group)
+                if len(completed_groups) > MAX_COMPLETED_TOOL_CALL_GROUPS:
+                    completed_groups = completed_groups[-MAX_COMPLETED_TOOL_CALL_GROUPS:]
             active = []
         else:
             return None
@@ -484,13 +559,19 @@ class PlanningRuntime:
         active.sort(key=lambda item: str(item.get("created_at", "")))
         if len(active) > MAX_ACTIVE_TOOL_CALLS:
             active = active[-MAX_ACTIVE_TOOL_CALLS:]
-
-        return core.transition_and_snapshot(
+        snapshot = core.transition_and_snapshot(
             session.status,
             phase_message=session.phase_message,
             active_tool_calls_json=json.dumps(active),
             allow_round_stability=True,
         )
+        if event_type == "complete":
+            self.store.update_planning_session(
+                session_id,
+                _bypass_protection=True,
+                completed_tool_call_groups_json=json.dumps(completed_groups),
+            )
+        return snapshot
 
     async def _prepare_memory(
         self,
@@ -593,7 +674,7 @@ class PlanningRuntime:
 
             self.author.event_callback = wrapped_event
             snapshot = core.transition_and_snapshot(
-                "drafting",
+                "draft",
                 phase_message="Building initial plan draft...",
                 pending_questions_json=None,
             )
@@ -616,6 +697,8 @@ class PlanningRuntime:
                 },
                 session_id,
             )
+            await wrapped_event({"type": "tool_call", "name": "draft_plan", "session_stage": "planner"})
+            _draft_started = time.perf_counter()
             try:
                 author_result = await asyncio.wait_for(
                     self._run_initial_draft(
@@ -673,6 +756,14 @@ class PlanningRuntime:
                     session_id,
                 )
                 plan_content = self._initial_draft_fallback(requirements, str(exc))
+            await wrapped_event(
+                {
+                    "type": "tool_result",
+                    "name": "draft_plan",
+                    "session_stage": "planner",
+                    "duration_ms": round((time.perf_counter() - _draft_started) * 1000),
+                }
+            )
             core.add_turn("author", self._author_chat_summary(plan_content, 0), round_number=0)
             core.save_plan_version(plan_content, round_number=0)
             await self._emit_event(
@@ -711,7 +802,7 @@ class PlanningRuntime:
             critic_model=critic_model or self.planning_config.critic_model,
             seed_type="requirements",
             no_recall=no_recall,
-            status="drafting",
+            status="draft",
         )
         self._session_no_recall[session.id] = no_recall
         return session
@@ -823,7 +914,7 @@ class PlanningRuntime:
             seed_type="upstream_pr",
             seed_ref=f"{upstream_repo}#{pr_number}",
             no_recall=no_recall,
-            status="drafting",
+            status="draft",
         )
         self._session_no_recall[session.id] = no_recall
         core = self._core(session.id)
@@ -846,7 +937,7 @@ class PlanningRuntime:
         no_recall: bool = False,
         rebuild_memory: bool = False,
     ) -> tuple[PlanningSession, str | None]:
-        """Create a chat session with status 'preparing'. Call continue_chat_setup to build memory and get opening."""
+        """Create a chat session in draft. Setup runs in background with phase progress events."""
         session = self.store.create_planning_session(
             repo_name=self.repo.name,
             title="New Plan (discovery)",
@@ -855,7 +946,7 @@ class PlanningRuntime:
             critic_model=critic_model or self.planning_config.critic_model,
             seed_type="chat",
             no_recall=no_recall,
-            status="preparing",
+            status="draft",
         )
         self._session_no_recall[session.id] = no_recall
         return session, None
@@ -866,7 +957,7 @@ class PlanningRuntime:
         rebuild_memory: bool = False,
         event_callback: Any | None = None,
     ) -> str:
-        """Build memory (with progress), add opening turn, set status to discovering. Returns opening message."""
+        """Build memory (with progress), add opening turn, keep status at draft. Returns opening message."""
 
         async def wrapped_event(event: dict[str, Any]) -> None:
             await self._emit_event(event_callback, event, session_id)
@@ -883,7 +974,7 @@ class PlanningRuntime:
         opening = self.discovery.opening_prompt()
         core = self._core(session_id)
         core.add_turn("author", opening, round_number=0)
-        snapshot = core.transition_and_snapshot("discovering", phase_message=None)
+        snapshot = core.transition_and_snapshot("draft", phase_message=None)
         await wrapped_event(snapshot)
         await wrapped_event({"type": "discovery_ready", "opening": opening})
         return opening
@@ -901,8 +992,8 @@ class PlanningRuntime:
             core = self._core(session_id)
             self.tools.set_session(session_id)
             session = core.get_session()
-            if session.status not in {"discovering", "discovery"}:
-                raise ValueError("Session is not in discovery mode")
+            if session.status != "draft":
+                raise ValueError("Session is not in draft mode")
             core.validate_command("message", session)
 
             async def wrapped_event(event: dict[str, Any]) -> None:
@@ -912,7 +1003,19 @@ class PlanningRuntime:
             self.author.event_callback = wrapped_event
 
             current_round = session.current_round
+            previous_pending_questions_json = session.pending_questions_json
             core.add_turn("user", user_message, round_number=current_round)
+            processing_message = (
+                "Analyzing your answers and preparing the first draft"
+                if previous_pending_questions_json
+                else "Analyzing your request and preparing clarifying questions"
+            )
+            snapshot = core.transition_and_snapshot(
+                "draft",
+                phase_message=processing_message,
+                pending_questions_json=None,
+            )
+            await wrapped_event(snapshot)
             conversation = [{"role": turn.role, "content": turn.content} for turn in core.get_conversation()]
             discovery_context = "".join(
                 [
@@ -929,13 +1032,15 @@ class PlanningRuntime:
                     extra_context=discovery_context,
                 )
                 self._record_session_reads(session_id, self.tools.accessed_paths.copy())
+                # Preserve full discovery question text in conversation history so
+                # follow-up user answers keep enough context for the model.
                 core.add_turn("author", result.reply, round_number=current_round)
 
                 if result.complete:
                     summary = result.summary or user_message
                     self.store.update_planning_session(session_id, requirements=summary)
                     snapshot = core.transition_and_snapshot(
-                        "drafting",
+                        "draft",
                         phase_message="Building initial plan draft...",
                         pending_questions_json=None,
                     )
@@ -959,14 +1064,31 @@ class PlanningRuntime:
                         await wrapped_event(snapshot)
                 else:
                     snapshot = core.transition_and_snapshot(
-                        "discovering",
+                        "draft",
                         phase_message=None,
-                        pending_questions_json=(json.dumps(result.questions) if result.questions else None),
+                        pending_questions_json=(
+                            json.dumps([asdict(question) for question in result.questions])
+                            if result.questions
+                            else None
+                        ),
                     )
                     await wrapped_event(snapshot)
 
+                await self._emit_event(
+                    event_callback,
+                    {"type": "complete", "message": "Discovery turn complete"},
+                    session_id,
+                )
                 return result
             except Exception:
+                latest = core.get_session()
+                if latest.status == "draft" and bool(latest.is_processing):
+                    recovery = core.transition_and_snapshot(
+                        "draft",
+                        phase_message=None,
+                        pending_questions_json=previous_pending_questions_json,
+                    )
+                    await wrapped_event(recovery)
                 if event_callback:
                     maybe = event_callback({"type": "error", "message": "Discovery turn failed"})
                     if asyncio.iscoroutine(maybe):
@@ -980,7 +1102,7 @@ class PlanningRuntime:
         author_model_override: str | None = None,
         event_callback: Any | None = None,
     ) -> PlanningSession:
-        """Continue drafting after discovery has already transitioned session to drafting."""
+        """Continue drafting after discovery has prepared requirements in draft state."""
         return await self._continue_initial_draft(
             session_id=session_id,
             requirements=requirements,
@@ -988,6 +1110,86 @@ class PlanningRuntime:
             event_callback=event_callback,
             rebuild_memory=False,
         )
+
+    async def chat_with_author(
+        self,
+        session_id: str,
+        user_message: str,
+        author_model_override: str | None = None,
+        event_callback: Any | None = None,
+    ) -> str:
+        """
+        Handle a conversational author reply in refinement/converged mode without running critique.
+        """
+        async with self._session_lock(session_id):
+            core = self._core(session_id)
+            session = core.get_session()
+            if session.status not in {"refining", "converged"}:
+                raise ValueError(f"Session is not in chat-refinement state: {session.status}")
+            core.validate_command("message", session)
+
+            status = session.status
+            current_round = session.current_round
+            current_plan = core.get_current_plan()
+            if current_plan is None:
+                raise ValueError("Cannot chat with author before an initial draft exists")
+
+            snapshot = core.transition_and_snapshot(
+                status,
+                phase_message="Author is responding...",
+                allow_round_stability=True,
+            )
+            await self._emit_event(event_callback, snapshot, session_id)
+
+            completed = False
+            try:
+                core.add_turn("user", user_message, round_number=current_round)
+                recent_turns = core.get_conversation()[-8:]
+                history_lines = "\n".join(
+                    f"{turn.role}: {turn.content.strip()}" for turn in recent_turns if turn.content.strip()
+                )
+                prompt = (
+                    "You are the planning author in a refinement chat.\n"
+                    "Answer the user's message conversationally and concisely.\n"
+                    "Do not run critique yourself.\n"
+                    "Do not claim the plan is updated unless a critique/refinement round is explicitly run.\n"
+                    "If useful, propose what should be adjusted in the next critique run.\n\n"
+                    f"Current plan (excerpt):\n{current_plan.plan_content[:3500]}\n\n"
+                    f"Recent conversation:\n{history_lines}\n\n"
+                    f"User message:\n{user_message}"
+                )
+                response, _ = await self.author._llm_call(  # noqa: SLF001
+                    [
+                        {"role": "system", "content": "You are a pragmatic software planning assistant."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    allow_tools=False,
+                    max_output_tokens=700,
+                    model_override=self._resolve_author_model(session, author_model_override),
+                )
+                message = response.choices[0].message
+                reply = str(getattr(message, "content", None) or "").strip()
+                if not reply:
+                    reply = (
+                        "I hear you. I can discuss changes here, and when you're ready we can run "
+                        "critique to apply updates to the plan."
+                    )
+                core.add_turn("author", reply, round_number=current_round)
+                completed = True
+                return reply
+            finally:
+                recovery = core.transition_and_snapshot(
+                    status,
+                    phase_message=None,
+                    allow_round_stability=True,
+                )
+                await self._emit_event(event_callback, recovery, session_id)
+                if completed:
+                    await self._emit_event(
+                        event_callback,
+                        {"type": "complete", "message": "Author chat reply complete"},
+                        session_id,
+                    )
 
     async def _run_initial_draft(
         self,
@@ -1080,9 +1282,9 @@ class PlanningRuntime:
             core = self._core(session_id)
             self.tools.set_session(session_id)
             session = core.get_session()
-            if session.status not in {"refining", "converged", "approved"}:
+            if session.status not in {"refining", "converged"}:
                 raise ValueError(f"Session is not in refining state: {session.status}")
-            core.validate_command("round", session)
+            core.validate_command("run_round", session)
 
             if session.status == "converged":
                 snapshot = core.transition_and_snapshot("refining", phase_message=None)
@@ -1106,10 +1308,11 @@ class PlanningRuntime:
                 round_number = session.current_round + 1
                 snapshot = core.transition_and_snapshot(
                     "refining",
-                    phase_message="Running critique...",
+                    phase_message="Running critique",
                     current_round=round_number,
                 )
                 await self._emit_event(event_callback, snapshot, session_id)
+                _critique_started = time.perf_counter()
                 blocks = self.memory.load_all_blocks()
                 manifesto = self._truncate_memory_block("manifesto", self.memory.load_manifesto())
                 manifesto_excerpt = self._excerpt(manifesto, max_lines=40)
@@ -1242,22 +1445,55 @@ class PlanningRuntime:
                     return answers
 
                 self.author.clarification_handler = handle_author_clarification
+                critic_prior_context = prior_critique_context
+                evidence_context = self._critic_evidence_context(session_id)
+                if critic_prior_context:
+                    critic_prior_context = f"{critic_prior_context}\n\n{evidence_context}"
+                else:
+                    critic_prior_context = evidence_context
+
+                await wrapped_event({"type": "tool_call", "name": "run_critique", "session_stage": "critic"})
                 critic_result = await self.critic.run_critic(
                     requirements=requirements,
                     plan_content=current.plan_content,
                     manifesto=manifesto,
                     architecture=blocks.get("architecture", ""),
                     constraints=constraints,
-                    prior_critique=prior_critique_context,
+                    prior_critique=critic_prior_context,
                     model_override=selected_critic_model,
+                    session_id=session_id,
+                    round_number=round_number,
                 )
-                should_pause_for_clarification = bool(critic_result.clarification_questions) and (
-                    critic_result.critic_confidence < 0.6
-                    or bool(critic_result.hard_constraint_violations)
-                    or (critic_result.vagueness_score > 0.25 and len(self._session_reads(session_id)) == 0)
+                asked_critic_questions: list[str] = []
+                clarification_candidates = [q.strip() for q in critic_result.clarification_questions if str(q).strip()]
+                has_hard_constraint_violations = bool(critic_result.hard_constraint_violations)
+                evidence_gap = bool(critic_result.missing_evidence or critic_result.unsupported_claims)
+                has_concrete_evidence_gap = self._has_concrete_critic_evidence_gap(critic_result)
+                should_pause_for_clarification = (
+                    bool(clarification_candidates)
+                    and has_hard_constraint_violations
+                    and evidence_gap
+                    and has_concrete_evidence_gap
                 )
+                if clarification_candidates and not should_pause_for_clarification:
+                    suppressed_count = len(clarification_candidates)
+                    total = self._suppressed_critic_clarifications.get(session_id, 0) + suppressed_count
+                    self._suppressed_critic_clarifications[session_id] = total
+                    logger.info(
+                        "[clarification_gate] Suppressed critic clarifications "
+                        "(session_id=%s round=%s suppressed_in_round=%s total_suppressed=%s "
+                        "hard_constraints=%s evidence_gap=%s concrete_evidence_gap=%s)",
+                        session_id,
+                        round_number,
+                        suppressed_count,
+                        total,
+                        has_hard_constraint_violations,
+                        evidence_gap,
+                        has_concrete_evidence_gap,
+                    )
                 if should_pause_for_clarification:
-                    for question in critic_result.clarification_questions:
+                    asked_critic_questions = clarification_candidates[:CRITIC_MAX_CLARIFICATION_QUESTIONS_PER_ROUND]
+                    for question in asked_critic_questions:
                         log_item = {
                             "round": round_number,
                             "question": question,
@@ -1277,6 +1513,8 @@ class PlanningRuntime:
                             session_id,
                         )
                     if event_callback is not None:
+                        # In API/web mode we surface clarification prompts but keep the
+                        # round moving to avoid clarification loops that stall convergence.
                         self.store.update_planning_session(
                             session_id,
                             clarifications_log_json=json.dumps(self._clarification_logs.get(session_id, [])),
@@ -1284,41 +1522,27 @@ class PlanningRuntime:
                         await self._emit_event(
                             event_callback,
                             {
-                                "type": "thinking",
-                                "message": "Waiting for clarification before continuing refinement.",
+                                "type": "warning",
+                                "message": (
+                                    "Clarification requested; continuing with best-effort assumptions from available context."
+                                ),
                             },
                             session_id,
                         )
-                        await self._emit_event(
-                            event_callback,
-                            {
-                                "type": "complete",
-                                "message": "Clarification requested",
-                            },
+                    if event_callback is None:
+                        try:
+                            answers, timed_out = await gate.wait_for_answer()
+                        except ClarificationAborted:
+                            answers, timed_out = ([], False)
+                        for idx, log in enumerate(self._clarification_logs.get(session_id, [])):
+                            if log["round"] == round_number and log["source"] == "critic" and not log["answer"]:
+                                if idx < len(answers):
+                                    log["answer"] = answers[idx]
+                                log["timed_out"] = timed_out
+                        self.store.update_planning_session(
                             session_id,
+                            clarifications_log_json=json.dumps(self._clarification_logs.get(session_id, [])),
                         )
-                        return (
-                            critic_result,
-                            AuthorResult(
-                                plan=current.plan_content,
-                                unverified_references=set(),
-                                accessed_paths=self._session_reads(session_id).copy(),
-                            ),
-                            core.check_convergence(),
-                        )
-                    try:
-                        answers, timed_out = await gate.wait_for_answer()
-                    except ClarificationAborted:
-                        answers, timed_out = ([], False)
-                    for idx, log in enumerate(self._clarification_logs.get(session_id, [])):
-                        if log["round"] == round_number and log["source"] == "critic" and not log["answer"]:
-                            if idx < len(answers):
-                                log["answer"] = answers[idx]
-                            log["timed_out"] = timed_out
-                    self.store.update_planning_session(
-                        session_id,
-                        clarifications_log_json=json.dumps(self._clarification_logs.get(session_id, [])),
-                    )
                 critic_content = self._critic_chat_summary(critic_result, constraints=constraints)
                 budget = TokenBudgetManager(context_window=128_000, max_completion_tokens=4000)
                 budget.enforce_required([requirements, f"Manifesto:\n{manifesto_excerpt}"])
@@ -1458,13 +1682,89 @@ class PlanningRuntime:
                     or bool(critic_result.missing_evidence)
                     or bool(critic_result.unsupported_claims)
                 )
-                author_result = await self.author.author_loop(
-                    author_messages,
-                    require_tool_calls=require_refiner_tool_calls,
-                    min_grounding_ratio=0.8,
-                    grounding_paths=self._session_reads(session_id),
-                    draft_phase="refiner",
-                    model_override=selected_author_model,
+                await wrapped_event(
+                    {
+                        "type": "tool_result",
+                        "name": "run_critique",
+                        "session_stage": "critic",
+                        "duration_ms": round((time.perf_counter() - _critique_started) * 1000),
+                    }
+                )
+                snapshot = core.transition_and_snapshot(
+                    "refining",
+                    phase_message="Applying critique updates",
+                    allow_round_stability=True,
+                )
+                await self._emit_event(event_callback, snapshot, session_id)
+                await wrapped_event({"type": "tool_call", "name": "apply_critique", "session_stage": "planner"})
+                _refine_started = time.perf_counter()
+                try:
+                    author_result = await asyncio.wait_for(
+                        self.author.author_loop(
+                            author_messages,
+                            require_tool_calls=require_refiner_tool_calls,
+                            max_tool_calls=min(REFINEMENT_MAX_TOOL_CALLS, self.planning_config.author_tool_rounds),
+                            min_grounding_ratio=0.8,
+                            grounding_paths=self._session_reads(session_id),
+                            draft_phase="refiner",
+                            model_override=selected_author_model,
+                        ),
+                        timeout=REFINEMENT_AUTHOR_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    await self._emit_event(
+                        event_callback,
+                        {
+                            "type": "warning",
+                            "message": (
+                                "Refinement timed out; keeping the current draft unchanged. "
+                                "You can run another critique round."
+                            ),
+                        },
+                        session_id,
+                    )
+                    await wrapped_event(
+                        {
+                            "type": "tool_result",
+                            "name": "apply_critique",
+                            "session_stage": "planner",
+                            "duration_ms": round((time.perf_counter() - _refine_started) * 1000),
+                        }
+                    )
+                    core.add_turn(
+                        "author",
+                        "Refinement timed out; keeping current draft unchanged.",
+                        round_number=round_number,
+                    )
+                    convergence = core.check_convergence()
+                    snapshot = core.transition_and_snapshot(
+                        "refining",
+                        phase_message=None,
+                        allow_round_stability=True,
+                    )
+                    await self._emit_event(event_callback, snapshot, session_id)
+                    if event_callback:
+                        await self._emit_event(
+                            event_callback,
+                            {"type": "complete", "message": "Adversarial round timed out"},
+                            session_id,
+                        )
+                    return (
+                        critic_result,
+                        AuthorResult(
+                            plan=current.plan_content,
+                            unverified_references=set(),
+                            accessed_paths=self._session_reads(session_id).copy(),
+                        ),
+                        convergence,
+                    )
+                await wrapped_event(
+                    {
+                        "type": "tool_result",
+                        "name": "apply_critique",
+                        "session_stage": "planner",
+                        "duration_ms": round((time.perf_counter() - _refine_started) * 1000),
+                    }
                 )
                 self._record_session_reads(session_id, author_result.accessed_paths)
                 core.add_turn(
@@ -1483,8 +1783,50 @@ class PlanningRuntime:
                     session_id,
                 )
                 convergence = core.check_convergence()
-                # Persist convergence score for UI: 1.0 when converged, else 1 - change_pct
-                convergence_score = 1.0 if convergence.converged else max(0.0, 1.0 - convergence.change_pct)
+                # --- composite convergence score (50% smoothed-issues / 20% confidence / 20% text / 10% velocity) ---
+                major = convergence.major_issues or 0
+                confidence = max(0.0, min(critic_result.critic_confidence or 0.0, 1.0))
+                text_change = max(0.0, min(convergence.change_pct or 1.0, 1.0))  # full clamp, guard None
+
+                # Exponential smoothing on major issues (alpha=0.7): dampens critic oscillation
+                # between 0 and 1 majors without hiding genuine regressions.
+                prev_major: float | None = (
+                    float(prior_critic_turn.major_issues_remaining)
+                    if prior_critic_turn and prior_critic_turn.major_issues_remaining is not None
+                    else None
+                )
+                smoothed_major = (0.7 * major + 0.3 * prev_major) if prev_major is not None else float(major)
+
+                issues_score = max(0.0, 1.0 - min(smoothed_major, 5) / 5.0)  # 0 majors→1.0, 5+→0.0
+                text_score = 1.0 - text_change
+
+                # Issue velocity: detects momentum. Kept at 10% because critic scoring is stochastic.
+                velocity_score = 0.0
+                if prev_major is not None:
+                    delta = prev_major - major
+                    if delta > 0:
+                        velocity_score = min(delta / 3.0, 1.0)  # rapid drop → boost
+                    elif delta < 0:
+                        velocity_score = max(delta / 3.0, -0.5)  # regression → mild penalty
+
+                convergence_score = (
+                    1.0
+                    if convergence.converged
+                    else round(
+                        0.5 * issues_score + 0.2 * confidence + 0.2 * text_score + 0.1 * velocity_score,
+                        3,
+                    )
+                )
+
+                # Monotonic clamp: after save_plan_version, index [0] = current, [1] = previous.
+                _prev_versions = self.store.get_plan_versions(session_id, limit=2)
+                _prev_score = _prev_versions[1].convergence_score if len(_prev_versions) >= 2 else None
+                if _prev_score is not None:
+                    convergence_score = max(_prev_score, convergence_score)
+
+                # Safety clamp to [0.0, 1.0] against floating-point edge cases.
+                convergence_score = max(0.0, min(1.0, convergence_score))
+
                 self.store.update_plan_version_convergence(session_id, round_number, convergence_score)
                 plan_quality_score = self._plan_quality_score(
                     critic=critic_result,
@@ -1527,7 +1869,7 @@ class PlanningRuntime:
                     citation_count=critic_result.citation_count,
                     constraint_violations=critic_result.hard_constraint_violations,
                     resolved_since_last_round=[],
-                    clarifications_this_round=len([q for q in critic_result.clarification_questions if q.strip()]),
+                    clarifications_this_round=len(asked_critic_questions),
                     call_cost_usd=self._session_cost_usd.get(session_id, 0.0),
                     issues_resolved=delta.issues_resolved,
                     issues_introduced=delta.issues_introduced,
@@ -1595,7 +1937,11 @@ class PlanningRuntime:
                 if convergence.converged:
                     snapshot = core.transition_and_snapshot("converged", phase_message=None)
                 else:
-                    snapshot = core.transition_and_snapshot("refining", phase_message=None)
+                    snapshot = core.transition_and_snapshot(
+                        "refining",
+                        phase_message=None,
+                        allow_round_stability=True,
+                    )
                 await self._emit_event(event_callback, snapshot, session_id)
                 if event_callback:
                     await self._emit_event(
@@ -1605,6 +1951,14 @@ class PlanningRuntime:
                     )
                 return critic_result, author_result, convergence
             except ContextWindowExceeded as exc:
+                latest = core.get_session()
+                if latest.status in {"refining", "converged"} and bool(latest.is_processing):
+                    snapshot = core.transition_and_snapshot(
+                        "refining",
+                        phase_message=None,
+                        allow_round_stability=True,
+                    )
+                    await self._emit_event(event_callback, snapshot, session_id)
                 await self._emit_event(
                     event_callback,
                     {"type": "error", "message": str(exc)},
@@ -1612,6 +1966,14 @@ class PlanningRuntime:
                 )
                 raise
             except Exception:
+                latest = core.get_session()
+                if latest.status in {"refining", "converged"} and bool(latest.is_processing):
+                    snapshot = core.transition_and_snapshot(
+                        "refining",
+                        phase_message=None,
+                        allow_round_stability=True,
+                    )
+                    await self._emit_event(event_callback, snapshot, session_id)
                 if event_callback:
                     await self._emit_event(
                         event_callback,
@@ -1657,7 +2019,6 @@ class PlanningRuntime:
             plan=plan,
             output_dir=output_dir,
         )
-        core.mark_exported()
         return paths
 
     def status(self, session_id: str, merged_pr_files: set[str]) -> dict[str, Any]:

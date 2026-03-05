@@ -178,6 +178,15 @@ prscope plan chat
 
 The Author LLM interviews you to define scope before drafting anything.
 
+Discovery now uses a generalized, repository-agnostic evidence flow:
+
+- extracts a feature intent from the request (for example: "rate limiting middleware")
+- scans code once, then reuses a shared signal index for framework + evidence inference
+- detects existing implementations before proposing creation plans
+- avoids asking framework-identification questions when framework evidence is already present
+
+In short: discovery should ask for decisions, not facts already visible in code.
+
 ---
 
 ## Web UI Workflow
@@ -212,6 +221,7 @@ Prscope now uses a server-authoritative runtime model for planning sessions:
 
 - Session row is the canonical state machine (`status`, `phase_message`, `pending_questions`, `is_processing`, `active_tool_calls`)
 - `session_state` SSE events carry full snapshots and are emitted snapshot-first on connect
+- `POST /round` executes through the command executor with lease-backed lock/idempotency semantics
 - Commands are idempotent via `command_id` and validated against explicit state/command rules
 - Frontend renders from canonical session state rather than reconstructing from turn text
 
@@ -454,7 +464,7 @@ prscope/
 │       ├── orchestration.py    # PlanningRuntime entry points (manifesto → skills → recall → memory)
 │       ├── author.py           # Author LLM loop + tool enforcement
 │       ├── critic.py           # Critic LLM + JSON contract validation
-│       ├── discovery.py        # Chat-first discovery flow
+│       ├── discovery.py        # Generalized discovery engine (intent → evidence → insight)
 │       └── tools.py            # Sandboxed read_file/search_codebase/list_dir
 ├── plan_templates/
 │   ├── prd.md.j2               # PRD Jinja2 template
