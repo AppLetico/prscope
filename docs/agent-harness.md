@@ -38,9 +38,17 @@ Core components:
   - Centralized replay, locking, lease heartbeat, and snapshot persistence
   - Command handlers return `HandlerResult` only (no direct snapshot/lock logic)
 - `prscope/planning/runtime/orchestration.py`
-  - Integrates discovery/author/critic loops with core transitions
+  - Acts as session coordinator (locks, lifecycle, core transitions, command flow)
+  - Delegates initial draft planning prompt construction/execution to `AuthorAgent.run_initial_draft()`
   - Enforces persist-then-emit sequencing for runtime events
+  - Emits unified `tool_update` events (replacing separate `tool_call`/`tool_result`)
+  - Stamps every SSE event with a monotonic `session_version` for ordering guarantees
+  - Persists completed tool groups with `sequence` and `created_at` before emitting snapshots
   - Persists bounded active tool calls (`MAX_ACTIVE_TOOL_CALLS = 50`)
+- `prscope/planning/runtime/pipeline/*`
+  - `AdversarialPlanningLoop` runs staged refinement rounds
+  - `PlanningStages` owns stage implementations (`design_review` -> `repair` -> `revise` -> `validation` -> `convergence`)
+  - Stage dependencies are injected explicitly (author, critic, manifesto checker, event + memory adapters), avoiding full runtime coupling
 - `prscope/planning/runtime/discovery.py`
   - Generalized discovery engine (feature intent extraction + evidence-first questioning)
   - Registry-scored framework detection and signal indexing
@@ -61,10 +69,12 @@ The `planning_sessions` row is authoritative for UI state. Core fields:
 - `is_processing`
 - `pending_questions_json`
 - `active_tool_calls_json`
+- `completed_tool_call_groups_json` (structured: `{sequence, created_at, tools}[]`)
+- `event_seq` (monotonic counter for deterministic ordering of turns and tool groups)
 - `processing_started_at`
 - `current_command_id`
 
-Turns (`planning_turns`) remain useful for traceability and debugging, but are not authoritative for live UI state.
+Turns (`planning_turns`) carry a `sequence` field for deterministic timeline ordering. Turns remain useful for traceability and debugging, but are not authoritative for live UI state.
 
 For the full state contract and transition matrix, see `docs/planning-state-machine.md`.
 
@@ -128,9 +138,8 @@ Executor details:
 
 Primary events:
 
-- `session_state` (versioned: `v: 1`, full canonical snapshot)
-- `tool_call`
-- `tool_result`
+- `session_state` (versioned: `v: 1`, full canonical snapshot including `completed_tool_call_groups` and `active_tool_calls`)
+- `tool_update` (unified event with `call_id`, `name`, `status: running|done`, `durationMs`; replaces legacy `tool_call`/`tool_result`)
 - `plan_ready`
 - `thinking`
 - `warning`
@@ -140,15 +149,25 @@ Primary events:
 - `clarification_needed`
 - `state_snapshot` events emitted by command finalize
 
+Every SSE event carries a `session_version` field — a monotonic integer incremented per emission. The frontend uses this to discard stale or reordered events (any event with `session_version ≤ lastVersionSeen` is dropped).
+
 Event semantics:
 
 - **Snapshot first**: every new SSE connection gets a fresh `session_state` event before any subsequent stream events
-- **Persist then emit**: runtime persists state first, then emits events
+- **Persist then emit**: runtime persists state first, then emits events. Completed tool groups are persisted *before* the `session_state` snapshot is built and emitted.
 - **Multi-tab safe**: all subscribers on the same session receive the same stream
+- **Unified tool events**: tool execution is streamed as `tool_update` with upsert semantics (keyed by `call_id`), not separate start/result event pairs
 
 Frontend integration expectation:
 
 - treat `session_state` as total replacement for session UI state, not a partial merge
+- treat `tool_update` as a hint for transient active tool state; the next `session_state` snapshot is authoritative
+
+Issue snapshot expectation:
+
+- session snapshots include a backward-compatible flat issue view (`open_issues`) and an additive graph payload (`issue_graph`)
+- `issue_graph` includes deterministic replay fields: `nodes`, `edges`, `duplicate_alias`, and `summary`
+- adjacency indexes are runtime-derived and should not be persisted
 
 ## Runtime Invariants Enforced by Core
 
@@ -163,9 +182,21 @@ High-value invariants:
 ## Tool Call Persistence Rules
 
 - Active tool calls are persisted on the session row (`active_tool_calls_json`)
+- Completed tool groups are persisted as `completed_tool_call_groups_json` with structured entries: `{sequence, created_at, tools[]}`
+- `sequence` is a monotonic integer from the session's `event_seq` counter, shared with turns for deterministic cross-type ordering
+- Completed groups are persisted *before* emitting the `session_state` snapshot (fixes race condition where snapshot could contain stale groups)
 - Updates are done under explicit transactional boundaries in orchestration
-- Entries are sorted by `created_at` and truncated to most recent 50
+- Active entries are sorted by `created_at` and truncated to most recent 50
+- Completed groups are truncated to most recent 50
 - Terminal `complete`/closure transitions clear or shrink volatile in-flight state
+
+## Issue Graph Runtime Rules
+
+- Public issue operations canonicalize IDs first (alias-safe traversal and mutation)
+- Duplicate detection maps aliases to canonical IDs; duplicate nodes are not created
+- Auto-resolution propagates only along `causes` edges (never `depends_on`)
+- Root-open computation uses incoming `causes` edges only
+- Dependency-chain checks count open nodes with unresolved `depends_on` targets
 
 ## Crash Recovery and Startup Reconciliation
 
@@ -250,8 +281,11 @@ python3 -m prscope.benchmark \
 
 When editing harness code, keep these fixed:
 
-- preserve persist-then-emit ordering
+- preserve persist-then-emit ordering (especially: persist completed tool groups before snapshot)
 - keep snapshot-first behavior on SSE connect
 - avoid adding client-side state reconstruction from turns/events
 - keep command rejection payloads structured and deterministic
+- stamp all SSE events with monotonic `session_version`
+- use `tool_update` (not separate `tool_call`/`tool_result`) for tool event emission
+- assign `sequence` from `event_seq` to new turns and tool groups for deterministic ordering
 

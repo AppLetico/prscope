@@ -7,7 +7,7 @@ Schema:
 - pull_requests: PR metadata
 - pr_files: Files changed per PR
 - evaluations: Evaluation results (with deduplication)
-- artifacts: Generated PRD files
+- artifacts: Generated plan/spec files
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from uuid import uuid4
 from .config import get_prscope_dir
 
 DB_FILENAME = "prscope.db"
-CURRENT_SCHEMA_VERSION = 15
+CURRENT_SCHEMA_VERSION = 17
 _UNSET = object()
 PROTECTED_SESSION_FIELDS = {
     "status",
@@ -115,7 +115,7 @@ CREATE TABLE IF NOT EXISTS evaluations (
     UNIQUE(pr_id, local_profile_sha, pr_head_sha)
 );
 
--- Generated artifacts (PRDs, etc.)
+-- Generated artifacts (plans, specs, etc.)
 CREATE TABLE IF NOT EXISTS artifacts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     evaluation_id INTEGER NOT NULL,
@@ -197,7 +197,9 @@ CREATE TABLE IF NOT EXISTS plan_versions (
     session_id TEXT NOT NULL,
     round INTEGER NOT NULL,
     plan_content TEXT NOT NULL,
+    plan_json TEXT,
     plan_sha TEXT NOT NULL,
+    changed_sections TEXT,
     diff_from_previous TEXT,
     convergence_score REAL,
     created_at TEXT NOT NULL,
@@ -349,7 +351,7 @@ class Evaluation:
 
 @dataclass
 class Artifact:
-    """Stored artifact (PRD file, etc.)."""
+    """Stored artifact (plan/spec file, etc.)."""
 
     id: int | None
     evaluation_id: int
@@ -388,6 +390,7 @@ class PlanningSession:
     confidence_trend: float | None = None
     converged_early: int | None = None
     clarifications_log_json: str | None = None
+    event_seq: int = 0
 
     @property
     def clarifications_log(self) -> list[dict[str, Any]]:
@@ -445,6 +448,7 @@ class PlanningTurn:
     hard_constraint_violations: list[str] | None = None
     parse_error: str | None = None
     created_at: str = ""
+    sequence: int | None = None
 
 
 @dataclass
@@ -455,8 +459,10 @@ class PlanVersion:
     session_id: str
     round: int
     plan_content: str
+    plan_json: str | None
     plan_sha: str
     created_at: str
+    changed_sections: str | None = None
     diff_from_previous: str | None = None
     convergence_score: float | None = None
 
@@ -784,6 +790,21 @@ class Store:
                 """
             )
             current = 15
+
+        if current < 16:
+            if not self._column_exists(conn, "planning_sessions", "event_seq"):
+                conn.execute("ALTER TABLE planning_sessions ADD COLUMN event_seq INTEGER NOT NULL DEFAULT 0")
+            if not self._column_exists(conn, "planning_turns", "sequence"):
+                conn.execute("ALTER TABLE planning_turns ADD COLUMN sequence INTEGER")
+            current = 16
+
+        # v16 -> v17: structured plan source-of-truth columns
+        if current < 17:
+            if not self._column_exists(conn, "plan_versions", "plan_json"):
+                conn.execute("ALTER TABLE plan_versions ADD COLUMN plan_json TEXT")
+            if not self._column_exists(conn, "plan_versions", "changed_sections"):
+                conn.execute("ALTER TABLE plan_versions ADD COLUMN changed_sections TEXT")
+            current = 17
 
         self._set_schema_version(conn, current)
 
@@ -1647,6 +1668,7 @@ class Store:
             hard_constraint_violations=violations,
             parse_error=data.get("parse_error"),
             created_at=data.get("created_at", ""),
+            sequence=data.get("sequence"),
         )
 
     def create_planning_session(
@@ -2194,6 +2216,19 @@ class Store:
             return {}
         return data if isinstance(data, dict) else {}
 
+    def increment_event_seq(self, session_id: str) -> int:
+        """Atomically increment and return the next event sequence number for a session."""
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE planning_sessions SET event_seq = event_seq + 1 WHERE id = ?",
+                (session_id,),
+            )
+            row = conn.execute(
+                "SELECT event_seq FROM planning_sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            return int(row["event_seq"]) if row else 1
+
     def add_planning_turn(
         self,
         session_id: str,
@@ -2204,16 +2239,19 @@ class Store:
         minor_issues_remaining: int | None = None,
         hard_constraint_violations: list[str] | None = None,
         parse_error: str | None = None,
+        sequence: int | None = None,
     ) -> PlanningTurn:
         """Insert a planning conversation turn."""
         violations_json = json.dumps(hard_constraint_violations or [])
+        if sequence is None:
+            sequence = self.increment_event_seq(session_id)
         with self._connect() as conn:
             conn.execute(
                 """
                 INSERT INTO planning_turns
                     (session_id, role, content, round, major_issues_remaining,
-                     minor_issues_remaining, hard_constraint_violations, parse_error, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                     minor_issues_remaining, hard_constraint_violations, parse_error, created_at, sequence)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
@@ -2225,6 +2263,7 @@ class Store:
                     violations_json,
                     parse_error,
                     self._now(),
+                    sequence,
                 ),
             )
             row = conn.execute("SELECT * FROM planning_turns WHERE id = last_insert_rowid()").fetchone()
@@ -2273,6 +2312,8 @@ class Store:
         round_number: int,
         plan_content: str,
         plan_sha: str,
+        plan_json: str | None = None,
+        changed_sections: str | None = None,
         diff_from_previous: str | None = None,
         convergence_score: float | None = None,
     ) -> PlanVersion:
@@ -2281,14 +2322,26 @@ class Store:
             conn.execute(
                 """
                 INSERT INTO plan_versions
-                    (session_id, round, plan_content, plan_sha, diff_from_previous, convergence_score, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (
+                        session_id,
+                        round,
+                        plan_content,
+                        plan_json,
+                        plan_sha,
+                        changed_sections,
+                        diff_from_previous,
+                        convergence_score,
+                        created_at
+                    )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
                     round_number,
                     plan_content,
+                    plan_json,
                     plan_sha,
+                    changed_sections,
                     diff_from_previous,
                     convergence_score,
                     self._now(),

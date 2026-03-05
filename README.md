@@ -7,7 +7,7 @@
 <p align="center">
   <b>PLAN. REFINE. SHIP.</b>
   <br />
-  <i>A planning engine that turns requirements (or upstream PR context) into grounded PRD/RFC outputs for real codebases.</i>
+  <i>A planning engine that turns requirements (or upstream PR context) into grounded plan/spec outputs for real codebases.</i>
 </p>
 
 <p align="center">
@@ -52,9 +52,9 @@ Prscope is a local-first planning system with a CLI + web UI workflow. You give 
 1. Scans your codebase into structured memory blocks
 2. Starts a planning session in the web UI where an **Author LLM** drafts the plan
 3. Runs up to 10 adversarial **Author ↔ Critic** refinement rounds
-4. Exports a final `PRD.md` and `RFC.md` grounded in your actual file paths and constraints
+4. Exports a final plan (`PRD.md`) grounded in your actual file paths and constraints
 
-Upstream PR tracking (`prscope upstream sync` / `prscope upstream evaluate`) feeds directly into this planning flow — instead of generating standalone PRDs, relevant PRs become high-signal inputs to planning sessions.
+Upstream PR tracking (`prscope upstream sync` / `prscope upstream evaluate`) feeds directly into this planning flow — instead of generating standalone plans, relevant PRs become high-signal inputs to planning sessions.
 
 ---
 
@@ -341,6 +341,17 @@ llm:
 planning:
   author_model: gpt-4o                        # any LiteLLM string
   critic_model: claude-3-5-sonnet-20241022    # any LiteLLM string
+  issue_dedupe:
+    embeddings_enabled: auto                   # auto | true | false
+    embedding_model: text-embedding-3-small    # any LiteLLM embedding model
+    similarity_threshold: 0.82                 # semantic duplicate cutoff
+    fallback_mode: lexical                     # lexical | none
+  issue_graph:
+    max_nodes: 50                              # hard cap for issue nodes
+    max_edges: 100                             # hard cap for issue edges
+    causality_extraction_enabled: false        # infer causes edges from critic prose
+    causality_max_edges_per_review: 8          # cap inferred edges each review pass
+    causality_min_text_len: 12                 # reject short/vague inferred issue text
   skills_max_chars: 3000                      # budget for .prscope/skills injection
   recall_prior_sessions: false                # enable session recall injection
   recall_top_k: 2                             # max recalled sessions considered
@@ -355,6 +366,13 @@ planning:
   validate_temperature: 0.0                   # deterministic CI validation
   validate_audit_log: true                    # save critic JSON to ~/.prscope/.../audit/
 ```
+
+Notes:
+- `issue_dedupe.embedding_model` is independent from `author_model` / `critic_model`, so you can run Claude or Gemini for planning while using a different embedding provider.
+- `embeddings_enabled: auto` attempts semantic dedupe first and falls back to lexical dedupe if embeddings are unavailable.
+- With `fallback_mode: none`, dedupe will not match when embeddings fail.
+- Issue tracking is graph-backed with canonical IDs; duplicates are tracked via alias mapping (not duplicate nodes).
+- Convergence gating uses root-open + unresolved dependency-chain checks, then existing stability/implementability checks.
 
 ---
 
@@ -396,7 +414,7 @@ prscope plan start --from-pr owner/repo 42         Seed from upstream PR
 prscope plan resume <session-id>                   Resume in browser UI
 prscope plan list [--repo <name>]                  List sessions
 prscope plan diff <session-id> [--round N]         Unified diff to stdout
-prscope plan export <session-id>                   Write PRD.md + RFC.md
+prscope plan export <session-id>                   Write plan (PRD.md) and conversation
 prscope plan validate <session-id>                 Headless CI check (exits 0/1/2)
 prscope plan status <session-id> --pr-number N     Post-merge drift detection
 prscope plan memory [--rebuild]                    Build/show memory blocks
@@ -436,7 +454,8 @@ prscope recall "query terms with enough signal" --full
 | `GOOGLE_API_KEY`    | If using Google models                  | `gemini-pro`, etc.           |
 
 
-Prscope uses [LiteLLM](https://docs.litellm.ai/docs/providers) — any provider it supports works as `author_model` or `critic_model`. Ollama local models need no API key.
+Prscope uses [LiteLLM](https://docs.litellm.ai/docs/providers) — any provider it supports works as `author_model`, `critic_model`, or `issue_dedupe.embedding_model`.
+Ollama local models need no API key.
 
 ---
 
@@ -459,19 +478,19 @@ prscope/
 │   └── static/                 # Built frontend assets served by backend
 ├── planning/
 │   ├── core.py                 # Pure state machine + convergence logic
-│   ├── render.py               # PRD/RFC Jinja2 rendering
+│   ├── render.py               # plan Jinja2 rendering
 │   └── runtime/
-│       ├── orchestration.py    # PlanningRuntime entry points (manifesto → skills → recall → memory)
-│       ├── author.py           # Author LLM loop + tool enforcement
+│       ├── orchestration.py    # Session coordinator (locks, lifecycle, command flow)
+│       ├── author.py           # Author agent + initial draft pipeline + tool enforcement
 │       ├── critic.py           # Critic LLM + JSON contract validation
 │       ├── discovery.py        # Generalized discovery engine (intent → evidence → insight)
-│       └── tools.py            # Sandboxed read_file/search_codebase/list_dir
+│       ├── tools.py            # Sandboxed read_file/search_codebase/list_dir
+│       ├── pipeline/           # Adversarial loop + stage implementations + round context
+│       ├── context/            # Budgeting, context assembly, compression, clarification gate
+│       ├── review/             # Issue similarity and manifesto validation helpers
+│       └── events/             # Analytics emitter + token/tool event persistence helpers
 ├── plan_templates/
-│   ├── prd.md.j2               # PRD Jinja2 template
-│   └── rfc.md.j2               # RFC Jinja2 template (file path validation)
-└── templates/
-    └── prd.md.j2               # Legacy upstream PRD template
-
+│   └── plan.md.j2               # plan Jinja2 template
 tests/
 ├── test_config.py              # Config + multi-repo parsing
 ├── test_store.py               # DB including planning tables + search_sessions

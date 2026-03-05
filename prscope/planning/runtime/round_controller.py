@@ -19,8 +19,12 @@ class PlanDelta:
 def compute_plan_delta(previous: CriticResult | None, current: CriticResult) -> PlanDelta:
     if previous is None:
         return PlanDelta(issues_resolved=0, issues_introduced=0, net_improvement=0)
-    previous_total = previous.major_issues_remaining + previous.minor_issues_remaining
-    current_total = current.major_issues_remaining + current.minor_issues_remaining
+    previous_total = len(getattr(previous, "blocking_issues", []) or []) + len(
+        getattr(previous, "architectural_concerns", []) or []
+    )
+    current_total = len(getattr(current, "blocking_issues", []) or []) + len(
+        getattr(current, "architectural_concerns", []) or []
+    )
     if current_total <= previous_total:
         resolved = previous_total - current_total
         return PlanDelta(

@@ -3,13 +3,14 @@ import type { ClarificationPrompt, DiscoveryQuestion, PlanningTurn, ToolCallEntr
 import { OptionButtons } from "./OptionButtons";
 import { ToolCallStream } from "./ToolCallStream";
 import { ModelSelector } from "./ModelSelector";
-import { Send, ArrowDown, Bot, User, Sparkles, BrainCircuit, RefreshCw, CheckCircle2, Copy, Check, Square, Loader2 } from "lucide-react";
+import { Send, Bot, User, Sparkles, BrainCircuit, RefreshCw, CheckCircle2, Copy, Check, Square, Loader2 } from "lucide-react";
 import { clsx } from "clsx";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Tooltip } from "./ui/Tooltip";
 import { chatMarkdownComponents } from "../lib/markdownComponents";
 import { extractFirstJsonObject, hasRunningToolCalls } from "./chatPanelUtils";
+import type { TimelineItem } from "./chatPanelUtils";
 
 interface ModelOption {
   model_id: string;
@@ -19,10 +20,9 @@ interface ModelOption {
 }
 
 interface ChatPanelProps {
-  turns: PlanningTurn[];
+  timeline: TimelineItem[];
   questions: DiscoveryQuestion[];
   activeToolCalls: ToolCallEntry[];
-  toolCallGroups: ToolCallEntry[][];
   thinkingMessage: string | null;
   phaseMessage?: string | null;
   warnings: string[];
@@ -55,10 +55,9 @@ function isDiscoveryQuestionBlock(content: string): boolean {
 }
 
 export function ChatPanel({
-  turns,
+  timeline,
   questions,
   activeToolCalls,
-  toolCallGroups,
   thinkingMessage,
   phaseMessage = null,
   warnings,
@@ -91,7 +90,6 @@ export function ChatPanel({
   const [otherInputs, setOtherInputs] = useState<Record<number, string>>({});
   const [submittingAnswers, setSubmittingAnswers] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
-  const [showNewActivity, setShowNewActivity] = useState(false);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [thinkingStatusTick, setThinkingStatusTick] = useState(0);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -109,31 +107,22 @@ export function ChatPanel({
     if (autoScroll && scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [turns, activeToolCalls, thinkingMessage, questions, autoScroll]);
+  }, [timeline, activeToolCalls, thinkingMessage, questions, autoScroll]);
 
   useEffect(() => {
     const signature = [
-      turns.length,
+      timeline.length,
       activeToolCalls.length,
-      toolCallGroups.length,
       warnings.length,
       Boolean(thinkingMessage),
       questions.length,
       pendingClarification ? 1 : 0,
     ].join("|");
-    const previous = lastActivitySignatureRef.current;
-    if (previous && previous !== signature && !autoScroll) {
-      setShowNewActivity(true);
-    }
-    if (autoScroll) {
-      setShowNewActivity(false);
-    }
     lastActivitySignatureRef.current = signature;
   }, [
     autoScroll,
-    turns.length,
+    timeline.length,
     activeToolCalls.length,
-    toolCallGroups.length,
     warnings.length,
     thinkingMessage,
     questions.length,
@@ -147,13 +136,13 @@ export function ChatPanel({
       setOptimisticUserMessage(null);
       return;
     }
-    const confirmed = turns.some(
-      (turn) => turn.role === "user" && turn.content.trim() === normalizedOptimistic,
+    const confirmed = timeline.some(
+      (item) => item.kind === "turn" && item.turn.role === "user" && item.turn.content.trim() === normalizedOptimistic,
     );
     if (confirmed) {
       setOptimisticUserMessage(null);
     }
-  }, [optimisticUserMessage, turns]);
+  }, [optimisticUserMessage, timeline]);
 
   useEffect(() => {
     const validIndexes = new Set(questions.map((q) => q.index));
@@ -237,18 +226,7 @@ export function ChatPanel({
   };
 
   const onScroll = () => {
-    const nearBottom = isNearBottom();
-    setAutoScroll(nearBottom);
-    if (nearBottom) {
-      setShowNewActivity(false);
-    }
-  };
-
-  const scrollToBottom = () => {
-    const el = scrollRef.current;
-    if (el) el.scrollTop = el.scrollHeight;
-    setAutoScroll(true);
-    setShowNewActivity(false);
+    setAutoScroll(isNearBottom());
   };
 
   const copyMessage = async (key: string, content: string) => {
@@ -363,67 +341,17 @@ export function ChatPanel({
     ];
     return activityPhrases[(thinkingStatusTick - 1) % activityPhrases.length];
   }, [thinkingMessage, thinkingStatusTick]);
-  const toolCallsByAssistantTurnIndex = useMemo(() => {
-    const mapping = new Map<number, ToolCallEntry[]>();
-    const assistantIndexes = turns
-      .map((turn, idx) => ({ turn, idx }))
-      .filter(({ turn }) => turn.role !== "user")
-      .map(({ idx }) => idx);
-    if (toolCallGroups.length === 0 || assistantIndexes.length === 0) {
-      return mapping;
-    }
-    // Map groups in chronological order. When there are more tool groups than
-    // assistant turns, keep overflow attached to the latest assistant turn
-    // instead of dropping them.
-    for (let i = 0; i < toolCallGroups.length; i += 1) {
-      const targetAssistantPos = i < assistantIndexes.length ? i : assistantIndexes.length - 1;
-      const turnIdx = assistantIndexes[targetAssistantPos];
-      const group = toolCallGroups[i] ?? [];
-      if (turnIdx === undefined) continue;
-      const existing = mapping.get(turnIdx) ?? [];
-      mapping.set(turnIdx, [...existing, ...group]);
-    }
-    return mapping;
-  }, [toolCallGroups, turns]);
-  const latestUserTurnIndex = useMemo(() => {
-    for (let idx = turns.length - 1; idx >= 0; idx -= 1) {
-      if (turns[idx]?.role === "user") {
-        return idx;
-      }
-    }
-    return null;
-  }, [turns]);
   const hasRunningActiveToolCalls = useMemo(
     () => hasRunningToolCalls(activeToolCalls),
     [activeToolCalls],
   );
-  const showActiveToolStreamUnderOptimistic = hasRunningActiveToolCalls && Boolean(optimisticUserMessage);
-  const activeToolCallsOrphaned = useMemo(() => {
-    if (!hasRunningActiveToolCalls) return false;
-    if (optimisticUserMessage) return false;
-    if (latestUserTurnIndex === null) return true;
-    // Keep active tool calls anchored inline with the latest user turn.
-    // Only treat as orphaned when there is no user turn to attach to.
-    return false;
-  }, [hasRunningActiveToolCalls, optimisticUserMessage, latestUserTurnIndex]);
-  const showActiveToolStreamInlineAtLatestUserTurn = (
-    !optimisticUserMessage
-    && latestUserTurnIndex !== null
-    && hasRunningActiveToolCalls
-    && !activeToolCallsOrphaned
-  );
-  const hasVisibleActiveToolStream = (
-    showActiveToolStreamUnderOptimistic
-    || showActiveToolStreamInlineAtLatestUserTurn
-    || activeToolCallsOrphaned
-  );
+  const hasVisibleActiveToolStream = hasRunningActiveToolCalls || activeToolCalls.length > 0;
   const liveStatusMessage = useMemo(() => {
-    const hasRunningToolCalls = activeToolCalls.some((c) => c.status === "running");
-    // If a tool stream is already visible, avoid a second parallel status line.
+    const hasRunning = activeToolCalls.some((c) => c.status === "running");
     if (hasVisibleActiveToolStream) return null;
-    if (phaseMessage && isProcessing && !hasRunningToolCalls) return phaseMessage;
+    if (phaseMessage && isProcessing && !hasRunning) return phaseMessage;
     if (animatedThinkingMessage) return animatedThinkingMessage;
-    if (hasRunningToolCalls) return "Running tools...";
+    if (hasRunning) return "Running tools...";
     if (isProcessing) return "Working...";
     return null;
   }, [phaseMessage, animatedThinkingMessage, activeToolCalls, isProcessing, hasVisibleActiveToolStream]);
@@ -438,23 +366,30 @@ export function ChatPanel({
         onScroll={onScroll}
       >
         <div className="max-w-2xl mx-auto space-y-6">
-          {turns.length === 0 && !thinkingMessage && (
+          {timeline.length === 0 && !thinkingMessage && (
             <div className="flex flex-col items-center justify-center py-12 text-zinc-500">
               <Sparkles className="w-8 h-8 mb-3 opacity-50" />
               <p className="text-sm">Start the conversation to begin planning.</p>
             </div>
           )}
 
-          {turns.map((turn, idx) => {
+          {timeline.map((item) => {
+            if (item.kind === "tool_group") {
+              return (
+                <div key={item.key} className="flex justify-start w-full animate-in slide-in-from-bottom-2 fade-in duration-300 ease-out">
+                  <ToolCallStream toolCalls={item.group.tools} />
+                </div>
+              );
+            }
+            const turn = item.turn;
             const isUser = turn.role === "user";
-            const turnKey = `${turn.role}-${idx}`;
+            const turnKey = item.key;
             const shouldCollapseDiscoveryQuestionText = (
               turn.role === "author"
               && questions.length > 0
               && isDiscoveryQuestionBlock(turn.content)
             );
             const displayContent = renderTurnContent(turn);
-            const turnToolCalls = !isUser ? (toolCallsByAssistantTurnIndex.get(idx) ?? []) : [];
             const criticJson = turn.role === "critic" ? extractFirstJsonObject(turn.content) : null;
             const criticPrelude = criticJson ? turn.content.slice(0, criticJson.start).trim() : "";
             const criticPostlude = criticJson ? turn.content.slice(criticJson.end).trim() : "";
@@ -465,7 +400,7 @@ export function ChatPanel({
               ? criticJson.parsed.minor_issues_remaining
               : null;
             const hardViolations = Array.isArray(criticJson?.parsed.hard_constraint_violations)
-              ? criticJson?.parsed.hard_constraint_violations.map((item) => String(item))
+              ? criticJson?.parsed.hard_constraint_violations.map((i) => String(i))
               : [];
             return (
               <div 
@@ -561,21 +496,6 @@ export function ChatPanel({
                     </div>
                   </div>
                 </div>
-                {!isUser && turnToolCalls.length > 0 && (
-                  <div className="flex justify-start w-full">
-                    <ToolCallStream toolCalls={turnToolCalls} />
-                  </div>
-                )}
-                {isUser
-                  && !optimisticUserMessage
-                  && idx === latestUserTurnIndex
-                  && activeToolCalls.length > 0
-                  && !toolCallsByAssistantTurnIndex.has(idx)
-                  && !activeToolCallsOrphaned && (
-                  <div className="flex justify-start w-full">
-                    <ToolCallStream toolCalls={activeToolCalls} defaultOpen forceRunning={isProcessing} />
-                  </div>
-                )}
               </div>
             );
           })}
@@ -595,11 +515,11 @@ export function ChatPanel({
                   </div>
                 </div>
               </div>
-              {showActiveToolStreamUnderOptimistic && (
-                <div className="flex justify-start w-full">
-                  <ToolCallStream toolCalls={activeToolCalls} defaultOpen forceRunning={isProcessing} />
-                </div>
-              )}
+            </div>
+          )}
+          {activeToolCalls.length > 0 && (
+            <div className="flex justify-start w-full animate-in slide-in-from-bottom-2 fade-in duration-200 ease-out">
+              <ToolCallStream toolCalls={activeToolCalls} defaultOpen forceRunning={isProcessing} />
             </div>
           )}
           <div className="relative z-[60]">
@@ -735,13 +655,8 @@ export function ChatPanel({
               </div>
             )}
           </div>
-          {(activeToolCallsOrphaned || liveStatusMessage || warningSummary.length > 0) && (
+          {(liveStatusMessage || warningSummary.length > 0) && (
             <div className="mt-2 space-y-2 animate-in fade-in duration-200">
-              {activeToolCallsOrphaned && (
-                <div className="pl-0">
-                  <ToolCallStream toolCalls={activeToolCalls} defaultOpen forceRunning={isProcessing} />
-                </div>
-              )}
               {liveStatusMessage && (
                 <div className="pl-12 flex items-center gap-2 text-xs text-zinc-300 llm-status-glow">
                   <div className="flex gap-1">
@@ -765,20 +680,6 @@ export function ChatPanel({
           )}
         </div>
       </div>
-
-      {/* Floating "Jump to latest" button - above input, clearly outside message flow */}
-      {showNewActivity && (
-        <div className="absolute bottom-32 left-1/2 -translate-x-1/2 z-50 pointer-events-auto animate-in slide-in-from-bottom-2 fade-in duration-200">
-          <button
-            type="button"
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-full bg-zinc-800 border border-zinc-600 text-xs font-medium text-zinc-200 hover:text-zinc-50 hover:bg-zinc-700 shadow-lg ring-1 ring-black/20 transition-all"
-            onClick={scrollToBottom}
-          >
-            <ArrowDown className="w-3.5 h-3.5" />
-            New activity
-          </button>
-        </div>
-      )}
 
       {/* Floating Input Area */}
       <div className="absolute bottom-6 left-1/2 -translate-x-1/2 w-full max-w-3xl px-4">

@@ -259,7 +259,8 @@ class MemoryStore:
         meta = self._read_meta()
         if meta.get("git_sha") != git_sha:
             return True
-        return not all((self.memory_dir / f"{block}.md").exists() for block in MEMORY_BLOCKS)
+        all_blocks = [*MEMORY_BLOCKS, "mental_model"]
+        return not all((self.memory_dir / f"{block}.md").exists() for block in all_blocks)
 
     async def ensure_memory(
         self,
@@ -309,6 +310,10 @@ class MemoryStore:
                 block_path = self.memory_dir / f"{block}.md"
                 if not block_path.exists():
                     block_path.write_text(stub, encoding="utf-8")
+            await self._build_mental_model(
+                progress_callback=progress_callback,
+                event_callback=event_callback,
+            )
             return
 
         # Default grep path: scanner builds a text profile, then LLM summarises
@@ -327,15 +332,59 @@ class MemoryStore:
                 (self.memory_dir / f"{block_name}.md").write_text(content, encoding="utf-8")
 
         await asyncio.gather(*(build_one(name, prompt) for name, prompt in prompts.items()))
+        await self._build_mental_model(
+            progress_callback=progress_callback,
+            event_callback=event_callback,
+        )
+
+    async def _build_mental_model(
+        self,
+        progress_callback: Callable[[str], Awaitable[None]] | None = None,
+        event_callback: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+    ) -> None:
+        """Synthesize a mental model from base memory blocks."""
+        if progress_callback:
+            await progress_callback("Synthesizing repository mental model...")
+        blocks = {name: self.load_block(name) for name in MEMORY_BLOCKS}
+        combined = "\n\n".join(
+            f"## {name.title()}\n{content}"
+            for name, content in blocks.items()
+            if content and not content.startswith("*See context.md")
+        )
+        if not combined.strip():
+            (self.memory_dir / "mental_model.md").write_text(
+                "# Repository Mental Model\n\nNo base memory blocks available.",
+                encoding="utf-8",
+            )
+            return
+        prompt = (
+            "Synthesize a concise repository mental model from the following memory blocks.\n"
+            "Focus on: key abstractions, dependency flow between modules, critical paths,\n"
+            "and the most important files an engineer should read first.\n"
+            "Output markdown with sections: Key Abstractions, Dependency Flow, "
+            "Critical Paths, Essential Files.\n"
+            "Be concise — this will be used as a quick-reference guide for planning.\n\n"
+            f"{combined}"
+        )
+        content = await self._complete(prompt, event_callback=event_callback)
+        (self.memory_dir / "mental_model.md").write_text(content, encoding="utf-8")
 
     def load_all_blocks(self) -> dict[str, str]:
         scanner_name = getattr(self._scanner, "name", "grep")
         if scanner_name in ("repomap", "repomix"):
-            # Return the single rich context block for non-grep backends
+            result: dict[str, str] = {}
             context_path = self.memory_dir / "context.md"
             if context_path.exists():
-                return {"context": context_path.read_text(encoding="utf-8")}
-        return {name: self.load_block(name) for name in MEMORY_BLOCKS}
+                result["context"] = context_path.read_text(encoding="utf-8")
+            mental_model = self.load_block("mental_model")
+            if mental_model:
+                result["mental_model"] = mental_model
+            return result
+        blocks = {name: self.load_block(name) for name in MEMORY_BLOCKS}
+        mental_model = self.load_block("mental_model")
+        if mental_model:
+            blocks["mental_model"] = mental_model
+        return blocks
 
     def _build_prompts(self, profile: dict[str, Any], scanner_context: str | None = None) -> dict[str, str]:
         files = profile.get("file_tree", {}).get("files", [])

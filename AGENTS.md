@@ -2,7 +2,7 @@
 
 ## What This Is
 
-Local-first planning engine. Requirements (or upstream PR context) → adversarial Author↔Critic refinement → grounded PRD/RFC outputs. Python 3.9+, FastAPI backend, React/Vite frontend.
+Local-first planning engine. Requirements (or upstream PR context) → adversarial Author↔Critic refinement → grounded plan outputs. Python 3.9+, FastAPI backend, React/Vite frontend.
 
 ## Repo Map
 
@@ -21,7 +21,7 @@ docs/
 ├── planning-state-machine.md ← state contract, transitions, invariants
 ├── memory-context-manifesto.md ← memory, context budgets, manifesto
 └── skills-and-recall.md   ← skills and session recall
-plans/                     ← versioned execution plans (PRD, RFC, conversation logs)
+plans/                     ← versioned execution plans (plan, conversation logs)
 .prscope/
 ├── manifesto.md           ← hard/soft constraints enforced by Critic
 └── skills/*.md            ← stable team planning patterns

@@ -1,6 +1,6 @@
-import { useQuery } from "@tanstack/react-query";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Link, useParams, useNavigate } from "react-router-dom";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
+import { useLocation, useParams, useNavigate } from "react-router-dom";
 import { ActionBar } from "../components/ActionBar";
 import { ChatPanel } from "../components/ChatPanel";
 import { PlanPanel } from "../components/PlanPanel";
@@ -12,8 +12,9 @@ import {
   deleteSession,
   downloadFile,
   exportSession,
+  getActiveRepoContext,
   getStoredModelSelection,
-  getDiff,
+  getSessionSnapshot,
   listModels,
   getSession,
   runRound,
@@ -23,12 +24,9 @@ import {
   submitClarification,
 } from "../lib/api";
 import { cleanPlanTitle } from "../lib/planTitle";
-import type { ClarificationPrompt, PlanningSession, ToolCallEntry, UIEvent } from "../types";
+import type { ClarificationPrompt, PlanningSession, UIEvent } from "../types";
 import { AlertCircle, Check, Loader2 } from "lucide-react";
-import {
-  isTerminalCompletedSnapshot,
-  shouldFinalizeFromTerminalSnapshot,
-} from "./planningViewUtils";
+import { INITIAL_TIMELINE_STATE, timelineReducer } from "../components/chatPanelUtils";
 
 function normalizeActivityText(value: string): string {
   return value.replace(/\.{3,}\s*$/u, "").trim();
@@ -36,12 +34,10 @@ function normalizeActivityText(value: string): string {
 
 export function PlanningViewPage() {
   const { id = "" } = useParams();
+  const location = useLocation();
   const navigate = useNavigate();
-  const [activeToolCalls, setActiveToolCalls] = useState<ToolCallEntry[]>([]);
-  const [toolCallGroups, setToolCallGroups] = useState<ToolCallEntry[][]>([]);
+  const [tl, dispatchTl] = useReducer(timelineReducer, INITIAL_TIMELINE_STATE);
   const [thinkingMessage, setThinkingMessage] = useState<string | null>(null);
-  const [showDiff, setShowDiff] = useState(false);
-  const [diff, setDiff] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [warnings, setWarnings] = useState<string[]>([]);
   const [authorModel, setAuthorModel] = useState("");
@@ -54,50 +50,33 @@ export function PlanningViewPage() {
   const [pendingClarification, setPendingClarification] = useState<ClarificationPrompt | null>(null);
   const [showCritiquePrompt, setShowCritiquePrompt] = useState(false);
   const [setupSteps, setSetupSteps] = useState<string[]>([]);
+  const [initialSetupDone, setInitialSetupDone] = useState(false);
+  const [deletingOrphan, setDeletingOrphan] = useState(false);
   const [sessionState, setSessionState] = useState<{
     status: PlanningSession["status"];
     current_round: number;
     pending_questions: PlanningSession["pending_questions"];
     phase_message: string | null;
     is_processing: boolean;
-    active_tool_calls: ToolCallEntry[];
-    completed_tool_call_groups: ToolCallEntry[][];
   } | null>(null);
-  const activeToolCallsRef = useRef<ToolCallEntry[]>([]);
-  const activeToolRunIdRef = useRef<string | null>(null);
-  const nextLocalToolRunIdRef = useRef<number>(0);
-  const lastFinalizedToolGroupSignatureRef = useRef<string>("");
   const lastEventAtMs = useRef<number>(0);
   const lastRefetchAtMs = useRef<number>(0);
   const lastContextNoticeAtMs = useRef<number>(0);
-
-  const ensureRunId = useCallback((preferred?: string | null) => {
-    if (preferred && preferred.trim()) return preferred;
-    if (activeToolRunIdRef.current) return activeToolRunIdRef.current;
-    nextLocalToolRunIdRef.current += 1;
-    return `local-tool-run-${nextLocalToolRunIdRef.current}`;
-  }, []);
-
-  const finalizeToolCalls = useCallback((calls: ToolCallEntry[], runIdHint?: string | null) => {
-    if (calls.length === 0) return false;
-    const runId = runIdHint ?? activeToolRunIdRef.current ?? "unknown-run";
-    const finalized = calls.map((call) => (
-      call.status === "running" ? { ...call, status: "done" as const } : call
-    ));
-    const signature = `${runId}:${JSON.stringify(finalized)}`;
-    if (signature === lastFinalizedToolGroupSignatureRef.current) {
-      return false;
-    }
-    lastFinalizedToolGroupSignatureRef.current = signature;
-    setToolCallGroups((groups) => [...groups, finalized].slice(-50));
-    return true;
-  }, []);
+  const lastVersionSeen = useRef<number>(0);
+  const queryClient = useQueryClient();
 
   useEffect(() => {
     if (lastEventAtMs.current === 0) {
       lastEventAtMs.current = Date.now();
     }
   }, []);
+
+  useEffect(() => {
+    // Session route changed: clear transient setup UI so old events/steps cannot bleed through.
+    setSetupSteps([]);
+    setInitialSetupDone(false);
+    lastVersionSeen.current = 0;
+  }, [id]);
 
   const isSessionNotFoundError = useCallback((err: unknown) => {
     return String(err).toLowerCase().includes("session not found");
@@ -118,7 +97,25 @@ export function PlanningViewPage() {
     staleTime: 60_000,
   });
   const session = sessionQuery.data?.session;
-  const turns = sessionQuery.data?.conversation ?? [];
+  const hasCurrentPlan = Boolean((sessionQuery.data?.current_plan?.plan_content ?? "").trim());
+  const shouldPollSnapshot =
+    Boolean(id)
+    && (
+      session?.status === "refining"
+      || session?.status === "converged"
+      || session?.status === "approved"
+      || hasCurrentPlan
+    );
+  const snapshotQuery = useQuery({
+    queryKey: ["session-snapshot", id],
+    queryFn: () => getSessionSnapshot(id),
+    enabled: shouldPollSnapshot,
+    retry: false,
+  });
+  const turns = useMemo(
+    () => sessionQuery.data?.conversation ?? [],
+    [sessionQuery.data?.conversation],
+  );
   const modelItems = modelQuery.data?.items ?? [];
   const availableModelItems = modelItems.filter((item) => item.available);
   const fallbackModel = availableModelItems[0]?.model_id || modelItems[0]?.model_id || "";
@@ -141,23 +138,23 @@ export function PlanningViewPage() {
 
   useEffect(() => {
     if (!session) return;
-    const nextState = {
+    setSessionState({
       status: session.status,
       current_round: session.current_round,
       pending_questions: session.pending_questions ?? null,
       phase_message: session.phase_message ?? null,
       is_processing: Boolean(session.is_processing),
-      active_tool_calls: session.active_tool_calls ?? [],
-      completed_tool_call_groups: session.completed_tool_call_groups ?? [],
-    };
-    const nextCalls = session.active_tool_calls ?? [];
-    const nextCompletedGroups = session.completed_tool_call_groups ?? [];
-    queueMicrotask(() => {
-      setSessionState(nextState);
-      setActiveToolCalls(nextCalls);
-      activeToolCallsRef.current = nextCalls;
-      setToolCallGroups((prev) => (prev.length > 0 ? prev : nextCompletedGroups));
     });
+    dispatchTl({
+      type: "session_state",
+      groups: session.completed_tool_call_groups ?? [],
+      activeTools: session.active_tool_calls ?? [],
+    });
+    if (session.session_total_cost_usd != null) setSessionCostUsd(session.session_total_cost_usd);
+    if (session.max_prompt_tokens != null) setMaxPromptTokens(session.max_prompt_tokens);
+    if ((sessionQuery.data?.conversation?.length ?? 0) > 0) {
+      setInitialSetupDone(true);
+    }
   }, [
     session,
     session?.id,
@@ -168,165 +165,67 @@ export function PlanningViewPage() {
     session?.is_processing,
     session?.active_tool_calls,
     session?.completed_tool_call_groups,
+    session?.session_total_cost_usd,
+    session?.max_prompt_tokens,
+    sessionQuery.data?.conversation?.length,
   ]);
 
-  const flushActiveToolCalls = useCallback(() => {
-    setActiveToolCalls((prev) => {
-      if (prev.length === 0) return prev;
-      finalizeToolCalls(prev, activeToolRunIdRef.current);
-      activeToolCallsRef.current = [];
-      activeToolRunIdRef.current = null;
-      return [];
-    });
-  }, [finalizeToolCalls]);
-
-  // Hydrate cost/tokens from session when loading an existing session (SSE only sends live events)
   useEffect(() => {
-    if (!session) return;
-    const cost = session.session_total_cost_usd;
-    const tokens = session.max_prompt_tokens;
-    queueMicrotask(() => {
-      if (cost != null) setSessionCostUsd(cost);
-      if (tokens != null) setMaxPromptTokens(tokens);
-    });
-  }, [session, session?.id, session?.session_total_cost_usd, session?.max_prompt_tokens]);
+    dispatchTl({ type: "sync_turns", turns });
+  }, [turns]);
 
   const handleEvent = useCallback((event: UIEvent) => {
     lastEventAtMs.current = Date.now();
+
+    const v = event.session_version;
+    if (typeof v === "number") {
+      if (v <= lastVersionSeen.current) return;
+      lastVersionSeen.current = v;
+    }
+
     if (event.type === "session_state") {
-      const eventRunId = event.active_command_id?.trim() || null;
-      const snapshotCalls = event.active_tool_calls ?? [];
-      if (activeToolCallsRef.current.length > 0 && snapshotCalls.length === 0) {
-        // Some backend flows clear active calls in session_state before a
-        // terminal complete event is processed on the client.
-        finalizeToolCalls(activeToolCallsRef.current, eventRunId ?? activeToolRunIdRef.current);
-        activeToolCallsRef.current = [];
+      // SSE reconnects emit an initial unversioned snapshot. Once we've seen
+      // versioned events, ignore unversioned snapshots to avoid stale rewinds.
+      if (typeof event.session_version !== "number" && lastVersionSeen.current > 0) {
+        return;
       }
-      if (
-        eventRunId
-        && activeToolRunIdRef.current
-        && eventRunId !== activeToolRunIdRef.current
-        && activeToolCallsRef.current.length > 0
-      ) {
-        flushActiveToolCalls();
-      }
-      activeToolRunIdRef.current = eventRunId;
       setSessionState({
         status: event.status,
         current_round: event.current_round,
         pending_questions: event.pending_questions,
         phase_message: event.phase_message,
         is_processing: event.is_processing,
-        active_tool_calls: event.active_tool_calls,
-        completed_tool_call_groups: event.completed_tool_call_groups,
       });
-      if ((event.completed_tool_call_groups?.length ?? 0) > 0) {
-        setToolCallGroups((prev) => (prev.length > 0 ? prev : event.completed_tool_call_groups));
-      }
-      const terminalCompletedSnapshot = isTerminalCompletedSnapshot(event.is_processing, snapshotCalls);
-      if (terminalCompletedSnapshot) {
-        if (shouldFinalizeFromTerminalSnapshot(event.is_processing, snapshotCalls, activeToolCallsRef.current.length)) {
-          // Recovery path: some flows end without explicit "complete".
-          // Only finalize from terminal snapshot when we still have active
-          // in-memory calls; otherwise this would duplicate an already-finalized group.
-          finalizeToolCalls(snapshotCalls, eventRunId);
-        }
-        // Never keep done-only terminal snapshots in active state.
-        setActiveToolCalls([]);
-        activeToolCallsRef.current = [];
-        activeToolRunIdRef.current = null;
-      } else {
-        setActiveToolCalls(snapshotCalls);
-        activeToolCallsRef.current = snapshotCalls;
-      }
-      // session_state is canonical; clear transient thinking text once
-      // the server reports stable/non-processing state.
-      if (!event.is_processing) {
-        setThinkingMessage(null);
-      }
+      dispatchTl({
+        type: "session_state",
+        groups: event.completed_tool_call_groups,
+        activeTools: event.active_tool_calls,
+      });
+      if (!event.is_processing) setThinkingMessage(null);
       return;
     }
     if (event.type === "thinking") {
       setThinkingMessage(event.message);
       return;
     }
-    if (event.type === "tool_call") {
-      const eventRunId = ensureRunId(event.command_id);
-      if (
-        activeToolRunIdRef.current
-        && activeToolRunIdRef.current !== eventRunId
-        && activeToolCallsRef.current.length > 0
-      ) {
-        flushActiveToolCalls();
-      }
-      activeToolRunIdRef.current = eventRunId;
-      setActiveToolCalls((prev) => {
-        const next = [
-          ...prev,
-          {
-            id: `${eventRunId}-${Date.now()}-${prev.length}`,
-            name: event.name,
-            sessionStage: event.session_stage,
-            path: event.path,
-            query: event.query,
-            status: "running" as const,
-          },
-        ].slice(-200);
-        activeToolCallsRef.current = next;
-        return next;
-      });
-      return;
-    }
-    if (event.type === "tool_result") {
-      const eventRunId = ensureRunId(event.command_id);
-      if (
-        activeToolRunIdRef.current
-        && activeToolRunIdRef.current !== eventRunId
-        && activeToolCallsRef.current.length > 0
-      ) {
-        flushActiveToolCalls();
-      }
-      activeToolRunIdRef.current = eventRunId;
-      setActiveToolCalls((prev) => {
-        const updated = [...prev];
-        for (let idx = updated.length - 1; idx >= 0; idx -= 1) {
-          const candidate = updated[idx];
-          const sameName = candidate.name === event.name;
-          const sameStage = (candidate.sessionStage ?? "") === (event.session_stage ?? "");
-          if (candidate.status === "running" && sameName && sameStage) {
-            updated[idx] = {
-              ...candidate,
-              status: "done",
-              durationMs: event.duration_ms,
-            };
-            activeToolCallsRef.current = updated;
-            return updated;
-          }
-        }
-        const next = [
-          ...updated,
-          {
-            id: `${eventRunId}-${Date.now()}-${updated.length}`,
-            name: event.name,
-            sessionStage: event.session_stage,
-            status: "done" as const,
-            durationMs: event.duration_ms,
-          },
-        ].slice(-200);
-        activeToolCallsRef.current = next;
-        return next;
-      });
+    if (event.type === "tool_update") {
+      dispatchTl({ type: "tool_update", tool: event.tool });
       return;
     }
     if (event.type === "complete") {
+      dispatchTl({ type: "complete" });
       setThinkingMessage(null);
-      flushActiveToolCalls();
       setWarnings([]);
+      const now = Date.now();
+      if (now - lastRefetchAtMs.current >= 800) {
+        lastRefetchAtMs.current = now;
+        void refetchSession();
+      }
       return;
     }
     if (event.type === "plan_ready") {
+      dispatchTl({ type: "plan_ready" });
       setThinkingMessage(null);
-      flushActiveToolCalls();
       if (event.round === 0) {
         setShowCritiquePrompt(true);
       }
@@ -335,6 +234,7 @@ export function PlanningViewPage() {
         lastRefetchAtMs.current = now;
         void refetchSession();
       }
+      void queryClient.invalidateQueries({ queryKey: ["session-snapshot", id] });
       return;
     }
     if (event.type === "error") {
@@ -400,38 +300,27 @@ export function PlanningViewPage() {
       return;
     }
     if (event.type === "discovery_ready") {
+      setInitialSetupDone(true);
       lastRefetchAtMs.current = Date.now();
       void refetchSession();
       return;
     }
-  }, [ensureRunId, finalizeToolCalls, flushActiveToolCalls, maxPromptTokens, refetchSession, sessionCostUsd]);
+  }, [id, maxPromptTokens, queryClient, refetchSession, sessionCostUsd]);
 
-  useSessionEvents(id, handleEvent, Boolean(session));
-
-  useEffect(() => {
-    const status = effectiveStatus;
-    const isActive = status === "draft" || status === "refining";
-    if (!isActive) {
-      return;
+  const handleReconnect = useCallback(() => {
+    lastRefetchAtMs.current = Date.now();
+    void refetchSession();
+    if (shouldPollSnapshot) {
+      void queryClient.invalidateQueries({ queryKey: ["session-snapshot", id] });
     }
-    const timer = window.setInterval(() => {
-      const now = Date.now();
-      const eventStale = now - lastEventAtMs.current > 8000;
-      const recentlyRefetched = now - lastRefetchAtMs.current < 4000;
-      const shouldForceRefresh = (status === "draft" || status === "refining") && !recentlyRefetched;
-      if ((eventStale || shouldForceRefresh) && !recentlyRefetched) {
-        lastRefetchAtMs.current = now;
-        void sessionQuery.refetch();
-      }
-    }, 3000);
-    return () => {
-      window.clearInterval(timer);
-    };
-  }, [effectiveStatus, sessionQuery]);
+  }, [id, queryClient, refetchSession, shouldPollSnapshot]);
+
+  useSessionEvents(id, handleEvent, Boolean(session), handleReconnect);
 
   const submitMessage = async (text: string) => {
     try {
       setError(null);
+      setThinkingMessage("Thinking...");
       const status = effectiveStatus;
       const models = {
         author_model: selectedAuthorModel || undefined,
@@ -507,31 +396,6 @@ export function PlanningViewPage() {
     }
   };
 
-  const onToggleDiff = async () => {
-    if (!showDiff) {
-      try {
-        const response = await getDiff(id);
-        setDiff(response.diff || "No diff available.");
-      } catch (err) {
-        setError(String(err));
-        return;
-      }
-    }
-    setShowDiff((v) => !v);
-  };
-
-  useEffect(() => {
-    if (!showDiff || !id) return;
-    void (async () => {
-      try {
-        const response = await getDiff(id);
-        setDiff(response.diff || "No diff available.");
-      } catch (err) {
-        setError(String(err));
-      }
-    })();
-  }, [showDiff, id, sessionQuery.data?.current_plan?.round]);
-
   const onDelete = async () => {
     if (!window.confirm("Delete this plan? This cannot be undone.")) return;
     try {
@@ -554,31 +418,92 @@ export function PlanningViewPage() {
   };
 
   const contextPercent = contextUsageRatio !== null ? contextUsageRatio * 100 : null;
-  const planContent = useMemo(() => {
-    if (showDiff) return diff;
-    return sessionQuery.data?.current_plan?.plan_content ?? "";
-  }, [showDiff, diff, sessionQuery.data?.current_plan?.plan_content]);
+  const planContent = sessionQuery.data?.current_plan?.plan_content ?? "";
+  const snapshot = snapshotQuery.data?.snapshot;
+  const openIssuesCount = snapshot?.issue_graph?.summary?.open_total
+    ?? (Array.isArray(snapshot?.open_issues) ? snapshot.open_issues.length : 0);
+  const constraintViolationsCount = Array.isArray(snapshot?.constraint_eval?.constraint_violations)
+    ? snapshot?.constraint_eval?.constraint_violations.length
+    : 0;
   const versionedTitle = useMemo(() => {
     if (!session) return "";
     return cleanPlanTitle(session.title);
   }, [session]);
+  const activeRepoContext = useMemo(() => {
+    const params = new URLSearchParams(location.search);
+    return params.get("repo") ?? getActiveRepoContext();
+  }, [location.search]);
+  const sessionsHref = activeRepoContext
+    ? `/?repo=${encodeURIComponent(activeRepoContext)}`
+    : "/";
+  const newPlanHref = activeRepoContext
+    ? `/new?repo=${encodeURIComponent(activeRepoContext)}`
+    : "/new";
+  const deleteStaleSession = async () => {
+    try {
+      setDeletingOrphan(true);
+      // Use delete by session id without repo scoping so orphan records are removable.
+      await deleteSession(id);
+      window.location.href = "/";
+    } catch {
+      // If already gone, still recover the user back to sessions.
+      window.location.href = "/";
+    } finally {
+      setDeletingOrphan(false);
+    }
+  };
 
   if (!session && !sessionQuery.isLoading) {
     return (
-      <main className="h-screen flex flex-col items-center justify-center bg-zinc-950 text-zinc-400">
-        <p>Session not found.</p>
-        <Link to="/" className="mt-4 text-indigo-400 hover:text-indigo-300">Return to sessions</Link>
+      <main className="h-screen flex items-center justify-center bg-zinc-950 px-6">
+        <div className="w-full max-w-lg rounded-2xl border border-zinc-800 bg-zinc-900/70 p-8 shadow-xl">
+          <div className="mb-5 inline-flex h-10 w-10 items-center justify-center rounded-lg bg-zinc-800/80 text-zinc-300">
+            <AlertCircle className="h-5 w-5" />
+          </div>
+          <h1 className="text-xl font-semibold text-zinc-100">Session no longer exists</h1>
+          <p className="mt-2 text-sm leading-6 text-zinc-400">
+            This usually happens after `make reset` or deleting sessions. Open your sessions list to continue.
+          </p>
+          {activeRepoContext ? (
+            <p className="mt-3 text-xs text-zinc-500">
+              Repo context: <span className="font-mono text-zinc-400">{activeRepoContext}</span>
+            </p>
+          ) : null}
+          <div className="mt-7 flex flex-wrap gap-3">
+            <a
+              href={sessionsHref}
+              className="inline-flex items-center rounded-md bg-indigo-500 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-indigo-400"
+            >
+              Back to sessions
+            </a>
+            <a
+              href={newPlanHref}
+              className="inline-flex items-center rounded-md border border-zinc-700 bg-zinc-900 px-4 py-2 text-sm font-medium text-zinc-200 transition-colors hover:bg-zinc-800"
+            >
+              Start new plan
+            </a>
+            <button
+              type="button"
+              onClick={() => void deleteStaleSession()}
+              disabled={deletingOrphan}
+              className="inline-flex items-center gap-2 rounded-md border border-rose-700/60 bg-rose-900/20 px-4 py-2 text-sm font-medium text-rose-200 transition-colors hover:bg-rose-900/35 disabled:cursor-not-allowed disabled:opacity-70"
+            >
+              {deletingOrphan ? <Loader2 className="h-4 w-4 animate-spin" /> : null}
+              {deletingOrphan ? "Deleting..." : "Delete stale session"}
+            </button>
+          </div>
+        </div>
       </main>
     );
   }
 
-  if (
-    effectiveStatus === "draft"
-    && isProcessing
-    && setupSteps.length > 0
+  const isInInitialSetup =
+    !initialSetupDone
+    && effectiveStatus === "draft"
     && turns.length === 0
-    && !(sessionQuery.data?.current_plan?.plan_content ?? "").trim()
-  ) {
+    && !(sessionQuery.data?.current_plan?.plan_content ?? "").trim();
+
+  if (isInInitialSetup) {
     return (
       <main className="h-screen flex flex-col bg-zinc-950 overflow-hidden">
         {session ? (
@@ -599,7 +524,7 @@ export function PlanningViewPage() {
           <div className="w-full max-w-md rounded-xl border border-zinc-800 bg-zinc-900/50 p-8 shadow-lg">
             <h2 className="text-lg font-semibold text-zinc-100 mb-1">Setting up your session</h2>
             <p className="text-sm text-zinc-500 mb-6">
-              Preparing codebase memory so the AI can understand your project. This may take a minute.
+              Preparing codebase memory so the AI can understand your project. This is a one-time setup per reset and may take a minute.
             </p>
             {setupSteps.length > 0 ? (
               <ul className="space-y-3">
@@ -666,22 +591,22 @@ export function PlanningViewPage() {
               left={(
                 <PlanPanel
                   content={planContent}
-                  isDiffMode={showDiff}
                   status={effectiveStatus ?? session.status}
-                  canExport={
-                    Boolean(sessionQuery.data?.current_plan)
-                    && effectiveStatus === "approved"
-                  }
-                  onToggleDiff={() => void onToggleDiff()}
+                  canExport={Boolean(sessionQuery.data?.current_plan)}
                   onExport={() => void onExport()}
+                  health={{
+                    snapshotUpdatedAt: snapshot?.updated_at,
+                    openIssuesCount,
+                    constraintViolationsCount,
+                    issueGraph: snapshot?.issue_graph ?? null,
+                  }}
                 />
               )}
               right={
                 <ChatPanel
-                  turns={turns}
+                  timeline={tl.timeline}
                   questions={questions}
-                  activeToolCalls={activeToolCalls}
-                  toolCallGroups={toolCallGroups}
+                  activeToolCalls={tl.activeTools}
                   thinkingMessage={thinkingMessage}
                   phaseMessage={phaseMessage}
                   warnings={warnings}

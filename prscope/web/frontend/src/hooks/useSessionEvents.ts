@@ -1,5 +1,5 @@
 import { useEffect } from "react";
-import type { DiscoveryQuestion, SessionStatus, ToolCallEntry, UIEvent } from "../types";
+import type { DiscoveryQuestion, SessionStatus, ToolCallEntry, ToolCallGroup, UIEvent } from "../types";
 
 const SESSION_STATUS_VALUES: ReadonlySet<SessionStatus> = new Set([
   "draft",
@@ -37,7 +37,7 @@ function normalizeEvent(rawType: string, rawPayload: Record<string, unknown>): U
         ? (rawPayload.active_tool_calls as ToolCallEntry[])
         : [],
       completed_tool_call_groups: Array.isArray(rawPayload.completed_tool_call_groups)
-        ? (rawPayload.completed_tool_call_groups as ToolCallEntry[][])
+        ? (rawPayload.completed_tool_call_groups as ToolCallGroup[])
         : [],
       active_command_id:
         activeCommand && typeof activeCommand.command_id === "string"
@@ -48,23 +48,21 @@ function normalizeEvent(rawType: string, rawPayload: Record<string, unknown>): U
   if (rawType === "thinking") {
     return { type: "thinking", message: String(rawPayload.message ?? "Thinking...") };
   }
-  if (rawType === "tool_call") {
+  if (rawType === "tool_update") {
+    const tool = (rawPayload.tool ?? rawPayload) as Record<string, unknown>;
     return {
-      type: "tool_call",
-      name: String(rawPayload.name ?? "tool"),
-      path: rawPayload.path ? String(rawPayload.path) : undefined,
-      query: rawPayload.query ? String(rawPayload.query) : undefined,
-      session_stage: rawPayload.session_stage ? String(rawPayload.session_stage) : undefined,
-      command_id: rawPayload.command_id ? String(rawPayload.command_id) : undefined,
-    };
-  }
-  if (rawType === "tool_result") {
-    return {
-      type: "tool_result",
-      name: String(rawPayload.name ?? "tool"),
-      session_stage: rawPayload.session_stage ? String(rawPayload.session_stage) : undefined,
-      duration_ms: rawPayload.duration_ms !== undefined ? Number(rawPayload.duration_ms) : undefined,
-      command_id: rawPayload.command_id ? String(rawPayload.command_id) : undefined,
+      type: "tool_update",
+      tool: {
+        id: String(tool.call_id ?? tool.id ?? `${Date.now()}`),
+        call_id: String(tool.call_id ?? tool.id ?? `${Date.now()}`),
+        name: String(tool.name ?? "tool"),
+        sessionStage: tool.sessionStage ? String(tool.sessionStage) : (tool.session_stage ? String(tool.session_stage) : undefined),
+        path: tool.path ? String(tool.path) : undefined,
+        query: tool.query ? String(tool.query) : undefined,
+        status: String(tool.status ?? "running") as "running" | "done",
+        durationMs: tool.durationMs !== undefined ? Number(tool.durationMs) : (tool.duration_ms !== undefined ? Number(tool.duration_ms) : undefined),
+        created_at: tool.created_at ? String(tool.created_at) : new Date().toISOString(),
+      },
     };
   }
   if (rawType === "complete") {
@@ -148,6 +146,7 @@ export function useSessionEvents(
   sessionId: string,
   onEvent: (event: UIEvent) => void,
   enabled = true,
+  onReconnect?: () => void,
 ) {
   useEffect(() => {
     if (!enabled || !sessionId) {
@@ -158,13 +157,27 @@ export function useSessionEvents(
     const basePath = `/api/sessions/${sessionId}/events`;
     const url = repo ? `${basePath}?repo=${encodeURIComponent(repo)}` : basePath;
     const eventSource = new EventSource(url);
+    let initialConnection = true;
+
+    eventSource.onopen = () => {
+      if (initialConnection) {
+        initialConnection = false;
+        return;
+      }
+      onReconnect?.();
+    };
 
     const bind = (eventName: string) => {
       eventSource.addEventListener(eventName, (event) => {
         try {
           const payload = JSON.parse((event as MessageEvent).data) as Record<string, unknown>;
           const normalized = normalizeEvent(eventName, payload);
-          if (normalized) onEvent(normalized);
+          if (normalized) {
+            if (typeof payload.session_version === "number") {
+              normalized.session_version = payload.session_version;
+            }
+            onEvent(normalized);
+          }
         } catch {
           // Ignore malformed events
         }
@@ -173,8 +186,7 @@ export function useSessionEvents(
 
     bind("thinking");
     bind("session_state");
-    bind("tool_call");
-    bind("tool_result");
+    bind("tool_update");
     bind("context_compaction");
     bind("plan_ready");
     bind("complete");
@@ -198,5 +210,5 @@ export function useSessionEvents(
     return () => {
       eventSource.close();
     };
-  }, [sessionId, onEvent, enabled]);
+  }, [sessionId, onEvent, enabled, onReconnect]);
 }

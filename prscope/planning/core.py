@@ -51,6 +51,30 @@ _UNSET = object()
 
 
 class PlanningCore:
+    @staticmethod
+    def _render_plan_markdown_from_payload(payload: dict[str, Any]) -> str:
+        title = str(payload.get("title", "Plan")).strip() or "Plan"
+        lines = [f"# {title}", ""]
+        sections = (
+            ("summary", "Summary"),
+            ("goals", "Goals"),
+            ("non_goals", "Non-Goals"),
+            ("files_changed", "Files Changed"),
+            ("architecture", "Architecture"),
+            ("implementation_steps", "Implementation Steps"),
+            ("test_strategy", "Test Strategy"),
+            ("rollback_plan", "Rollback Plan"),
+            ("open_questions", "Open Questions"),
+        )
+        for key, label in sections:
+            content = str(payload.get(key, "") or "").strip()
+            if not content:
+                continue
+            lines.append(f"## {label}")
+            lines.append(content)
+            lines.append("")
+        return "\n".join(lines).strip() + "\n"
+
     """Deterministic planning state and convergence logic."""
 
     ALLOWED_TRANSITIONS: dict[str, set[str]] = {
@@ -61,9 +85,9 @@ class PlanningCore:
         "error": {"draft"},
     }
     VALID_COMMANDS: dict[str, set[str]] = {
-        "draft": {"message"},
-        "refining": {"message", "run_round"},
-        "converged": {"run_round", "approve"},
+        "draft": {"message", "export"},
+        "refining": {"message", "run_round", "export"},
+        "converged": {"run_round", "approve", "export"},
         "approved": {"export"},
         "error": {"reset"},
     }
@@ -94,9 +118,32 @@ class PlanningCore:
 
     def get_current_plan(self) -> PlanVersion | None:
         versions = self.store.get_plan_versions(self.session_id, limit=1)
-        return versions[0] if versions else None
+        if not versions:
+            return None
+        current = versions[0]
+        if current.plan_json and (not current.plan_content or not current.plan_content.strip()):
+            try:
+                payload = json.loads(current.plan_json)
+                if isinstance(payload, dict):
+                    current.plan_content = self._render_plan_markdown_from_payload(payload)
+            except Exception:  # noqa: BLE001
+                pass
+        return current
 
-    def save_plan_version(self, content: str, round_number: int) -> PlanVersion:
+    def save_plan_version(
+        self,
+        content: str,
+        round_number: int,
+        *,
+        plan_document: Any | None = None,
+        changed_sections: list[str] | None = None,
+    ) -> PlanVersion:
+        if plan_document is not None:
+            payload = dict(getattr(plan_document, "__dict__", {}))
+            plan_json = json.dumps(payload)
+            content = self._render_plan_markdown_from_payload(payload)
+        else:
+            plan_json = None
         plan_sha = hashlib.sha256(content.encode("utf-8")).hexdigest()
         previous = self.store.get_plan_version(self.session_id, max(round_number - 1, 0))
         diff_from_previous: str | None = None
@@ -114,7 +161,9 @@ class PlanningCore:
             session_id=self.session_id,
             round_number=round_number,
             plan_content=content,
+            plan_json=plan_json,
             plan_sha=plan_sha,
+            changed_sections=json.dumps(changed_sections or []),
             diff_from_previous=diff_from_previous,
         )
         return version
@@ -177,6 +226,22 @@ class PlanningCore:
         active_tool_calls = self._parse_json(session.active_tool_calls_json, [])
         if not isinstance(active_tool_calls, list):
             active_tool_calls = []
+        completed_groups_raw = self._parse_json(getattr(session, "completed_tool_call_groups_json", None), [])
+        completed_groups: list[Any] = []
+        if isinstance(completed_groups_raw, list):
+            for idx, group in enumerate(completed_groups_raw):
+                if isinstance(group, dict) and "tools" in group:
+                    completed_groups.append(group)
+                elif isinstance(group, list):
+                    tools = [e for e in group if isinstance(e, dict)]
+                    first_ts = str(tools[0].get("created_at", "")) if tools else ""
+                    completed_groups.append(
+                        {
+                            "sequence": idx,
+                            "created_at": first_ts,
+                            "tools": tools,
+                        }
+                    )
         return {
             "type": "session_state",
             "v": 1,
@@ -186,6 +251,7 @@ class PlanningCore:
             "current_round": session.current_round,
             "pending_questions": pending_questions,
             "active_tool_calls": active_tool_calls,
+            "completed_tool_call_groups": completed_groups,
         }
 
     def transition_and_snapshot(

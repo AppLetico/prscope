@@ -23,10 +23,13 @@ src/
 ├── pages/
 │   ├── SessionList.tsx         ← session list / home page
 │   ├── NewSession.tsx          ← session creation form
-│   └── PlanningView.tsx        ← main planning workspace (chat + plan)
+│   ├── PlanningView.tsx        ← main planning workspace (chat + plan)
+│   └── PlanningView.test.ts   ← tests for timeline reducer, buildTimeline, upsertToolCall
 ├── components/
 │   ├── ActionBar.tsx           ← session action buttons (round, approve, export)
-│   ├── ChatPanel.tsx           ← discovery chat / message history
+│   ├── ChatPanel.tsx           ← pure timeline renderer (chat + tools)
+│   ├── ChatPanel.test.ts      ← tests for hasRunningToolCalls
+│   ├── chatPanelUtils.ts      ← timeline reducer, buildTimeline, upsertToolCall utilities
 │   ├── PlanPanel.tsx           ← rendered plan with diff view
 │   ├── ResizableLayout.tsx     ← draggable split pane
 │   ├── ToolCallStream.tsx      ← live tool call display
@@ -37,7 +40,7 @@ src/
 │   └── ui/
 │       └── Tooltip.tsx         ← reusable tooltip primitive
 ├── hooks/
-│   ├── useSessionEvents.ts    ← SSE connection + event dispatch
+│   ├── useSessionEvents.ts    ← SSE connection + event normalization
 │   ├── useTheme.ts            ← theme preference persistence
 │   └── useMediaQuery.ts       ← responsive breakpoint hook
 └── lib/
@@ -56,6 +59,7 @@ The frontend treats the server as the source of truth:
 - `GET /api/sessions/{id}` is sufficient to render any screen.
 - `session_state` SSE events replace local state entirely (not merged).
 - On reconnect, the first SSE event is always a full `session_state` snapshot.
+- Session snapshot payloads can include both legacy `open_issues` and additive `issue_graph` fields.
 
 **Rule:** Never reconstruct UI state from turns, events, or local cache. Always derive from the latest server snapshot.
 
@@ -64,10 +68,33 @@ The frontend treats the server as the source of truth:
 `useSessionEvents` manages the SSE connection lifecycle:
 
 - Connects to `GET /api/sessions/{id}/events`
-- Dispatches typed events to callbacks
+- Normalizes raw SSE events into typed `UIEvent` objects
+- Extracts `session_version` from every event payload for ordering guarantees
 - `session_state` events are treated as total state replacement
-- Tool call events (`tool_call`, `tool_result`) update an in-memory list
+- `tool_update` events carry a unified `ToolCallEntry` with `call_id` and `status` (`running` | `done`)
 - Connection drops trigger automatic reconnection
+
+### Timeline Architecture
+
+The frontend renders chat history and tool execution as a single chronological timeline.
+
+**State ownership:** A `timelineReducer` in `PlanningView` owns the timeline via `useReducer`. It stores `turns`, `groups`, the merged `timeline`, and `activeTools` in a single state object.
+
+**Timeline projection:** `buildTimeline()` performs an O(n) linear merge of turns and completed tool groups, sorted by monotonic `sequence` numbers assigned server-side. Tool groups with the same sequence as a turn sort first (tools appear before the response they produced).
+
+**Active tools** are transient UI state, rendered separately below the timeline — they are not timeline items. This prevents visual flicker when tools complete and move into a finalized group.
+
+**Event version gating:** Every SSE event carries a monotonic `session_version`. The frontend tracks `lastVersionSeen` and discards any event with a version ≤ the last seen, preventing stale/reordered events from causing UI glitches.
+
+**Data flow:**
+
+```
+SSE event → version gate → dispatch to timelineReducer
+                              ↓
+                        TimelineState { timeline, activeTools }
+                              ↓
+                        ChatPanel (pure renderer)
+```
 
 ### Command Model
 
@@ -79,11 +106,19 @@ The frontend handles `409` responses gracefully — they indicate the session is
 
 | Component | Owns | Does Not Own |
 |---|---|---|
-| `PlanningView` | Session lifecycle, SSE subscription, layout | Individual panel rendering |
-| `ChatPanel` | Message display, input, discovery flow | Session state mutations |
+| `PlanningView` | Session lifecycle, SSE subscription, timeline reducer, layout | Individual panel rendering |
+| `ChatPanel` | Pure timeline rendering, message input, discovery flow | State management, timeline construction |
+| `chatPanelUtils` | `timelineReducer`, `buildTimeline`, `upsertToolCall` | Component rendering |
 | `PlanPanel` | Plan rendering, diff view, export | Round execution |
 | `ActionBar` | Command dispatch (round, approve, export) | State management |
 | `ToolCallStream` | Tool call display and filtering | Tool execution |
+
+### Issue Graph Rendering
+
+- When `snapshot.issue_graph` is present, `PlanPanel` renders a causal issue tree from `causes` edges.
+- `depends_on` and duplicate aliases are rendered as annotations, not as tree edges.
+- When `issue_graph` is absent, UI falls back to legacy flat issue counters from `open_issues`.
+- Round tables remain backward-compatible (`major_issues`, `minor_issues`) with optional graph summaries.
 
 ### Styling
 

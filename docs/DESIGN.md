@@ -4,7 +4,7 @@ This document captures the foundational design decisions behind prscope and the 
 
 ## Product Intent
 
-Prscope exists to reduce the gap between "I know roughly what I want" and "here is a grounded, reviewable plan that references real code." It is a planning tool, not a code generator — its output is PRD/RFC documents, not pull requests.
+Prscope exists to reduce the gap between "I know roughly what I want" and "here is a grounded, reviewable plan that references real code." It is a planning tool, not a code generator — its output is plan documents, not pull requests.
 
 ## Design Decisions
 

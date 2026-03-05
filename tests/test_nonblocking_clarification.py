@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from prscope.config import PlanningConfig, PrscopeConfig, RepoProfile
-from prscope.planning.runtime.author import AuthorResult
+from prscope.planning.runtime.author import RepairPlan, RevisionResult
 from prscope.planning.runtime.critic import CriticResult
 from prscope.planning.runtime.discovery import DiscoveryQuestion, DiscoveryTurnResult, QuestionOption
 from prscope.planning.runtime.orchestration import PlanningRuntime
@@ -35,32 +35,49 @@ async def test_round_returns_quickly_when_clarification_requested(tmp_path):
     async def fake_run_critic(**kwargs):  # type: ignore[no-untyped-def]
         del kwargs
         return CriticResult(
-            major_issues_remaining=1,
-            minor_issues_remaining=0,
-            hard_constraint_violations=["HARD_CONSTRAINT_001"],
-            critique_complete=False,
-            failure_modes=[],
-            design_tradeoff_risks=[],
-            unsupported_claims=[],
-            missing_evidence=[
-                "Security controls for `prscope/web/api.py` endpoint `/api/health` "
-                "are not specified in the Architecture section."
-            ],
-            critic_confidence=0.2,
-            operational_readiness=False,
-            vagueness_score=0.0,
-            citation_count=0,
-            clarification_questions=["Which environment should rollout target first?"],
+            strengths=[],
+            architectural_concerns=["Security controls for `/api/health` are underspecified."],
+            risks=["Deployment target ambiguity could block rollout sequencing."],
+            simplification_opportunities=[],
+            blocking_issues=["Specify rollout environment before refinement."],
+            reviewer_questions=["Which environment should rollout target first?"],
+            recommended_changes=["Clarify target environment and threat model assumptions."],
+            design_quality_score=3.0,
+            confidence="low",
+            review_complete=False,
+            simplest_possible_design=None,
+            primary_issue="Missing rollout environment",
+            resolved_issues=[],
+            constraint_violations=["HARD_CONSTRAINT_001"],
+            issue_priority=["Missing rollout environment"],
             prose="Need clarification before refining.",
             parse_error=None,
         )
 
-    async def fake_author_loop(*args, **kwargs):  # type: ignore[no-untyped-def]
+    async def fake_plan_repair(*args, **kwargs):  # type: ignore[no-untyped-def]
         del args, kwargs
-        return AuthorResult(plan="# Plan\n\nUnexpected", unverified_references=set(), accessed_paths=set())
+        return RepairPlan(
+            problem_understanding="Need clarification before deep changes.",
+            accepted_issues=["Specify rollout environment before refinement."],
+            rejected_issues=[],
+            root_causes=["Missing deployment context"],
+            repair_strategy="Apply best-effort assumptions and mark open question",
+            target_sections=["open_questions"],
+            revision_plan="Add unresolved clarification explicitly.",
+        )
 
-    runtime.critic.run_critic = fake_run_critic  # type: ignore[method-assign]
-    runtime.author.author_loop = fake_author_loop  # type: ignore[method-assign]
+    async def fake_revise_plan(*args, **kwargs):  # type: ignore[no-untyped-def]
+        del args, kwargs
+        return RevisionResult(
+            problem_understanding="Proceeding with best-effort assumptions.",
+            updates={"open_questions": "- Which environment should rollout target first?"},
+            justification={"open_questions": "Carries reviewer clarification request forward."},
+            review_prediction="Reviewer should request explicit answer next round.",
+        )
+
+    runtime.critic.run_design_review = fake_run_critic  # type: ignore[method-assign]
+    runtime.author.plan_repair = fake_plan_repair  # type: ignore[method-assign]
+    runtime.author.revise_plan = fake_revise_plan  # type: ignore[method-assign]
 
     events: list[dict[str, object]] = []
 
@@ -72,14 +89,11 @@ async def test_round_returns_quickly_when_clarification_requested(tmp_path):
         timeout=2.0,
     )
 
-    assert critic_result.clarification_questions == ["Which environment should rollout target first?"]
+    assert critic_result.reviewer_questions == ["Which environment should rollout target first?"]
     # In web/API mode, clarification is surfaced but the round continues best-effort.
-    assert author_result.plan == "# Plan\n\nUnexpected"
-    assert any(event.get("type") == "clarification_needed" for event in events)
-    assert any(
-        event.get("type") == "warning" and "best-effort assumptions" in str(event.get("message", ""))
-        for event in events
-    )
+    assert "Which environment should rollout target first?" in author_result.plan
+    assert any(event.get("type") == "plan_ready" for event in events)
+    assert any(event.get("type") == "complete" for event in events)
 
 
 @pytest.mark.asyncio

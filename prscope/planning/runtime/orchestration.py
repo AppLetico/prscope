@@ -11,28 +11,41 @@ import re
 import time
 from dataclasses import asdict
 from datetime import datetime, timezone
+from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from ...config import PlanningConfig, PrscopeConfig, RepoProfile
-from ...memory import MemoryStore, ParsedConstraint, load_skills
+from ...memory import MemoryStore, ParsedConstraint
 from ...pricing import MODEL_CONTEXT_WINDOWS
 from ...profile import build_profile
 from ...store import PlanningSession, PullRequest, Store
 from ..core import ConvergenceResult, PlanningCore
 from ..render import export_plan_documents
 from ..scanners import get_scanner
-from .analytics_emitter import AnalyticsEmitter
-from .author import AuthorAgent, AuthorResult
-from .budget import ContextWindowExceeded, TokenBudgetManager, estimate_tokens
-from .clarification import ClarificationAborted, ClarificationGate
-from .compression import CritiqueCompressor
-from .critic import CriticAgent, CriticResult
+from .author import (
+    AuthorAgent,
+    AuthorResult,
+    DesignRecord,
+    PlanDocument,
+    RepairPlan,
+    RevisionResult,
+)
+from .context import ClarificationGate, ContextAssembler, CritiqueCompressor
+from .critic import CriticAgent, CriticResult, ImplementabilityResult, ReviewResult
 from .discovery import DiscoveryManager, DiscoveryTurnResult
-from .round_controller import compute_plan_delta
+from .events import AnalyticsEmitter, ToolEventStateManager, apply_token_usage_event
+from .pipeline import AdversarialPlanningLoop, PlanningRoundContext, PlanningStages
+from .review import (
+    IssueCausalityExtractor,
+    IssueGraphTracker,
+    IssueSimilarityService,
+    ManifestoChecker,
+)
+from .state import PlanningState
 from .tools import ToolExecutor
 
-MEMORY_BLOCK_KEYS = {"architecture", "modules", "patterns", "entrypoints", "context"}
+MEMORY_BLOCK_KEYS = {"architecture", "modules", "patterns", "entrypoints", "context", "mental_model"}
 # Keep startup responsive; deeper refinement can happen in subsequent rounds.
 INITIAL_DRAFT_TIMEOUT_SECONDS = 90
 REFINEMENT_AUTHOR_TIMEOUT_SECONDS = 420
@@ -40,7 +53,23 @@ REFINEMENT_MAX_TOOL_CALLS = 10
 MAX_ACTIVE_TOOL_CALLS = 50
 MAX_COMPLETED_TOOL_CALL_GROUPS = 50
 CRITIC_MAX_CLARIFICATION_QUESTIONS_PER_ROUND = 1
+MAX_STATE_CACHE = 200
 logger = logging.getLogger(__name__)
+STATE_SNAPSHOT_SCHEMA_VERSION = 1
+
+PLAN_TITLE_PATTERN = re.compile(r"^#\s+(.+)$", flags=re.MULTILINE)
+
+
+@lru_cache(maxsize=64)
+def _section_heading_pattern(heading: str) -> re.Pattern[str]:
+    return re.compile(
+        rf"^##\s+{re.escape(heading)}\b(.*?)(?=^##\s+|\Z)",
+        re.IGNORECASE | re.MULTILINE | re.DOTALL,
+    )
+
+
+class IssueTracker(IssueGraphTracker):
+    """Compatibility alias preserving runtime isinstance checks."""
 
 
 class PlanningRuntime:
@@ -63,16 +92,40 @@ class PlanningRuntime:
         if self.repo.memory_block_max_chars:
             self._memory_block_caps.update(self.repo.memory_block_max_chars)
         self._locks: dict[str, asyncio.Lock] = {}
-        self._session_cost_usd: dict[str, float] = {}
-        self._session_max_prompt_tokens: dict[str, int] = {}
-        self._session_read_paths: dict[str, set[str]] = {}
+        self._states: dict[str, PlanningState] = {}
+        self._session_version: dict[str, int] = {}
         self._clarification_gates: dict[str, ClarificationGate] = {}
-        self._clarification_logs: dict[str, list[dict[str, Any]]] = {}
-        self._suppressed_critic_clarifications: dict[str, int] = {}
-        self._session_working_summary: dict[str, str] = {}
-        self._session_skills_context: dict[str, str] = {}
-        self._session_no_recall: dict[str, bool] = {}
+        self._manifesto_checker = ManifestoChecker()
         self._compressor = CritiqueCompressor()
+        self._issue_similarity = IssueSimilarityService(self.planning_config.issue_dedupe)
+        self._causality_extractor = IssueCausalityExtractor(self.planning_config.issue_graph)
+        self._tool_event_state = ToolEventStateManager(
+            store=self.store,
+            core_resolver=self._core,
+            max_active_tool_calls=MAX_ACTIVE_TOOL_CALLS,
+            max_completed_tool_call_groups=MAX_COMPLETED_TOOL_CALL_GROUPS,
+        )
+        self._context_assembler = ContextAssembler(
+            repo=self.repo,
+            planning_config=self.planning_config,
+            memory=self.memory,
+            store=self.store,
+            state_getter=self._state,
+            truncate_memory_block=self._truncate_memory_block,
+            recall_disabled=self._recall_disabled,
+        )
+        self._stages = PlanningStages(
+            emit_event=self._emit_event,
+            repo_memory=self._repo_memory,
+            critic=self.critic,
+            author=self.author,
+            design_record_payload=self._design_record_payload,
+            design_record_from_payload=self._design_record_from_payload,
+            review_chat_summary=self._review_chat_summary,
+            manifesto_checker=self._manifesto_checker,
+            causality_extractor=self._causality_extractor,
+        )
+        self._adversarial_loop = AdversarialPlanningLoop(self)
 
     def _resolve_author_model(
         self,
@@ -96,85 +149,199 @@ class PlanningRuntime:
 
     def cleanup_session_resources(self, session_id: str) -> None:
         self._locks.pop(session_id, None)
-        self._session_cost_usd.pop(session_id, None)
-        self._session_max_prompt_tokens.pop(session_id, None)
-        self._session_read_paths.pop(session_id, None)
         self._clarification_gates.pop(session_id, None)
-        self._clarification_logs.pop(session_id, None)
-        self._suppressed_critic_clarifications.pop(session_id, None)
-        self._session_working_summary.pop(session_id, None)
-        self._session_skills_context.pop(session_id, None)
-        self._session_no_recall.pop(session_id, None)
+        self._states.pop(session_id, None)
         self.discovery.clear_session(session_id)
         self.tools.delete_session_artifacts(session_id)
 
-    def _skills_context(self, session_id: str) -> str:
-        cached = self._session_skills_context.get(session_id)
-        if cached is not None:
-            return cached
-        skills_body = load_skills(self.repo.skills_dir, self.planning_config.skills_max_chars)
-        if not skills_body:
-            self._session_skills_context[session_id] = ""
-            return ""
-        wrapped = (
-            "## Team Skills & Patterns\n"
-            "The following represent stable team patterns and engineering defaults.\n"
-            "Apply them unless explicitly overridden by requirements.\n\n"
-            "---\n"
-            f"{skills_body}\n"
+    def _state(self, session_id: str, session: PlanningSession | None = None) -> PlanningState:
+        state = self._states.get(session_id)
+        if state is not None:
+            # Move hot sessions to the end for LRU-like eviction.
+            self._states.pop(session_id, None)
+            self._states[session_id] = state
+        if state is None:
+            current = session or self.store.get_planning_session(session_id)
+            requirements = str(getattr(current, "requirements", "") or "")
+            no_recall = bool(getattr(current, "no_recall", 0)) if current is not None else False
+            tracker = IssueTracker(
+                self._issue_similarity,
+                max_nodes=self.planning_config.issue_graph.max_nodes,
+                max_edges=self.planning_config.issue_graph.max_edges,
+            )
+            snapshot = self.read_state_snapshot(session_id)
+            if isinstance(snapshot, dict):
+                snapshot_version = int(snapshot.get("schema_version", 0) or 0)
+                issue_graph_payload = snapshot.get("issue_graph")
+                if snapshot_version >= 1 and isinstance(issue_graph_payload, dict):
+                    tracker.load_snapshot(issue_graph_payload)
+                else:
+                    # Backward compatibility for flat snapshots.
+                    for raw in snapshot.get("open_issues", []):
+                        if not isinstance(raw, dict):
+                            continue
+                        description = str(raw.get("description", "")).strip()
+                        issue_id = str(raw.get("id", "")).strip() or None
+                        raised_round = int(raw.get("raised_in_round", 0) or 0)
+                        if description:
+                            canonical_issue = tracker.add_issue(description, raised_round)
+                            if issue_id and canonical_issue.id and canonical_issue.id != issue_id:
+                                tracker.alias_duplicate(issue_id, canonical_issue.id)
+                            if issue_id:
+                                tracker.canonical_issue_id(issue_id)
+            state = PlanningState(
+                session_id=session_id,
+                requirements=requirements,
+                no_recall=no_recall,
+                issue_tracker=tracker,
+            )
+            self._states[session_id] = state
+            if len(self._states) > MAX_STATE_CACHE:
+                oldest_session_id = next(iter(self._states))
+                self._states.pop(oldest_session_id, None)
+        if not state.manifesto:
+            state.manifesto = self.memory.load_manifesto()
+        if not state.constraints:
+            state.constraints = self._constraints()
+        return state
+
+    def _repo_memory(self, state: PlanningState) -> dict[str, str]:
+        return self._context_assembler.repo_memory(state)
+
+    @staticmethod
+    def _design_record_from_payload(payload: dict[str, Any] | None) -> DesignRecord | None:
+        if not payload:
+            return None
+        return DesignRecord(
+            problem_summary=str(payload.get("problem_summary", "")),
+            constraints=[str(item) for item in payload.get("constraints", [])],
+            architecture=str(payload.get("architecture", "")),
+            alternatives_considered=[str(item) for item in payload.get("alternatives_considered", [])],
+            tradeoffs=[str(item) for item in payload.get("tradeoffs", [])],
+            chosen_design=str(payload.get("chosen_design", "")),
+            assumptions=[str(item) for item in payload.get("assumptions", [])],
+            potential_failure_modes=[str(item) for item in payload.get("potential_failure_modes", [])],
         )
-        self._session_skills_context[session_id] = wrapped
-        return wrapped
+
+    @staticmethod
+    def _design_record_payload(record: DesignRecord | None) -> dict[str, Any] | None:
+        if record is None:
+            return None
+        return asdict(record)
+
+    @staticmethod
+    def _as_serializable(value: Any) -> Any:
+        if value is None:
+            return None
+        if hasattr(value, "__dataclass_fields__"):
+            return asdict(value)
+        return value
+
+    @staticmethod
+    def _reset_round_telemetry(state: PlanningState) -> None:
+        state.round_cost_usd = 0.0
+        state.author_prompt_tokens = 0
+        state.author_completion_tokens = 0
+        state.critic_prompt_tokens = 0
+        state.critic_completion_tokens = 0
+
+    def _persist_state_snapshot(self, session_id: str) -> None:
+        state = self._states.get(session_id)
+        if state is None:
+            return
+        sessions_dir = self.repo.resolved_path / ".prscope" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
+        issue_entries: list[dict[str, Any]] = []
+        issue_graph: dict[str, Any] = {
+            "nodes": [],
+            "edges": [],
+            "duplicate_alias": {},
+            "summary": {
+                "open_total": 0,
+                "root_open": 0,
+                "resolved_total": 0,
+                "open_major": 0,
+                "open_minor": 0,
+                "open_info": 0,
+                "unresolved_dependency_chains": 0,
+            },
+        }
+        if isinstance(state.issue_tracker, IssueTracker):
+            issue_entries = state.issue_tracker.open_issue_dicts()
+            snapshot = state.issue_tracker.graph_snapshot()
+            if isinstance(snapshot, dict):
+                issue_graph = snapshot
+        payload: dict[str, Any] = {
+            "schema_version": STATE_SNAPSHOT_SCHEMA_VERSION,
+            "session_id": state.session_id,
+            "requirements": state.requirements,
+            "repo_memory_keys": sorted(list(state.repo_memory.keys())),
+            "manifesto_excerpt": (state.manifesto or "")[:2000],
+            "constraints": [asdict(constraint) for constraint in state.constraints],
+            "plan_markdown": state.plan_markdown,
+            "design_record": self._as_serializable(state.design_record),
+            "review": self._as_serializable(state.review),
+            "constraint_eval": self._as_serializable(state.constraint_eval),
+            "revision_round": state.revision_round,
+            "open_issues": issue_entries,
+            "issue_graph": issue_graph,
+            "accessed_paths": sorted(state.accessed_paths),
+            "session_cost_usd": state.session_cost_usd,
+            "round_cost_usd": state.round_cost_usd,
+            "max_prompt_tokens": state.max_prompt_tokens,
+            "author_prompt_tokens": state.author_prompt_tokens,
+            "author_completion_tokens": state.author_completion_tokens,
+            "critic_prompt_tokens": state.critic_prompt_tokens,
+            "critic_completion_tokens": state.critic_completion_tokens,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        snapshot_path = sessions_dir / f"{session_id}.json"
+        snapshot_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+    def read_state_snapshot(self, session_id: str) -> dict[str, Any] | None:
+        snapshot_path = self.repo.resolved_path / ".prscope" / "sessions" / f"{session_id}.json"
+        if not snapshot_path.exists():
+            return None
+        try:
+            payload = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return payload
+
+    def list_state_snapshots(self) -> list[dict[str, Any]]:
+        snapshots_dir = self.repo.resolved_path / ".prscope" / "sessions"
+        if not snapshots_dir.exists():
+            return []
+        items: list[dict[str, Any]] = []
+        for path in sorted(snapshots_dir.glob("*.json")):
+            try:
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            items.append(
+                {
+                    "session_id": str(payload.get("session_id", path.stem)),
+                    "updated_at": str(payload.get("updated_at", "")),
+                    "path": str(path),
+                }
+            )
+        return items
+
+    def _skills_context(self, session_id: str) -> str:
+        return self._context_assembler.skills_context(session_id)
 
     def _recall_disabled(self, session_id: str) -> bool:
-        if session_id in self._session_no_recall:
-            return bool(self._session_no_recall[session_id])
-        session = self.store.get_planning_session(session_id)
-        disabled = bool(getattr(session, "no_recall", 0)) if session is not None else False
-        self._session_no_recall[session_id] = disabled
-        return disabled
+        return bool(self._state(session_id).no_recall)
 
     def _build_recall_context(self, session_id: str, query: str) -> str:
-        if not self.planning_config.recall_prior_sessions:
-            return ""
-        if self._recall_disabled(session_id):
-            return ""
-        if len(query.split()) < 6:
-            logger.info("[recall] Skipped - insufficient query signal")
-            return ""
-
-        ranked = self.store.search_sessions(
-            query=query,
-            repo_name=self.repo.name,
-            limit=self.planning_config.recall_top_k,
-        )
-        if not ranked:
-            return ""
-
-        header = (
-            "## Prior Planning Context\nHistorical context may be outdated. Validate against current requirements.\n\n"
-        )
-        body_blocks: list[str] = []
-        total = len(header)
-        max_chars = max(0, self.planning_config.recall_max_chars)
-        for item in ranked:
-            block = (
-                f"### Session: {item['title']} ({item['created_at'][:10]})\n"
-                f"Repo: {item['repo_name']}\n"
-                f"Relevance Score: {float(item['score']):.2f}\n\n"
-                "Key Summary:\n"
-                f"- {item['summary_snippet']}\n"
-            )
-            if max_chars > 0 and (total + len(block) > max_chars):
-                break
-            body_blocks.append(block)
-            total += len(block)
-        if not body_blocks:
-            return ""
-        return header + "\n".join(body_blocks)
+        return self._context_assembler.build_recall_context(session_id, query)
 
     def _session_reads(self, session_id: str) -> set[str]:
-        return self._session_read_paths.setdefault(session_id, set())
+        return self._state(session_id).accessed_paths
 
     def _record_session_reads(self, session_id: str, read_paths: set[str]) -> None:
         if not read_paths:
@@ -224,8 +391,9 @@ class PlanningRuntime:
         return gate
 
     def provide_clarification(self, session_id: str, answers: list[str]) -> None:
+        state = self._state(session_id)
         if answers:
-            logs = self._clarification_logs.setdefault(session_id, [])
+            logs = state.clarification_logs
             pending_indices = [idx for idx, item in enumerate(logs) if not str(item.get("answer", "")).strip()]
             for idx, answer in zip(pending_indices, answers):
                 logs[idx]["answer"] = answer
@@ -300,7 +468,7 @@ class PlanningRuntime:
         if len(critic_turns) >= 4:
             return True
         context_window = self._context_window_limit(self.planning_config)
-        recent_peak = int(self._session_max_prompt_tokens.get(session_id, 0) or 0)
+        recent_peak = int(self._state(session_id).max_prompt_tokens or 0)
         if recent_peak > int(context_window * 0.65):
             return True
         if len(current_plan) >= 14_000:
@@ -314,7 +482,12 @@ class PlanningRuntime:
         critic_turns: list[str],
         current_plan: str,
     ) -> str:
-        critique_summary = self._compressor.summarize(critic_turns) if critic_turns else "(none yet)"
+        critique_summary = "(none yet)"
+        if critic_turns:
+            try:
+                critique_summary = self._compressor.summarize(critic_turns)
+            except Exception:  # noqa: BLE001
+                critique_summary = critic_turns[-1][:1200]
         objective = self._single_line(requirements or "Refine plan against critique.", limit=280)
         summary = (
             "WORKING SUMMARY (compact prior rounds)\n\n"
@@ -346,14 +519,20 @@ class PlanningRuntime:
         round_number: int,
     ) -> str:
         objective = self._single_line(requirements or "Refine plan against latest critique.")
+        major_remaining = int(
+            getattr(critic, "major_issues_remaining", None) or len(getattr(critic, "blocking_issues", []) or [])
+        )
+        constraint_items = list(getattr(critic, "hard_constraint_violations", []) or [])
+        if not constraint_items:
+            constraint_items = [f"Constraint violation: {cid}" for cid in getattr(critic, "constraint_violations", [])]
         major_issues = [
-            f"major_issues_remaining={critic.major_issues_remaining}",
-            *[self._single_line(item) for item in critic.hard_constraint_violations],
+            f"major_issues_remaining={major_remaining}",
+            *[self._single_line(item) for item in constraint_items],
         ]
         major_issues = self._cap_lines([issue for issue in major_issues if issue.strip()], 5)
         clarifications = [
             self._single_line(str(item.get("answer", "")))
-            for item in self._clarification_logs.get(session_id, [])
+            for item in self._state(session_id).clarification_logs
             if str(item.get("answer", "")).strip()
         ]
         if len(clarifications) > 10:
@@ -378,101 +557,66 @@ class PlanningRuntime:
         except ValueError:
             return str(self.repo.resolved_manifesto)
 
-    @staticmethod
-    def _excerpt(text: str, max_lines: int = 40) -> str:
-        lines = text.splitlines()
-        return "\n".join(lines[:max_lines]).strip()
-
     def _build_context_index(self, blocks: dict[str, str]) -> str:
-        descriptions = {
-            "architecture": "high-level system structure and dependencies",
-            "modules": "module responsibilities and file mapping",
-            "patterns": "cross-cutting implementation patterns",
-            "entrypoints": "runtime and CLI entrypoints",
-            "context": "scanner-generated rich repository context",
-        }
-        lines: list[str] = []
-        for key, value in blocks.items():
-            if key == "manifesto":
-                continue
-            if not value:
-                continue
-            desc = descriptions.get(key, "repo memory block")
-            lines.append(f"- {key} memory ({len(value)} chars): {desc}")
-        lines.append("- Entire repo via grep_code, list_files, read_file")
-        return "\n".join(lines)
-
-    @staticmethod
-    def _requirements_vagueness_score(text: str) -> float:
-        tokens = [token for token in re.split(r"[^a-z0-9]+", text.lower()) if token]
-        if not tokens:
-            return 0.0
-        vague_markers = {
-            "maybe",
-            "possibly",
-            "some",
-            "improve",
-            "better",
-            "stuff",
-            "things",
-            "etc",
-            "roughly",
-            "around",
-        }
-        marker_hits = sum(1 for token in tokens if token in vague_markers)
-        return marker_hits / float(len(tokens))
-
-    def _initial_draft_policy(self, requirements: str) -> tuple[int, int, float, int]:
-        """Tune startup discovery budget from requirement complexity."""
-        tokens = [token for token in re.split(r"[^a-z0-9]+", requirements.lower()) if token]
-        uniq_tokens = {token for token in tokens if len(token) >= 4}
-        path_mentions = re.findall(r"[A-Za-z0-9_./-]+\.[A-Za-z0-9]+", requirements)
-        complexity_score = len(uniq_tokens) + (3 * len(path_mentions))
-        if complexity_score >= 45:
-            return 3, 4, 0.55, 1800
-        if complexity_score >= 25:
-            return 2, 3, 0.45, 1400
-        return 2, 2, 0.35, 1200
+        return self._context_assembler.build_context_index(blocks)
 
     def _memory_block_for_tool(self, key: str) -> dict[str, Any]:
-        if key not in MEMORY_BLOCK_KEYS:
-            allowed = ", ".join(sorted(MEMORY_BLOCK_KEYS))
-            raise ValueError(f"Unsupported memory block '{key}'. Allowed: {allowed}")
-        raw = self.memory.load_block(key)
-        truncated = self._truncate_memory_block(key, raw)
-        return {
-            "key": key,
-            "truncated": truncated != raw,
-            "content": truncated,
-        }
+        return self._context_assembler.memory_block_for_tool(key, MEMORY_BLOCK_KEYS)
+
+    def _next_version(self, session_id: str) -> int:
+        v = self._session_version.get(session_id, 0) + 1
+        self._session_version[session_id] = v
+        return v
 
     async def _emit_event(self, callback: Any | None, event: dict[str, Any], session_id: str) -> None:
         emitter = AnalyticsEmitter(callback)
         event_type = str(event.get("type", "")).strip().lower()
-        if event_type in {"tool_call", "tool_result", "complete"}:
-            snapshot = self._persist_tool_event_state(session_id, event_type, event)
-            if snapshot is not None:
-                await emitter.emit(snapshot)
 
-        # Aggregate cost/token telemetry centrally before forwarding downstream.
+        async def emit_versioned(payload: dict[str, Any]) -> None:
+            # Increment once per emitted SSE message.
+            version = self._next_version(session_id)
+            await emitter.emit({**payload, "session_version": version})
+
+        if event_type in {"tool_call", "tool_result", "tool_update", "complete"}:
+            persist_type = event_type
+            if event_type in {"tool_call", "tool_result"}:
+                persist_type = "tool_update"
+            snapshot = self._persist_tool_event_state(session_id, persist_type, event)
+            if snapshot is not None:
+                await emit_versioned(snapshot)
+
         if event.get("type") == "token_usage":
-            call_cost = float(event.get("call_cost_usd", 0.0) or 0.0)
-            prompt_tokens = int(event.get("prompt_tokens", 0) or 0)
-            running_cost = self._session_cost_usd.get(session_id, 0.0) + call_cost
-            max_prompt = max(self._session_max_prompt_tokens.get(session_id, 0), prompt_tokens)
-            self._session_cost_usd[session_id] = running_cost
-            self._session_max_prompt_tokens[session_id] = max_prompt
-            self.store.update_planning_session(
-                session_id,
-                session_total_cost_usd=running_cost,
-                max_prompt_tokens=max_prompt,
+            event = apply_token_usage_event(
+                state=self._state(session_id),
+                store=self.store,
+                session_id=session_id,
+                event=event,
             )
-            event = {
-                **event,
-                "session_total_usd": running_cost,
-                "max_prompt_tokens": max_prompt,
+
+        if event_type in {"tool_call", "tool_result"}:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            call_id = str(event.get("call_id", ""))
+            if not call_id:
+                call_id = f"{int(time.time() * 1000)}-{event.get('name', 'tool')}"
+            tool_entry: dict[str, Any] = {
+                "call_id": call_id,
+                "name": str(event.get("name", "tool")),
+                "sessionStage": event.get("session_stage"),
+                "path": event.get("path"),
+                "query": event.get("query"),
+                "status": "done" if event_type == "tool_result" else "running",
+                "created_at": now_iso,
             }
-        await emitter.emit(event)
+            if event_type == "tool_result":
+                tool_entry["durationMs"] = event.get("duration_ms")
+            await emit_versioned(
+                {
+                    "type": "tool_update",
+                    "tool": tool_entry,
+                }
+            )
+        else:
+            await emit_versioned(event)
 
     def _persist_tool_event_state(
         self,
@@ -480,98 +624,7 @@ class PlanningRuntime:
         event_type: str,
         event: dict[str, Any],
     ) -> dict[str, Any] | None:
-        core = self._core(session_id)
-        session = core.get_session()
-        active = []
-        if session.active_tool_calls_json:
-            try:
-                parsed = json.loads(session.active_tool_calls_json)
-                if isinstance(parsed, list):
-                    active = [item for item in parsed if isinstance(item, dict)]
-            except json.JSONDecodeError:
-                active = []
-        completed_groups: list[list[dict[str, Any]]] = []
-        if getattr(session, "completed_tool_call_groups_json", None):
-            try:
-                parsed_completed = json.loads(str(session.completed_tool_call_groups_json))
-                if isinstance(parsed_completed, list):
-                    completed_groups = [
-                        [entry for entry in group if isinstance(entry, dict)]
-                        for group in parsed_completed
-                        if isinstance(group, list)
-                    ]
-            except json.JSONDecodeError:
-                completed_groups = []
-
-        now_iso = datetime.now(timezone.utc).isoformat()
-        if event_type == "tool_call":
-            active.append(
-                {
-                    "id": f"{int(time.time() * 1000)}-{len(active)}",
-                    "name": str(event.get("name", "tool")),
-                    "path": event.get("path"),
-                    "query": event.get("query"),
-                    "session_stage": event.get("session_stage"),
-                    "status": "running",
-                    "created_at": now_iso,
-                }
-            )
-        elif event_type == "tool_result":
-            name = str(event.get("name", "tool"))
-            stage = str(event.get("session_stage", ""))
-            matched = False
-            for idx in range(len(active) - 1, -1, -1):
-                item = active[idx]
-                if (
-                    str(item.get("name", "")) == name
-                    and str(item.get("session_stage", "")) == stage
-                    and str(item.get("status", "")) == "running"
-                ):
-                    item["status"] = "done"
-                    item["duration_ms"] = event.get("duration_ms")
-                    matched = True
-                    break
-            if not matched:
-                active.append(
-                    {
-                        "id": f"{int(time.time() * 1000)}-{len(active)}",
-                        "name": name,
-                        "session_stage": event.get("session_stage"),
-                        "status": "done",
-                        "duration_ms": event.get("duration_ms"),
-                        "created_at": now_iso,
-                    }
-                )
-        elif event_type == "complete":
-            finalized_group = [
-                {**item, "status": "done"} if str(item.get("status", "")) == "running" else item
-                for item in active
-                if isinstance(item, dict)
-            ]
-            if finalized_group:
-                completed_groups.append(finalized_group)
-                if len(completed_groups) > MAX_COMPLETED_TOOL_CALL_GROUPS:
-                    completed_groups = completed_groups[-MAX_COMPLETED_TOOL_CALL_GROUPS:]
-            active = []
-        else:
-            return None
-
-        active.sort(key=lambda item: str(item.get("created_at", "")))
-        if len(active) > MAX_ACTIVE_TOOL_CALLS:
-            active = active[-MAX_ACTIVE_TOOL_CALLS:]
-        snapshot = core.transition_and_snapshot(
-            session.status,
-            phase_message=session.phase_message,
-            active_tool_calls_json=json.dumps(active),
-            allow_round_stability=True,
-        )
-        if event_type == "complete":
-            self.store.update_planning_session(
-                session_id,
-                _bypass_protection=True,
-                completed_tool_call_groups_json=json.dumps(completed_groups),
-            )
-        return snapshot
+        return self._tool_event_state.persist_event(session_id=session_id, event_type=event_type, event=event)
 
     async def _prepare_memory(
         self,
@@ -592,6 +645,65 @@ class PlanningRuntime:
 
     def _constraints(self) -> list[ParsedConstraint]:
         return self.memory.load_constraints(self.repo.resolved_manifesto)
+
+    @staticmethod
+    def _plan_document_from_version(version_content: str, plan_json: str | None = None) -> PlanDocument:
+        if plan_json:
+            try:
+                payload = json.loads(plan_json)
+                if isinstance(payload, dict):
+                    return PlanDocument(
+                        title=str(payload.get("title", "Plan")),
+                        summary=str(payload.get("summary", "")),
+                        goals=str(payload.get("goals", "")),
+                        non_goals=str(payload.get("non_goals", payload.get("non-goals", ""))),
+                        files_changed=str(
+                            payload.get(
+                                "files_changed", payload.get("files changed", payload.get("execution_flow", ""))
+                            )
+                        ),
+                        architecture=str(payload.get("architecture", "")),
+                        implementation_steps=str(payload.get("implementation_steps", "")),
+                        test_strategy=str(payload.get("test_strategy", "")),
+                        rollback_plan=str(payload.get("rollback_plan", "")),
+                        open_questions=str(payload.get("open_questions", "")),
+                    )
+            except Exception:  # noqa: BLE001
+                pass
+
+        def extract(heading: str) -> str:
+            pattern = _section_heading_pattern(heading)
+            match = pattern.search(version_content)
+            return match.group(1).strip() if match else ""
+
+        title_match = PLAN_TITLE_PATTERN.search(version_content)
+        title = title_match.group(1).strip() if title_match else "Plan"
+        return PlanDocument(
+            title=title,
+            summary=extract("Summary"),
+            goals=extract("Goals"),
+            non_goals=extract("Non-Goals"),
+            files_changed=extract("Files Changed"),
+            architecture=extract("Architecture"),
+            implementation_steps=extract("Implementation Steps"),
+            test_strategy=extract("Test Strategy"),
+            rollback_plan=extract("Rollback Plan"),
+            open_questions=extract("Open Questions"),
+        )
+
+    def _review_chat_summary(self, review: ReviewResult) -> str:
+        lines = [
+            f"Design review: score {review.design_quality_score:.1f}/10, confidence={review.confidence}.",
+        ]
+        if review.primary_issue:
+            lines.append(f"Primary issue: {review.primary_issue}")
+        if review.blocking_issues:
+            lines.append("Blocking issues: " + "; ".join(review.blocking_issues[:3]))
+        if review.recommended_changes:
+            lines.append("Recommended changes: " + "; ".join(review.recommended_changes[:3]))
+        if review.prose:
+            lines.append(review.prose)
+        return "\n\n".join(lines)
 
     @staticmethod
     def _author_chat_summary(plan_content: str, round_number: int) -> str:
@@ -616,33 +728,12 @@ class PlanningRuntime:
         critic: CriticResult,
         constraints: list[ParsedConstraint] | None = None,
     ) -> str:
-        lines = [
-            (f"Critic review: {critic.major_issues_remaining} major, {critic.minor_issues_remaining} minor."),
-        ]
-        if critic.hard_constraint_violations:
-            resolved_constraints = constraints if constraints is not None else self._constraints()
-            constraint_lookup = {item.id: item.text for item in resolved_constraints if item.id and item.text}
-            max_listed = 5
-            rendered_violations: list[str] = []
-            for constraint_id in critic.hard_constraint_violations[:max_listed]:
-                text = constraint_lookup.get(constraint_id, "")
-                if text:
-                    rendered_violations.append(f"{text} ({constraint_id})")
-                else:
-                    rendered_violations.append(constraint_id)
-            lines.append(
-                "Hard-constraint violations: "
-                + ", ".join(rendered_violations)
-                + (
-                    f" (+{len(critic.hard_constraint_violations) - max_listed} more)"
-                    if len(critic.hard_constraint_violations) > max_listed
-                    else ""
-                )
-            )
-        if critic.parse_error:
-            lines.append(f"Critic parse/runtime warning: {critic.parse_error}")
-        if critic.prose:
-            lines.append(critic.prose)
+        if isinstance(critic, ReviewResult):
+            return self._review_chat_summary(critic)
+        lines = ["Design review result available."]
+        prose = getattr(critic, "prose", "")
+        if prose:
+            lines.append(str(prose))
         return "\n\n".join(lines)
 
     def _initial_draft_fallback(self, requirements: str, reason: str) -> str:
@@ -713,6 +804,9 @@ class PlanningRuntime:
                 )
                 plan_content = author_result.plan
                 self._record_session_reads(session.id, author_result.accessed_paths)
+                self._state(session.id, session).design_record = self._design_record_from_payload(
+                    author_result.design_record
+                )
                 if "fallback plan because the authoring model was unavailable" in plan_content.lower():
                     fallback_details = next(
                         (
@@ -766,6 +860,9 @@ class PlanningRuntime:
             )
             core.add_turn("author", self._author_chat_summary(plan_content, 0), round_number=0)
             core.save_plan_version(plan_content, round_number=0)
+            state = self._state(session.id, session)
+            state.plan_markdown = plan_content
+            self._persist_state_snapshot(session.id)
             await self._emit_event(
                 event_callback,
                 {
@@ -804,7 +901,7 @@ class PlanningRuntime:
             no_recall=no_recall,
             status="draft",
         )
-        self._session_no_recall[session.id] = no_recall
+        self._state(session.id, session).no_recall = no_recall
         return session
 
     async def continue_requirements_draft(
@@ -916,7 +1013,7 @@ class PlanningRuntime:
             no_recall=no_recall,
             status="draft",
         )
-        self._session_no_recall[session.id] = no_recall
+        self._state(session.id, session).no_recall = no_recall
         core = self._core(session.id)
         self.tools.set_session(session.id)
         author_result = await self._run_initial_draft(
@@ -925,6 +1022,7 @@ class PlanningRuntime:
             author_model_override=self._resolve_author_model(session, author_model),
         )
         self._record_session_reads(session.id, author_result.accessed_paths)
+        self._state(session.id, session).design_record = self._design_record_from_payload(author_result.design_record)
         core.add_turn("author", self._author_chat_summary(author_result.plan, 0), round_number=0)
         core.save_plan_version(author_result.plan, round_number=0)
         core.transition("refining")
@@ -948,8 +1046,13 @@ class PlanningRuntime:
             no_recall=no_recall,
             status="draft",
         )
-        self._session_no_recall[session.id] = no_recall
-        return session, None
+        self._state(session.id, session).no_recall = no_recall
+        # Mark draft setup as in-progress immediately so the UI can render
+        # the setup state even before the first SSE progress event arrives.
+        core = self._core(session.id)
+        core.transition_and_snapshot("draft", phase_message="Preparing codebase memory...")
+        updated = self.store.get_planning_session(session.id) or session
+        return updated, None
 
     async def continue_chat_setup(
         self,
@@ -1054,6 +1157,9 @@ class PlanningRuntime:
                             author_model_override=selected_author_model,
                         )
                         self._record_session_reads(session_id, author_result.accessed_paths)
+                        self._state(session_id).design_record = self._design_record_from_payload(
+                            author_result.design_record
+                        )
                         core.add_turn(
                             "author",
                             self._author_chat_summary(author_result.plan, 0),
@@ -1198,77 +1304,97 @@ class PlanningRuntime:
         author_model_override: str | None = None,
     ) -> AuthorResult:
         session = core.get_session()
-        blocks = self.memory.load_all_blocks()
-        manifesto = self._truncate_memory_block("manifesto", self.memory.load_manifesto())
-        manifesto_excerpt = self._excerpt(manifesto, max_lines=40)
-        skills_block = self._skills_context(session.id)
+        state = self._state(session.id, session)
+        state.requirements = requirements
+        blocks = self._repo_memory(state)
+        manifesto = self._truncate_memory_block("manifesto", state.manifesto)
+        skills_block = state.skills_context or self._skills_context(session.id)
         recall_block = self._build_recall_context(session.id, requirements)
         context_index = self._build_context_index(blocks)
-        manifesto_path = self._manifesto_relative_path()
-        budget = TokenBudgetManager(context_window=128_000, max_completion_tokens=4000)
-        budget.enforce_required([requirements, f"Manifesto:\n{manifesto_excerpt}"])
-        remaining = budget.available_prompt_tokens - estimate_tokens(requirements)
-        manifesto_block, used_manifesto = budget.allocate(
-            f"PROJECT MANIFESTO (excerpt):\n{manifesto_excerpt}\n\n", remaining
-        )
-        remaining = max(0, remaining - used_manifesto)
-        skills_allocated, used_skills = budget.allocate(skills_block, remaining)
-        remaining = max(0, remaining - used_skills)
-        recall_allocated, used_recall = budget.allocate(recall_block, remaining)
-        remaining = max(0, remaining - used_recall)
-        context_index_block, _ = budget.allocate(
-            f"CONTEXT INDEX:\n{context_index}\n\n",
-            remaining,
-        )
-        initial_ratio = budget.injection_ratio(
-            [requirements, manifesto_block, skills_allocated, recall_allocated, context_index_block]
-        )
-        if initial_ratio > budget.enforce_ratio:
-            target_tokens = int(budget.context_window * budget.enforce_ratio)
-            remaining = max(0, target_tokens - estimate_tokens(requirements))
-            manifesto_block, used_manifesto = budget.allocate(manifesto_block, remaining)
-            remaining = max(0, remaining - used_manifesto)
-            skills_allocated, used_skills = budget.allocate(skills_allocated, remaining)
-            remaining = max(0, remaining - used_skills)
-            recall_allocated, used_recall = budget.allocate(recall_allocated, remaining)
-            remaining = max(0, remaining - used_recall)
-            context_index_block, _ = budget.allocate(context_index_block, remaining)
-        messages = [
-            {
-                "role": "user",
-                "content": (
-                    "You are planning changes to this repository.\n\n"
-                    f"REQUIREMENTS:\n{requirements}\n\n"
-                    f"{manifesto_block}"
-                    f"Full manifesto available at: {manifesto_path}\n\n"
-                    f"{skills_allocated}"
-                    f"{recall_allocated}"
-                    f"{context_index_block}"
-                    "IMPORTANT:\n"
-                    "- Do not assume file paths.\n"
-                    "- Search before referencing files.\n"
-                    "- Read files before proposing changes.\n"
-                    "- Pull additional memory only when needed with get_memory_block(key).\n"
-                ),
-            }
-        ]
-        require_clarification_first = self._requirements_vagueness_score(requirements) > 0.25
-        max_attempts, max_tool_calls, min_grounding_ratio, max_output_tokens = self._initial_draft_policy(requirements)
-        result = await self.author.author_loop(
-            messages,
-            require_tool_calls=True,
-            max_attempts=min(max_attempts, self.planning_config.author_tool_rounds),
-            max_tool_calls=max_tool_calls,
-            min_grounding_ratio=min_grounding_ratio,
+        result = await self.author.run_initial_draft(
+            requirements=requirements,
+            manifesto=manifesto,
+            manifesto_path=self._manifesto_relative_path(),
+            skills_block=skills_block,
+            recall_block=recall_block,
+            context_index=context_index,
             grounding_paths=self._session_reads(session.id),
-            draft_phase="planner",
-            require_clarification_first=require_clarification_first and self.author.clarification_handler is not None,
-            max_output_tokens=max_output_tokens,
-            quick_start_mode=True,
             model_override=author_model_override,
-            reset_tool_history=False,
         )
         return result
+
+    async def _stage_design_review(
+        self,
+        *,
+        ctx: PlanningRoundContext,
+        current_plan_content: str,
+        emit_tool: Callable[..., Any],
+    ) -> ReviewResult:
+        return await self._stages.design_review(
+            ctx=ctx,
+            current_plan_content=current_plan_content,
+            emit_tool=emit_tool,
+        )
+
+    async def _stage_repair_plan(
+        self,
+        *,
+        ctx: PlanningRoundContext,
+        current_plan_doc: PlanDocument,
+        review_result: ReviewResult,
+        emit_tool: Callable[..., Any],
+    ) -> RepairPlan:
+        return await self._stages.repair_plan(
+            ctx=ctx,
+            current_plan_doc=current_plan_doc,
+            review_result=review_result,
+            emit_tool=emit_tool,
+        )
+
+    async def _stage_revise_plan(
+        self,
+        *,
+        ctx: PlanningRoundContext,
+        current_plan_doc: PlanDocument,
+        repair_plan: RepairPlan,
+        review_result: ReviewResult,
+        emit_tool: Callable[..., Any],
+    ) -> tuple[str, list[str], RevisionResult]:
+        return await self._stages.revise_plan(
+            ctx=ctx,
+            current_plan_doc=current_plan_doc,
+            repair_plan=repair_plan,
+            review_result=review_result,
+            emit_tool=emit_tool,
+        )
+
+    async def _stage_validation_review(
+        self,
+        *,
+        ctx: PlanningRoundContext,
+        updated_markdown: str,
+        emit_tool: Callable[..., Any],
+    ) -> ReviewResult:
+        return await self._stages.validation_review(
+            ctx=ctx,
+            updated_markdown=updated_markdown,
+            emit_tool=emit_tool,
+        )
+
+    async def _stage_convergence_check(
+        self,
+        *,
+        ctx: PlanningRoundContext,
+        updated_markdown: str,
+        validation_review: ReviewResult,
+        emit_tool: Callable[..., Any],
+    ) -> tuple[ImplementabilityResult, ConvergenceResult]:
+        return await self._stages.convergence_check(
+            ctx=ctx,
+            updated_markdown=updated_markdown,
+            validation_review=validation_review,
+            emit_tool=emit_tool,
+        )
 
     async def run_adversarial_round(
         self,
@@ -1285,702 +1411,40 @@ class PlanningRuntime:
             if session.status not in {"refining", "converged"}:
                 raise ValueError(f"Session is not in refining state: {session.status}")
             core.validate_command("run_round", session)
-
             if session.status == "converged":
                 snapshot = core.transition_and_snapshot("refining", phase_message=None)
                 await self._emit_event(event_callback, snapshot, session_id)
                 session = core.get_session()
 
-            if event_callback:
-                await self._emit_event(
-                    event_callback,
-                    {"type": "thinking", "message": "Running adversarial round..."},
-                    session_id,
-                )
+            current = core.get_current_plan()
+            if current is None:
+                raise ValueError("Cannot run adversarial round without initial plan")
 
-            try:
-                current = core.get_current_plan()
-                if current is None:
-                    raise ValueError("Cannot run adversarial round without initial plan")
-                selected_author_model = self._resolve_author_model(session, author_model_override)
-                selected_critic_model = self._resolve_critic_model(session, critic_model_override)
+            round_number = session.current_round + 1
+            requirements = (session.requirements or "") + (f"\n\nUser input:\n{user_input}" if user_input else "")
+            state = self._state(session_id, session)
+            state.requirements = requirements
+            state.revision_round = round_number
+            self._reset_round_telemetry(state)
+            selected_author_model = self._resolve_author_model(session, author_model_override)
+            selected_critic_model = self._resolve_critic_model(session, critic_model_override)
 
-                round_number = session.current_round + 1
-                snapshot = core.transition_and_snapshot(
-                    "refining",
-                    phase_message="Running critique",
-                    current_round=round_number,
-                )
-                await self._emit_event(event_callback, snapshot, session_id)
-                _critique_started = time.perf_counter()
-                blocks = self.memory.load_all_blocks()
-                manifesto = self._truncate_memory_block("manifesto", self.memory.load_manifesto())
-                manifesto_excerpt = self._excerpt(manifesto, max_lines=40)
-                skills_context = self._skills_context(session_id)
-                context_index = self._build_context_index(blocks)
-                manifesto_path = self._manifesto_relative_path()
-                constraints = self._constraints()
-                requirements = (session.requirements or "") + (f"\n\nUser input:\n{user_input}" if user_input else "")
-                recall_context = self._build_recall_context(session_id, requirements)
-                if user_input:
-                    core.add_turn("user", user_input, round_number=round_number)
-                prior_critic_turn = self.store.get_latest_critic_turn(session_id)
-                prior_critique_context = ""
-                critic_turns = self._extract_critic_turns(core.get_conversation())
-                if critic_turns:
-                    prior_critique_context = self._compressor.summarize(critic_turns)
-                elif prior_critic_turn is not None:
-                    prior_critique_context = prior_critic_turn.content[:5000]
-                compact_mode = bool(self._session_working_summary.get(session_id))
-                if not compact_mode and self._should_compact_context(
-                    session_id=session_id,
-                    round_number=round_number,
-                    critic_turns=critic_turns,
-                    current_plan=current.plan_content,
-                ):
-                    compact_mode = True
-                if compact_mode:
-                    working_summary = self._build_working_summary(
-                        requirements=requirements,
-                        critic_turns=critic_turns,
-                        current_plan=current.plan_content,
-                    )
-                    self._session_working_summary[session_id] = working_summary
-                    prior_critique_context = working_summary
-                    await self._emit_event(
-                        event_callback,
-                        {
-                            "type": "warning",
-                            "message": "Context compaction enabled for this session to stay within token budget.",
-                        },
-                        session_id,
-                    )
-                    await self._emit_event(
-                        event_callback,
-                        {
-                            "type": "context_compaction",
-                            "enabled": True,
-                            "reason": "token_budget",
-                        },
-                        session_id,
-                    )
-
-                round_usage: dict[str, int] = {
-                    "author_prompt": 0,
-                    "author_completion": 0,
-                    "critic_prompt": 0,
-                    "critic_completion": 0,
-                }
-                author_tool_calls = 0
-                time_to_first_tool_call: int | None = None
-                round_model_costs: dict[str, float] = {}
-
-                async def wrapped_event(event: dict[str, Any]) -> None:
-                    nonlocal author_tool_calls, time_to_first_tool_call
-                    if event.get("type") == "token_usage":
-                        stage = str(event.get("session_stage", ""))
-                        prompt = int(event.get("prompt_tokens", 0) or 0)
-                        completion = int(event.get("completion_tokens", 0) or 0)
-                        model = str(event.get("model", "unknown"))
-                        call_cost = float(event.get("call_cost_usd", 0.0) or 0.0)
-                        round_model_costs[model] = round_model_costs.get(model, 0.0) + call_cost
-                        if stage == "author":
-                            round_usage["author_prompt"] += prompt
-                            round_usage["author_completion"] += completion
-                        elif stage == "critic":
-                            round_usage["critic_prompt"] += prompt
-                            round_usage["critic_completion"] += completion
-                    if event.get("type") == "tool_call" and str(event.get("session_stage", "")) == "author":
-                        author_tool_calls += 1
-                        if time_to_first_tool_call is None:
-                            time_to_first_tool_call = author_tool_calls
-                    await self._emit_event(event_callback, event, session_id)
-
-                self.author.event_callback = wrapped_event
-                self.critic.event_callback = wrapped_event
-                gate = self._clarification_gate(session_id)
-
-                async def handle_author_clarification(question: str, context: str) -> list[str]:
-                    self._clarification_logs.setdefault(session_id, []).append(
-                        {
-                            "round": round_number,
-                            "question": question,
-                            "answer": "",
-                            "source": "author",
-                            "timed_out": False,
-                        }
-                    )
-                    await self._emit_event(
-                        event_callback,
-                        {
-                            "type": "clarification_needed",
-                            "question": question,
-                            "context": context,
-                            "source": "author",
-                        },
-                        session_id,
-                    )
-                    if event_callback is not None:
-                        # In web/API mode we keep the round responsive and let the
-                        # user submit clarifications asynchronously.
-                        self.store.update_planning_session(
-                            session_id,
-                            clarifications_log_json=json.dumps(self._clarification_logs.get(session_id, [])),
-                        )
-                        return []
-                    try:
-                        answers, timed_out = await gate.wait_for_answer()
-                    except ClarificationAborted:
-                        answers, timed_out = ([], False)
-                    answer = answers[0] if answers else ""
-                    for item in reversed(self._clarification_logs.get(session_id, [])):
-                        if item["round"] == round_number and item["source"] == "author" and not item["answer"]:
-                            item["answer"] = answer
-                            item["timed_out"] = timed_out
-                            break
-                    self.store.update_planning_session(
-                        session_id,
-                        clarifications_log_json=json.dumps(self._clarification_logs.get(session_id, [])),
-                    )
-                    return answers
-
-                self.author.clarification_handler = handle_author_clarification
-                critic_prior_context = prior_critique_context
-                evidence_context = self._critic_evidence_context(session_id)
-                if critic_prior_context:
-                    critic_prior_context = f"{critic_prior_context}\n\n{evidence_context}"
-                else:
-                    critic_prior_context = evidence_context
-
-                await wrapped_event({"type": "tool_call", "name": "run_critique", "session_stage": "critic"})
-                critic_result = await self.critic.run_critic(
-                    requirements=requirements,
-                    plan_content=current.plan_content,
-                    manifesto=manifesto,
-                    architecture=blocks.get("architecture", ""),
-                    constraints=constraints,
-                    prior_critique=critic_prior_context,
-                    model_override=selected_critic_model,
-                    session_id=session_id,
-                    round_number=round_number,
-                )
-                asked_critic_questions: list[str] = []
-                clarification_candidates = [q.strip() for q in critic_result.clarification_questions if str(q).strip()]
-                has_hard_constraint_violations = bool(critic_result.hard_constraint_violations)
-                evidence_gap = bool(critic_result.missing_evidence or critic_result.unsupported_claims)
-                has_concrete_evidence_gap = self._has_concrete_critic_evidence_gap(critic_result)
-                should_pause_for_clarification = (
-                    bool(clarification_candidates)
-                    and has_hard_constraint_violations
-                    and evidence_gap
-                    and has_concrete_evidence_gap
-                )
-                if clarification_candidates and not should_pause_for_clarification:
-                    suppressed_count = len(clarification_candidates)
-                    total = self._suppressed_critic_clarifications.get(session_id, 0) + suppressed_count
-                    self._suppressed_critic_clarifications[session_id] = total
-                    logger.info(
-                        "[clarification_gate] Suppressed critic clarifications "
-                        "(session_id=%s round=%s suppressed_in_round=%s total_suppressed=%s "
-                        "hard_constraints=%s evidence_gap=%s concrete_evidence_gap=%s)",
-                        session_id,
-                        round_number,
-                        suppressed_count,
-                        total,
-                        has_hard_constraint_violations,
-                        evidence_gap,
-                        has_concrete_evidence_gap,
-                    )
-                if should_pause_for_clarification:
-                    asked_critic_questions = clarification_candidates[:CRITIC_MAX_CLARIFICATION_QUESTIONS_PER_ROUND]
-                    for question in asked_critic_questions:
-                        log_item = {
-                            "round": round_number,
-                            "question": question,
-                            "answer": "",
-                            "source": "critic",
-                            "timed_out": False,
-                        }
-                        self._clarification_logs.setdefault(session_id, []).append(log_item)
-                        await self._emit_event(
-                            event_callback,
-                            {
-                                "type": "clarification_needed",
-                                "question": question,
-                                "context": "critic requested clarification",
-                                "source": "critic",
-                            },
-                            session_id,
-                        )
-                    if event_callback is not None:
-                        # In API/web mode we surface clarification prompts but keep the
-                        # round moving to avoid clarification loops that stall convergence.
-                        self.store.update_planning_session(
-                            session_id,
-                            clarifications_log_json=json.dumps(self._clarification_logs.get(session_id, [])),
-                        )
-                        await self._emit_event(
-                            event_callback,
-                            {
-                                "type": "warning",
-                                "message": (
-                                    "Clarification requested; continuing with best-effort assumptions from available context."
-                                ),
-                            },
-                            session_id,
-                        )
-                    if event_callback is None:
-                        try:
-                            answers, timed_out = await gate.wait_for_answer()
-                        except ClarificationAborted:
-                            answers, timed_out = ([], False)
-                        for idx, log in enumerate(self._clarification_logs.get(session_id, [])):
-                            if log["round"] == round_number and log["source"] == "critic" and not log["answer"]:
-                                if idx < len(answers):
-                                    log["answer"] = answers[idx]
-                                log["timed_out"] = timed_out
-                        self.store.update_planning_session(
-                            session_id,
-                            clarifications_log_json=json.dumps(self._clarification_logs.get(session_id, [])),
-                        )
-                critic_content = self._critic_chat_summary(critic_result, constraints=constraints)
-                budget = TokenBudgetManager(context_window=128_000, max_completion_tokens=4000)
-                budget.enforce_required([requirements, f"Manifesto:\n{manifesto_excerpt}"])
-                remaining_prompt = budget.available_prompt_tokens - estimate_tokens(requirements)
-                manifesto_block, used = budget.allocate(manifesto_excerpt, remaining_prompt)
-                remaining_prompt = max(0, remaining_prompt - used)
-                skills_block, used = budget.allocate(skills_context, remaining_prompt)
-                remaining_prompt = max(0, remaining_prompt - used)
-                recall_block, used = budget.allocate(recall_context, remaining_prompt)
-                remaining_prompt = max(0, remaining_prompt - used)
-                context_index_block, used = budget.allocate(context_index, remaining_prompt)
-                remaining_prompt = max(0, remaining_prompt - used)
-                current_plan_block, used = budget.allocate(current.plan_content, remaining_prompt)
-                remaining_prompt = max(0, remaining_prompt - used)
-                critique_block, _ = budget.allocate(critic_content, remaining_prompt)
-                working_summary_block = ""
-                if compact_mode:
-                    remaining_prompt = max(0, remaining_prompt - estimate_tokens(critique_block))
-                    working_summary_block, _ = budget.allocate(
-                        self._session_working_summary.get(session_id, ""),
-                        remaining_prompt,
-                    )
-                round_anchor = self._round_anchor_block(
-                    requirements=requirements,
-                    critic=critic_result,
-                    session_id=session_id,
-                    round_number=round_number,
-                )
-                injection_blocks = [
-                    requirements,
-                    round_anchor,
-                    manifesto_block,
-                    skills_block,
-                    recall_block,
-                    context_index_block,
-                    current_plan_block,
-                    critique_block,
-                    working_summary_block,
-                ]
-                static_ratio = budget.injection_ratio(injection_blocks)
-                if static_ratio > budget.warn_ratio:
-                    await self._emit_event(
-                        event_callback,
-                        {
-                            "type": "warning",
-                            "message": (
-                                f"Prompt injection at {static_ratio:.2%} of context window; "
-                                "approaching attention degradation zone."
-                            ),
-                        },
-                        session_id,
-                    )
-                if static_ratio > budget.enforce_ratio:
-                    target_tokens = int(budget.context_window * budget.enforce_ratio)
-                    required_tokens = estimate_tokens(requirements) + estimate_tokens(round_anchor)
-                    remaining_prompt = max(0, target_tokens - required_tokens)
-                    critique_block, used = budget.allocate(critique_block, remaining_prompt)
-                    remaining_prompt = max(0, remaining_prompt - used)
-                    current_plan_block, used = budget.allocate(current_plan_block, remaining_prompt)
-                    remaining_prompt = max(0, remaining_prompt - used)
-                    manifesto_block, used = budget.allocate(manifesto_block, remaining_prompt)
-                    remaining_prompt = max(0, remaining_prompt - used)
-                    skills_block, used = budget.allocate(skills_block, remaining_prompt)
-                    remaining_prompt = max(0, remaining_prompt - used)
-                    recall_block, used = budget.allocate(recall_block, remaining_prompt)
-                    remaining_prompt = max(0, remaining_prompt - used)
-                    context_index_block, _ = budget.allocate(context_index_block, remaining_prompt)
-                core.add_turn(
-                    "critic",
-                    critic_content,
-                    round_number=round_number,
-                    major_issues_remaining=critic_result.major_issues_remaining,
-                    minor_issues_remaining=critic_result.minor_issues_remaining,
-                    hard_constraint_violations=critic_result.hard_constraint_violations,
-                    parse_error=critic_result.parse_error,
-                )
-
-                author_messages = [
-                    {
-                        "role": "user",
-                        "content": "".join(
-                            [
-                                f"{round_anchor}\n\n",
-                                f"PROJECT MANIFESTO (excerpt):\n{manifesto_block}\n\n",
-                                f"Full manifesto available at: {manifesto_path}\n\n",
-                                (f"{skills_block}\n\n" if skills_block else ""),
-                                (f"{recall_block}\n\n" if recall_block else ""),
-                                f"CONTEXT INDEX:\n{context_index_block}\n\n",
-                                f"Requirements:\n{requirements}\n\n",
-                                (
-                                    f"Working summary of prior rounds (compacted):\n{working_summary_block}\n\n"
-                                    if working_summary_block
-                                    else ""
-                                ),
-                                f"Current plan:\n{current_plan_block}\n\n",
-                                f"Critique:\n{critique_block}\n\n",
-                                "Refinement requirements:\n",
-                                "1) Every implementation step must include exact file path(s), change type, and rationale.\n",
-                                "2) Update or add a concrete Test Strategy section with specific validations.\n",
-                                "3) Update or add a concrete Rollback Plan section with failure triggers and rollback actions.\n",
-                                "4) Explicitly resolve major critique issues, including failure modes and tradeoff risks.\n",
-                                (
-                                    "5) Keep Cursor-style plan shape with title, summary, changes, files changed, ordered "
-                                    "to-dos, example code snippets, and mermaid diagram (or explicit waiver).\n"
-                                ),
-                            ]
-                        ),
-                    }
-                ]
-                recent_critics = self.store.get_planning_turns(session_id)
-                recent_major = [
-                    int(turn.major_issues_remaining)
-                    for turn in recent_critics
-                    if turn.role == "critic" and turn.major_issues_remaining is not None
-                ]
-                oscillation_detected = (
-                    len(recent_major) >= 2
-                    and critic_result.major_issues_remaining > recent_major[-1] > recent_major[-2]
-                )
-                oscillation_reason: dict[str, str] | None = None
-                if oscillation_detected:
-                    oscillation_reason = {
-                        "reason": "OSCILLATION",
-                        "details": (
-                            "major issues increased for two consecutive rounds: "
-                            f"{recent_major[-2]} -> {recent_major[-1]} -> {critic_result.major_issues_remaining}"
-                        ),
-                    }
-                    author_messages[0]["content"] += (
-                        "\n\nRegression blocker:\n"
-                        "Major issues have increased for two consecutive rounds. "
-                        "Prioritize reducing major issues and do not introduce new ones."
-                    )
-                require_refiner_tool_calls = (
-                    critic_result.major_issues_remaining > 0
-                    or bool(critic_result.hard_constraint_violations)
-                    or bool(critic_result.missing_evidence)
-                    or bool(critic_result.unsupported_claims)
-                )
-                await wrapped_event(
-                    {
-                        "type": "tool_result",
-                        "name": "run_critique",
-                        "session_stage": "critic",
-                        "duration_ms": round((time.perf_counter() - _critique_started) * 1000),
-                    }
-                )
-                snapshot = core.transition_and_snapshot(
-                    "refining",
-                    phase_message="Applying critique updates",
-                    allow_round_stability=True,
-                )
-                await self._emit_event(event_callback, snapshot, session_id)
-                await wrapped_event({"type": "tool_call", "name": "apply_critique", "session_stage": "planner"})
-                _refine_started = time.perf_counter()
-                try:
-                    author_result = await asyncio.wait_for(
-                        self.author.author_loop(
-                            author_messages,
-                            require_tool_calls=require_refiner_tool_calls,
-                            max_tool_calls=min(REFINEMENT_MAX_TOOL_CALLS, self.planning_config.author_tool_rounds),
-                            min_grounding_ratio=0.8,
-                            grounding_paths=self._session_reads(session_id),
-                            draft_phase="refiner",
-                            model_override=selected_author_model,
-                        ),
-                        timeout=REFINEMENT_AUTHOR_TIMEOUT_SECONDS,
-                    )
-                except asyncio.TimeoutError:
-                    await self._emit_event(
-                        event_callback,
-                        {
-                            "type": "warning",
-                            "message": (
-                                "Refinement timed out; keeping the current draft unchanged. "
-                                "You can run another critique round."
-                            ),
-                        },
-                        session_id,
-                    )
-                    await wrapped_event(
-                        {
-                            "type": "tool_result",
-                            "name": "apply_critique",
-                            "session_stage": "planner",
-                            "duration_ms": round((time.perf_counter() - _refine_started) * 1000),
-                        }
-                    )
-                    core.add_turn(
-                        "author",
-                        "Refinement timed out; keeping current draft unchanged.",
-                        round_number=round_number,
-                    )
-                    convergence = core.check_convergence()
-                    snapshot = core.transition_and_snapshot(
-                        "refining",
-                        phase_message=None,
-                        allow_round_stability=True,
-                    )
-                    await self._emit_event(event_callback, snapshot, session_id)
-                    if event_callback:
-                        await self._emit_event(
-                            event_callback,
-                            {"type": "complete", "message": "Adversarial round timed out"},
-                            session_id,
-                        )
-                    return (
-                        critic_result,
-                        AuthorResult(
-                            plan=current.plan_content,
-                            unverified_references=set(),
-                            accessed_paths=self._session_reads(session_id).copy(),
-                        ),
-                        convergence,
-                    )
-                await wrapped_event(
-                    {
-                        "type": "tool_result",
-                        "name": "apply_critique",
-                        "session_stage": "planner",
-                        "duration_ms": round((time.perf_counter() - _refine_started) * 1000),
-                    }
-                )
-                self._record_session_reads(session_id, author_result.accessed_paths)
-                core.add_turn(
-                    "author",
-                    self._author_chat_summary(author_result.plan, round_number),
-                    round_number=round_number,
-                )
-                core.save_plan_version(author_result.plan, round_number=round_number)
-                await self._emit_event(
-                    event_callback,
-                    {
-                        "type": "plan_ready",
-                        "round": round_number,
-                        "saved_at_unix_s": time.time(),
-                    },
-                    session_id,
-                )
-                convergence = core.check_convergence()
-                # --- composite convergence score (50% smoothed-issues / 20% confidence / 20% text / 10% velocity) ---
-                major = convergence.major_issues or 0
-                confidence = max(0.0, min(critic_result.critic_confidence or 0.0, 1.0))
-                text_change = max(0.0, min(convergence.change_pct or 1.0, 1.0))  # full clamp, guard None
-
-                # Exponential smoothing on major issues (alpha=0.7): dampens critic oscillation
-                # between 0 and 1 majors without hiding genuine regressions.
-                prev_major: float | None = (
-                    float(prior_critic_turn.major_issues_remaining)
-                    if prior_critic_turn and prior_critic_turn.major_issues_remaining is not None
-                    else None
-                )
-                smoothed_major = (0.7 * major + 0.3 * prev_major) if prev_major is not None else float(major)
-
-                issues_score = max(0.0, 1.0 - min(smoothed_major, 5) / 5.0)  # 0 majors→1.0, 5+→0.0
-                text_score = 1.0 - text_change
-
-                # Issue velocity: detects momentum. Kept at 10% because critic scoring is stochastic.
-                velocity_score = 0.0
-                if prev_major is not None:
-                    delta = prev_major - major
-                    if delta > 0:
-                        velocity_score = min(delta / 3.0, 1.0)  # rapid drop → boost
-                    elif delta < 0:
-                        velocity_score = max(delta / 3.0, -0.5)  # regression → mild penalty
-
-                convergence_score = (
-                    1.0
-                    if convergence.converged
-                    else round(
-                        0.5 * issues_score + 0.2 * confidence + 0.2 * text_score + 0.1 * velocity_score,
-                        3,
-                    )
-                )
-
-                # Monotonic clamp: after save_plan_version, index [0] = current, [1] = previous.
-                _prev_versions = self.store.get_plan_versions(session_id, limit=2)
-                _prev_score = _prev_versions[1].convergence_score if len(_prev_versions) >= 2 else None
-                if _prev_score is not None:
-                    convergence_score = max(_prev_score, convergence_score)
-
-                # Safety clamp to [0.0, 1.0] against floating-point edge cases.
-                convergence_score = max(0.0, min(1.0, convergence_score))
-
-                self.store.update_plan_version_convergence(session_id, round_number, convergence_score)
-                plan_quality_score = self._plan_quality_score(
-                    critic=critic_result,
-                    grounding_ratio=author_result.grounding_ratio,
-                )
-                previous_critic_turn = prior_critic_turn
-                previous_critic: CriticResult | None = None
-                if previous_critic_turn and previous_critic_turn.major_issues_remaining is not None:
-                    previous_critic = CriticResult(
-                        major_issues_remaining=int(previous_critic_turn.major_issues_remaining or 0),
-                        minor_issues_remaining=int(previous_critic_turn.minor_issues_remaining or 0),
-                        hard_constraint_violations=previous_critic_turn.hard_constraint_violations or [],
-                        critique_complete=False,
-                        failure_modes=[],
-                        design_tradeoff_risks=[],
-                        unsupported_claims=[],
-                        missing_evidence=[],
-                        critic_confidence=0.0,
-                        operational_readiness=False,
-                        vagueness_score=0.0,
-                        citation_count=0,
-                        clarification_questions=[],
-                        prose=previous_critic_turn.content,
-                        parse_error=previous_critic_turn.parse_error,
-                    )
-                delta = compute_plan_delta(previous_critic, critic_result)
-                self.store.add_round_metrics(
-                    session_id=session_id,
-                    repo_name=self.repo.name,
-                    round_number=round_number,
-                    author_prompt_tokens=round_usage["author_prompt"],
-                    author_completion_tokens=round_usage["author_completion"],
-                    critic_prompt_tokens=round_usage["critic_prompt"],
-                    critic_completion_tokens=round_usage["critic_completion"],
-                    max_prompt_tokens=self._session_max_prompt_tokens.get(session_id),
-                    major_issues=critic_result.major_issues_remaining,
-                    minor_issues=critic_result.minor_issues_remaining,
-                    critic_confidence=critic_result.critic_confidence,
-                    vagueness_score=critic_result.vagueness_score,
-                    citation_count=critic_result.citation_count,
-                    constraint_violations=critic_result.hard_constraint_violations,
-                    resolved_since_last_round=[],
-                    clarifications_this_round=len(asked_critic_questions),
-                    call_cost_usd=self._session_cost_usd.get(session_id, 0.0),
-                    issues_resolved=delta.issues_resolved,
-                    issues_introduced=delta.issues_introduced,
-                    net_improvement=delta.net_improvement,
-                    model_costs=round_model_costs,
-                    time_to_first_tool_call=time_to_first_tool_call,
-                    grounding_ratio=author_result.grounding_ratio,
-                    static_injection_tokens_pct=static_ratio,
-                    rejected_for_no_discovery=author_result.rejection_counts.get("rejected_for_no_discovery", 0),
-                    rejected_for_grounding=author_result.rejection_counts.get("rejected_for_grounding", 0),
-                    rejected_for_budget=author_result.rejection_counts.get("rejected_for_budget", 0),
-                    average_read_depth_per_round=author_result.average_read_depth,
-                    time_between_tool_calls=author_result.average_time_between_tool_calls,
-                    rejection_reasons=(
-                        [*author_result.rejection_reasons, oscillation_reason]
-                        if oscillation_reason is not None
-                        else author_result.rejection_reasons
-                    ),
-                    plan_quality_score=plan_quality_score,
-                    unsupported_claims_count=len(critic_result.unsupported_claims),
-                    missing_evidence_count=len(critic_result.missing_evidence),
-                )
-                metrics = self.store.get_round_metrics(session_id)
-                confidence_points = [
-                    float(metric.critic_confidence) for metric in metrics if metric.critic_confidence is not None
-                ]
-                confidence_trend = self._confidence_trend(confidence_points)
-                converged_early = int(
-                    any(point >= 0.85 for point in confidence_points)
-                    and len(confidence_points) < self.planning_config.max_adversarial_rounds
-                )
-                self.store.update_planning_session(
-                    session_id,
-                    confidence_trend=confidence_trend,
-                    converged_early=converged_early,
-                )
-                self.store.update_constraint_stats(
-                    self.repo.name,
-                    critic_result.hard_constraint_violations,
-                    session_id=session_id,
-                )
-                await self._emit_event(
-                    event_callback,
-                    {
-                        "type": "plan_delta",
-                        "issues_resolved": delta.issues_resolved,
-                        "issues_introduced": delta.issues_introduced,
-                        "net_improvement": delta.net_improvement,
-                    },
-                    session_id,
-                )
-                if convergence.converged and (
-                    plan_quality_score < 0.7
-                    or bool(critic_result.unsupported_claims)
-                    or bool(critic_result.missing_evidence)
-                    or not critic_result.operational_readiness
-                ):
-                    convergence = ConvergenceResult(
-                        converged=False,
-                        reason="quality_gate",
-                        change_pct=convergence.change_pct,
-                        regression=convergence.regression,
-                        major_issues=convergence.major_issues,
-                    )
-                if convergence.converged:
-                    snapshot = core.transition_and_snapshot("converged", phase_message=None)
-                else:
-                    snapshot = core.transition_and_snapshot(
-                        "refining",
-                        phase_message=None,
-                        allow_round_stability=True,
-                    )
-                await self._emit_event(event_callback, snapshot, session_id)
-                if event_callback:
-                    await self._emit_event(
-                        event_callback,
-                        {"type": "complete", "message": "Adversarial round complete"},
-                        session_id,
-                    )
-                return critic_result, author_result, convergence
-            except ContextWindowExceeded as exc:
-                latest = core.get_session()
-                if latest.status in {"refining", "converged"} and bool(latest.is_processing):
-                    snapshot = core.transition_and_snapshot(
-                        "refining",
-                        phase_message=None,
-                        allow_round_stability=True,
-                    )
-                    await self._emit_event(event_callback, snapshot, session_id)
-                await self._emit_event(
-                    event_callback,
-                    {"type": "error", "message": str(exc)},
-                    session_id,
-                )
-                raise
-            except Exception:
-                latest = core.get_session()
-                if latest.status in {"refining", "converged"} and bool(latest.is_processing):
-                    snapshot = core.transition_and_snapshot(
-                        "refining",
-                        phase_message=None,
-                        allow_round_stability=True,
-                    )
-                    await self._emit_event(event_callback, snapshot, session_id)
-                if event_callback:
-                    await self._emit_event(
-                        event_callback,
-                        {"type": "error", "message": "Adversarial round failed"},
-                        session_id,
-                    )
-                raise
+            issue_tracker = state.issue_tracker
+            if not isinstance(issue_tracker, IssueTracker):
+                raise RuntimeError("PlanningState issue_tracker must be an IssueTracker instance")
+            state.issue_tracker = issue_tracker
+            ctx = PlanningRoundContext(
+                core=core,
+                session_id=session_id,
+                round_number=round_number,
+                requirements=requirements,
+                state=state,
+                issue_tracker=issue_tracker,
+                selected_author_model=selected_author_model,
+                selected_critic_model=selected_critic_model,
+                event_callback=event_callback,
+            )
+            return await self._adversarial_loop.run_round(ctx=ctx, current_plan=current, user_input=user_input)
 
     def approve(self, session_id: str, unverified_references: set[str] | None = None) -> None:
         core = self._core(session_id)
@@ -2027,6 +1491,11 @@ class PlanningRuntime:
         plan = core.get_current_plan()
         if plan is None:
             raise ValueError("No plan to compare")
+        state = self._state(session_id, session)
+        issue_tracker = state.issue_tracker if isinstance(state.issue_tracker, IssueTracker) else None
+        open_issues = issue_tracker.open_issues() if issue_tracker is not None else []
+        root_open_issues = issue_tracker.root_open_issues() if issue_tracker is not None else []
+        dependency_blocks = issue_tracker.unresolved_dependency_chains() if issue_tracker is not None else 0
         planned_files = set(re.findall(r"`([A-Za-z0-9_./-]+\.[A-Za-z0-9]+)`", plan.plan_content))
         implemented = planned_files & merged_pr_files
         missing = planned_files - merged_pr_files
@@ -2045,6 +1514,9 @@ class PlanningRuntime:
             "unplanned": sorted(unplanned),
             "session_cost_usd": session.session_total_cost_usd,
             "max_prompt_tokens": session.max_prompt_tokens,
+            "open_issues": len(open_issues),
+            "root_open_issues": len(root_open_issues),
+            "dependency_blocks": int(dependency_blocks),
             "confidence_trend": (
                 session.confidence_trend
                 if session.confidence_trend is not None

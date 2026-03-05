@@ -64,6 +64,47 @@ LLMConfig = UpstreamEvalConfig
 
 
 @dataclass
+class IssueDedupeConfig:
+    """Issue dedupe similarity behavior."""
+
+    embeddings_enabled: str = "auto"  # auto | true | false
+    embedding_model: str = "text-embedding-3-small"
+    similarity_threshold: float = 0.82
+    fallback_mode: str = "lexical"  # lexical | none
+
+
+@dataclass
+class IssueGraphConfig:
+    """Issue graph runtime behavior and causality extraction settings."""
+
+    max_nodes: int = 50
+    max_edges: int = 100
+    causality_extraction_enabled: bool = False
+    causality_max_edges_per_review: int = 8
+    causality_min_text_len: int = 12
+    causality_patterns: list[str] = field(
+        default_factory=lambda: [
+            "because",
+            "due to",
+            "caused by",
+            "leads to",
+            "results in",
+            "therefore",
+        ]
+    )
+    causality_negative_patterns: list[str] = field(
+        default_factory=lambda: [
+            "causes problems",
+            "caused problems",
+            "leads to issues",
+            "results in issues",
+            "this causes",
+            "this leads",
+        ]
+    )
+
+
+@dataclass
 class PlanningConfig:
     """Planning mode configuration."""
 
@@ -95,6 +136,8 @@ class PlanningConfig:
             "manifesto": 1500,
         }
     )
+    issue_dedupe: IssueDedupeConfig = field(default_factory=IssueDedupeConfig)
+    issue_graph: IssueGraphConfig = field(default_factory=IssueGraphConfig)
     clarification_timeout_seconds: int = 600
 
 
@@ -300,6 +343,51 @@ class PrscopeConfig:
         )
 
         planning_data = data.get("planning", {})
+        dedupe_raw = planning_data.get("issue_dedupe", {})
+        dedupe_config = IssueDedupeConfig(
+            embeddings_enabled=str(dedupe_raw.get("embeddings_enabled", "auto")).strip().lower(),
+            embedding_model=str(dedupe_raw.get("embedding_model", "text-embedding-3-small")).strip(),
+            similarity_threshold=float(dedupe_raw.get("similarity_threshold", 0.82)),
+            fallback_mode=str(dedupe_raw.get("fallback_mode", "lexical")).strip().lower(),
+        )
+        issue_graph_raw = planning_data.get("issue_graph", {})
+        issue_graph_config = IssueGraphConfig(
+            max_nodes=max(1, int(issue_graph_raw.get("max_nodes", 50))),
+            max_edges=max(1, int(issue_graph_raw.get("max_edges", 100))),
+            causality_extraction_enabled=bool(issue_graph_raw.get("causality_extraction_enabled", False)),
+            causality_max_edges_per_review=max(0, int(issue_graph_raw.get("causality_max_edges_per_review", 8))),
+            causality_min_text_len=max(1, int(issue_graph_raw.get("causality_min_text_len", 12))),
+            causality_patterns=[
+                str(item).strip().lower()
+                for item in issue_graph_raw.get(
+                    "causality_patterns",
+                    [
+                        "because",
+                        "due to",
+                        "caused by",
+                        "leads to",
+                        "results in",
+                        "therefore",
+                    ],
+                )
+                if str(item).strip()
+            ],
+            causality_negative_patterns=[
+                str(item).strip().lower()
+                for item in issue_graph_raw.get(
+                    "causality_negative_patterns",
+                    [
+                        "causes problems",
+                        "caused problems",
+                        "leads to issues",
+                        "results in issues",
+                        "this causes",
+                        "this leads",
+                    ],
+                )
+                if str(item).strip()
+            ],
+        )
         memory_caps_raw = planning_data.get("memory_block_max_chars", {})
         memory_caps = {
             "architecture": int(memory_caps_raw.get("architecture", 3000)),
@@ -331,6 +419,8 @@ class PrscopeConfig:
             recall_top_k=max(1, int(planning_data.get("recall_top_k", 2))),
             recall_max_chars=max(0, int(planning_data.get("recall_max_chars", 1500))),
             memory_block_max_chars=memory_caps,
+            issue_dedupe=dedupe_config,
+            issue_graph=issue_graph_config,
             clarification_timeout_seconds=int(planning_data.get("clarification_timeout_seconds", 600)),
         )
 

@@ -6,6 +6,8 @@ import type {
   PlanningTurn,
   RepoProfileSummary,
   RoundMetric,
+  SessionSnapshotSummary,
+  SessionStateSnapshot,
 } from "../types";
 
 const REPO_STORAGE_KEY = "prscope.web.repo";
@@ -162,6 +164,14 @@ export function getSession(sessionId: string) {
     tool_summary: { recent_tool_calls: string[] };
     round_metrics?: RoundMetric[];
   }>(withRepoQuery(`/api/sessions/${sessionId}`));
+}
+
+export function getSessionSnapshot(sessionId: string) {
+  return request<{ snapshot: SessionStateSnapshot }>(withRepoQuery(`/api/sessions/${sessionId}/snapshot`));
+}
+
+export function listSessionSnapshots() {
+  return request<{ items: SessionSnapshotSummary[] }>(withRepoQuery("/api/snapshots"));
 }
 
 export function sendDiscoveryMessage(

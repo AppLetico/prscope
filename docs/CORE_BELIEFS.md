@@ -48,9 +48,9 @@ Corollary: when adding a new utility, check if an existing module already covers
 
 ## 9. Keep Leaf Modules Leaf
 
-Runtime leaf modules (`tools.py`, `budget.py`, `telemetry.py`, `analytics_emitter.py`, `clarification.py`, `compression.py`) have minimal or zero internal imports. They do not import from `planning.core` or `planning.executor`. This keeps the dependency graph shallow and testable.
+Runtime leaf modules (`tools.py`, `context/budget.py`, `telemetry.py`, `events/analytics_emitter.py`, `context/clarification.py`, `context/compression.py`) have minimal or zero internal imports. They do not import from `planning.core` or `planning.executor`. This keeps the dependency graph shallow and testable.
 
-Only `orchestration.py` is allowed to import broadly across the runtime.
+`orchestration.py` may import broadly as session coordinator, but stage implementations should receive explicit dependencies instead of importing runtime internals ad hoc.
 
 ## 10. Context is Finite — Budget It
 

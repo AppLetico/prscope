@@ -201,6 +201,7 @@ class Evidence:
     path: str
     snippet: str
     confidence: int
+    line: int = 0
 
 
 @dataclass
@@ -337,7 +338,7 @@ CODE_SIGNALS = [
     ),
 ]
 
-_INTENT_STOP_WORDS = {"a", "an", "the", "new", "feature", "endpoint", "support", "system"}
+_INTENT_STOP_WORDS = {"a", "an", "the", "new", "feature", "endpoint", "support", "system", "api"}
 _VENDOR_DIRS = {"node_modules", "venv", ".env", "dist", "build", "__pycache__", ".git", ".tox", "egg-info"}
 _BACKEND_DIR_NAMES = {"backend", "api", "server", "src", "services", "web", "app", "lib"}
 _CODE_NOUNS = {
@@ -555,6 +556,8 @@ class DiscoveryManager:
             score += 4
         if re.search(r"(routes?|router|controller|handler)\.", filename):
             score += 6
+        if re.search(r"(^|[_\-])api\.", filename):
+            score += 3
         if re.search(r"(server|app|main|urls|views)\.", filename):
             score += 2
         if "test" in path_lower:
@@ -721,12 +724,69 @@ class DiscoveryManager:
         insights = getattr(self, "bootstrap_insights_by_session", {}).get(session_id, {})
         lines = [str(line).strip() for line in insights.get("matched_evidence", []) if str(line).strip()]
         if lines:
-            return lines[:3]
+            keywords = [
+                str(keyword).strip().lower() for keyword in insights.get("feature_keywords", []) if str(keyword).strip()
+            ]
+            generic_tokens = _INTENT_STOP_WORDS | {
+                "api",
+                "route",
+                "routes",
+                "handler",
+                "handlers",
+                "create",
+                "add",
+                "build",
+                "implement",
+                "review",
+                "current",
+                "behavior",
+            }
+            ranked_keywords = [kw for kw in keywords if len(kw) >= 3 and kw not in generic_tokens]
+
+            scored_lines: list[tuple[int, str, bool]] = []
+            for line in lines:
+                lowered = line.lower()
+                parsed = self._parse_evidence_reference(line)
+                path_score = self._route_file_score(parsed[0]) if parsed else 0
+                keyword_hits = sum(1 for kw in ranked_keywords if kw in lowered)
+                has_route_shape = bool(
+                    re.search(
+                        r"@(?:app|router)\.(?:get|post|put|patch|delete)\(|\b(?:app|router)\.(?:get|post|put|patch|delete)\(",
+                        lowered,
+                    )
+                )
+                # Guard against generic doc/config lines that happen to mention "api".
+                if parsed and path_score <= 0 and keyword_hits == 0 and not has_route_shape:
+                    continue
+                score = max(path_score, 0) + keyword_hits * 3 + (2 if parsed else 0) + (2 if has_route_shape else 0)
+                if score <= 0 and parsed is None:
+                    continue
+                is_runtime_evidence = bool(parsed and path_score > 0) or has_route_shape
+                scored_lines.append((score, line, is_runtime_evidence))
+
+            if scored_lines:
+                runtime_available = any(is_runtime for _, _, is_runtime in scored_lines)
+                filtered = [item for item in scored_lines if item[2]] if runtime_available else scored_lines
+                filtered.sort(key=lambda item: (-item[0], item[1]))
+                return [line for _, line, _ in filtered[:5]]
+
         paths = [str(path).strip() for path in insights.get("matched_paths", []) if str(path).strip()]
         feature_label = str(insights.get("feature_label", "feature")).strip() or "feature"
         if paths:
-            return [f"Found existing {feature_label} in `{paths[0]}`"]
+            ranked_paths = sorted(paths, key=lambda path: (-self._route_file_score(path), path))
+            top_path = ranked_paths[0]
+            return [f"Found existing {feature_label} in `{top_path}`"]
         return [f"Found existing {feature_label} in the codebase"]
+
+    @staticmethod
+    def _format_evidence_line(item: Evidence) -> str:
+        path = str(item.path or "").strip()
+        snippet = str(item.snippet or "").strip()
+        if not path:
+            return ""
+        if int(item.line or 0) > 0:
+            return f"`{path}:{int(item.line)}` {snippet[:120]}".strip()
+        return f"`{path}` {snippet[:120]}".strip()
 
     @staticmethod
     def _parse_evidence_reference(line: str) -> tuple[str, int] | None:
@@ -912,18 +972,27 @@ class DiscoveryManager:
                     if not matched:
                         continue
                     confidence = self._location_score(path)
-                    evidence_list.append(Evidence(path=path, snippet=snippet[:240], confidence=confidence))
+                    evidence_list.append(
+                        Evidence(
+                            path=path,
+                            snippet=snippet[:240],
+                            confidence=confidence,
+                            line=line_num if line_num > 0 else 0,
+                        )
+                    )
                     candidate_paths.add(path)
         else:
             path = str(parsed_args.get("path") or payload.get("path") or "").strip()
             content = str(payload.get("content", "")).strip()
             if path and any(pattern.search(content) for pattern in patterns):
                 confidence = self._location_score(path, file_line_count=len(content.splitlines()))
-                evidence_list.append(Evidence(path=path, snippet=content[:240], confidence=confidence))
+                evidence_list.append(Evidence(path=path, snippet=content[:240], confidence=confidence, line=0))
                 candidate_paths.add(path)
         aggregated = self._aggregate_evidence(evidence_list)
         if candidate_paths:
-            evidence_lines = [f"`{item.path}` {item.snippet[:120]}" for item in aggregated[:5]]
+            evidence_lines = [
+                formatted for formatted in (self._format_evidence_line(item) for item in aggregated[:5]) if formatted
+            ]
             self._merge_feature_evidence(
                 session_id=session_id,
                 feature=feature,
@@ -1047,6 +1116,7 @@ class DiscoveryManager:
                         path=item_path,
                         snippet=snippet[:240],
                         confidence=self._location_score(item_path),
+                        line=line_num if line_num > 0 else 0,
                     )
                 )
         aggregated = self._aggregate_evidence(evidence_list)
@@ -1055,7 +1125,11 @@ class DiscoveryManager:
                 session_id=session_id,
                 feature=feature,
                 candidate_paths=[item.path for item in aggregated],
-                evidence_lines=[f"`{item.path}` {item.snippet[:120]}" for item in aggregated[:5]],
+                evidence_lines=[
+                    formatted
+                    for formatted in (self._format_evidence_line(item) for item in aggregated[:5])
+                    if formatted
+                ],
             )
         return aggregated
 
@@ -1131,6 +1205,7 @@ class DiscoveryManager:
                             path=path,
                             snippet=text[:240],
                             confidence=self._location_score(path, file_line_count=line if line > 0 else None),
+                            line=line if line > 0 else 0,
                         )
                     )
             evidence_list = self._aggregate_evidence(evidence_list)
@@ -1148,7 +1223,11 @@ class DiscoveryManager:
                     session_id=session_id,
                     feature=feature,
                     candidate_paths=[item.path for item in evidence_list],
-                    evidence_lines=[f"`{item.path}` {item.snippet[:120]}" for item in evidence_list[:6]],
+                    evidence_lines=[
+                        formatted
+                        for formatted in (self._format_evidence_line(item) for item in evidence_list[:6])
+                        if formatted
+                    ],
                 )
                 insights = self.bootstrap_insights_by_session.setdefault(session_id, {})
                 insights["architecture"] = architecture
@@ -1513,13 +1592,43 @@ class DiscoveryManager:
         if turn_count > 1 and bool(prior_insights.get("existing_feature")):
             choice = self._parse_existing_endpoint_followup_choice(latest_user_message)
             if choice == "A":
-                evidence = "\n".join(f"- {line}" for line in self._existing_feature_evidence_lines(session_id))
+                evidence_lines = self._existing_feature_evidence_lines(session_id)
+                evidence = "\n".join(f"- {line}" for line in evidence_lines)
                 deep_summary, functional_summary = await self._build_existing_endpoint_deep_summary(session_id)
-                details_block = f"What it currently does:\n{deep_summary}\n\n" if deep_summary else ""
+                matched_paths = [
+                    str(path).strip() for path in prior_insights.get("matched_paths", []) if str(path).strip()
+                ]
+                runtime_paths = [
+                    path
+                    for path in sorted(matched_paths, key=lambda p: (-self._route_file_score(p), p))
+                    if self._route_file_score(path) > 0
+                ][:3]
+                primary_impl = runtime_paths[0] if runtime_paths else None
+                if functional_summary:
+                    overview = functional_summary
+                elif evidence_lines:
+                    overview = (
+                        f"I found existing implementation evidence for {feature_label} with concrete references below."
+                    )
+                else:
+                    overview = (
+                        f"I found signs of an existing {feature_label}, but current citations are weak. "
+                        "I should run a targeted route/handler scan before giving a definitive summary."
+                    )
+                files_block = ""
+                if primary_impl:
+                    files_block = f"- Primary implementation: `{primary_impl}`\n"
+                elif runtime_paths:
+                    files_block = (
+                        "Likely implementation files:\n" + "\n".join(f"- `{path}`" for path in runtime_paths) + "\n"
+                    )
+                details_block = f"Implementation notes:\n{deep_summary}\n\n" if deep_summary else ""
                 return DiscoveryTurnResult(
                     reply=(
                         "Summary of what already exists:\n"
-                        f"- Functional overview: {functional_summary or 'This implementation is already present in the repository.'}\n"
+                        f"- Functional overview: {overview}\n"
+                        f"{files_block}"
+                        "Supporting references:\n"
                         f"{evidence}\n\n"
                         f"{details_block}"
                         f"If you want, I can propose targeted enhancements next for the existing {feature_label}, "
@@ -1592,15 +1701,20 @@ class DiscoveryManager:
         current_intent = self._extract_feature_intent(latest_user_message)
         current_feature_label = str(insights.get("feature_label", "feature")).strip() or "feature"
         if turn_count == 1 and current_intent is not None and existing_feature:
-            evidence_lines = [str(line).strip() for line in insights.get("matched_evidence", []) if str(line).strip()]
+            evidence_lines = self._existing_feature_evidence_lines(session_id)
             evidence_block = (
-                "\n".join(f"- {line}" for line in evidence_lines[:3])
+                "\n".join(f"- {line}" for line in evidence_lines[:5])
                 or "- Found existing implementation in the codebase"
             )
+            deep_summary, functional_summary = await self._build_existing_endpoint_deep_summary(session_id)
+            details_block = f"\n\nWhat it currently does:\n{deep_summary}" if deep_summary else ""
+            overview_line = f"Functional overview: {functional_summary}\n\n" if functional_summary else ""
             return DiscoveryTurnResult(
                 reply=(
                     f"The {current_feature_label} already appears to exist in the codebase, so I won't draft a new creation plan.\n\n"
-                    f"Evidence:\n{evidence_block}\n\n"
+                    f"{overview_line}"
+                    f"Evidence:\n{evidence_block}"
+                    f"{details_block}\n\n"
                     f"Do you want me to review and propose enhancements to the existing {current_feature_label} instead?"
                 ),
                 complete=False,

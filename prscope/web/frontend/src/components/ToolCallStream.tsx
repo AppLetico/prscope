@@ -1,12 +1,15 @@
 import { ChevronRight, Search, Loader2, CheckCircle2, Bot, Pencil } from "lucide-react";
-import { useState } from "react";
+import { useState, useRef, useEffect } from "react";
 import { clsx } from "clsx";
 import type { ToolCallEntry } from "../types";
 
 const PLAN_PHASE_NAMES: Record<string, { label: string; icon: "draft" | "critique" | "refine" | "search" }> = {
   draft_plan: { label: "Drafting plan", icon: "draft" },
-  run_critique: { label: "Running critique", icon: "critique" },
-  apply_critique: { label: "Applying critique", icon: "refine" },
+  design_review: { label: "Design review", icon: "critique" },
+  repair_planning: { label: "Planning repair", icon: "draft" },
+  apply_critique: { label: "Revising design", icon: "refine" },
+  review_validation: { label: "Validating changes", icon: "critique" },
+  implementability_check: { label: "Checking implementability", icon: "critique" },
 };
 
 interface ToolCallStreamProps {
@@ -26,7 +29,32 @@ export function ToolCallStream({
   const hasRunningCalls = toolCalls.some((call) => call.status === "running");
   const isEffectivelyRunning = forceRunning || hasRunningCalls;
   const count = toolCalls.length;
-  const isOpen = isEffectivelyRunning ? true : (userOpen ?? defaultOpen);
+  
+  // Stabilize the running state to prevent flickering during rapid transitions
+  const lastRunningStateRef = useRef(isEffectivelyRunning);
+  const runningStateChangeTimeRef = useRef(0);
+  const [stableRunningState, setStableRunningState] = useState(isEffectivelyRunning);
+
+  useEffect(() => {
+    if (isEffectivelyRunning !== lastRunningStateRef.current) {
+      lastRunningStateRef.current = isEffectivelyRunning;
+      runningStateChangeTimeRef.current = Date.now();
+      
+      if (isEffectivelyRunning) {
+        // Defer so we don't call setState synchronously in the effect
+        const t = setTimeout(() => setStableRunningState(true), 0);
+        return () => clearTimeout(t);
+      } else {
+        // Delay the transition to "not running" to prevent flicker
+        const timer = setTimeout(() => {
+          setStableRunningState(false);
+        }, 150);
+        return () => clearTimeout(timer);
+      }
+    }
+  }, [isEffectivelyRunning]);
+  
+  const isOpen = stableRunningState ? true : (userOpen ?? defaultOpen);
 
   if (toolCalls.length === 0) return null;
 
@@ -37,9 +65,9 @@ export function ToolCallStream({
   // When exclusively plan-phase calls, use a planner-oriented summary label
   const summaryLabel = (() => {
     if (runningPlanPhase) return PLAN_PHASE_NAMES[runningPlanPhase.name]?.label ?? "Planning...";
-    if (isEffectivelyRunning && !hasRunningCalls) return "Working...";
+    if (stableRunningState && !hasRunningCalls) return "Working...";
     if (onlyPlanPhases) return "Planning complete";
-    if (isEffectivelyRunning) return `Running tools (${count})`;
+    if (stableRunningState) return `Running tools (${count})`;
     return `Tools completed (${count})`;
   })();
 
@@ -51,7 +79,7 @@ export function ToolCallStream({
         return <Loader2 className="w-3.5 h-3.5 text-indigo-400 animate-spin" />;
       }
     }
-    if (isEffectivelyRunning) return <Loader2 className="w-3.5 h-3.5 text-indigo-400 animate-spin" />;
+    if (stableRunningState) return <Loader2 className="w-3.5 h-3.5 text-indigo-400 animate-spin" />;
     return <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />;
   })();
 
@@ -62,7 +90,7 @@ export function ToolCallStream({
           <div
             className={clsx(
               "relative w-8 h-8 rounded-full border flex items-center justify-center transition-colors",
-              isEffectivelyRunning
+              stableRunningState
                 ? "bg-indigo-500/15 border-indigo-400/50"
                 : "bg-zinc-800 border-zinc-700",
             )}
@@ -73,15 +101,15 @@ export function ToolCallStream({
         <div className="min-w-0">
           <button
             onClick={() => setUserOpen(!isOpen)}
-            className="inline-flex items-center gap-2 rounded-md border border-zinc-800/80 bg-zinc-900/55 px-3 py-1.5 text-sm text-zinc-300 hover:border-zinc-700 hover:bg-zinc-900/75 transition-colors"
+            className="inline-flex items-center gap-2 rounded-md border border-zinc-800/80 bg-zinc-900/55 px-3 py-1.5 text-sm text-zinc-300 hover:border-zinc-700 hover:bg-zinc-900/75 transition-colors w-full min-w-0"
           >
-            <ChevronRight className={clsx("w-3.5 h-3.5 text-zinc-500 transition-transform duration-200", isOpen && "rotate-90")} />
-            {SummaryIcon}
-            {!hasPlanPhase && <Search className="w-4 h-4 text-zinc-500" />}
+            <ChevronRight className={clsx("w-3.5 h-3.5 text-zinc-500 transition-transform duration-200 shrink-0", isOpen && "rotate-90")} />
+            {!hasPlanPhase && <Search className="w-4 h-4 text-zinc-500 shrink-0" />}
             {hasPlanPhase && toolCalls.some((c) => c.name === "draft_plan") && (
-              <Pencil className="w-4 h-4 text-zinc-500" />
+              <Pencil className="w-4 h-4 text-zinc-500 shrink-0" />
             )}
-            <span>{summaryLabel}</span>
+            <span className="min-w-0 truncate">{summaryLabel}</span>
+            <span className="ml-auto shrink-0">{SummaryIcon}</span>
           </button>
 
           {isOpen && (

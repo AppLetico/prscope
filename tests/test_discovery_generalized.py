@@ -69,6 +69,46 @@ def test_route_file_score_penalizes_test_paths() -> None:
     assert manager._route_file_score("tests/test_routes.py") < manager._route_file_score("backend/routes.py")
 
 
+def test_existing_feature_evidence_lines_prefers_runtime_references() -> None:
+    manager = DiscoveryManager.__new__(DiscoveryManager)
+    manager.bootstrap_insights_by_session = {
+        "s1": {
+            "existing_feature": True,
+            "feature_label": "status endpoint",
+            "feature_keywords": ["status", "endpoint"],
+            "matched_paths": ["docs/ARCHITECTURE.md", "prscope/web/api.py"],
+            "matched_evidence": [
+                "`docs/ARCHITECTURE.md:4` Interface never imports from web layer.",
+                "`README.md:12` API key configuration is documented.",
+                "`prscope/web/api.py:111` @app.get('/status')",
+            ],
+        }
+    }
+
+    lines = manager._existing_feature_evidence_lines("s1")
+
+    assert lines
+    assert "prscope/web/api.py:111" in lines[0]
+    assert all("ARCHITECTURE.md" not in line for line in lines)
+
+
+def test_existing_feature_evidence_lines_fallback_prefers_runtime_path() -> None:
+    manager = DiscoveryManager.__new__(DiscoveryManager)
+    manager.bootstrap_insights_by_session = {
+        "s1": {
+            "existing_feature": True,
+            "feature_label": "status endpoint",
+            "feature_keywords": ["status", "endpoint"],
+            "matched_paths": ["docs/README.md", "prscope/web/api.py"],
+            "matched_evidence": [],
+        }
+    }
+
+    lines = manager._existing_feature_evidence_lines("s1")
+
+    assert lines == ["Found existing status endpoint in `prscope/web/api.py`"]
+
+
 def test_select_scan_directories_skips_vendor_and_hidden() -> None:
     manager = DiscoveryManager.__new__(DiscoveryManager)
     ranked = manager._select_scan_directories(

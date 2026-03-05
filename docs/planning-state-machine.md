@@ -34,6 +34,8 @@ These fields are state-machine controlled:
 - `is_processing`
 - `processing_started_at`
 - `active_tool_calls_json`
+- `completed_tool_call_groups_json`
+- `event_seq`
 
 They must be written through `PlanningCore.transition_and_snapshot()` only.
 
@@ -97,6 +99,12 @@ Snapshot shape:
 - `current_round`
 - `pending_questions`
 - `active_tool_calls`
+- `completed_tool_call_groups` (structured: `{sequence, created_at, tools[]}[]`)
+- `session_version` (monotonic ordering counter)
+
+Runtime file snapshots under `.prscope/sessions/{session_id}.json` are also versioned with
+`schema_version` (current: `1`). Restore logic defaults missing versions to legacy (`0`) and
+applies backward-compatible fallback parsing.
 
 Design intent: transition logic is "closed world." Illegal states should be unrepresentable.
 
@@ -138,10 +146,14 @@ This keeps client behavior simple: the server explains what actions are valid ne
 
 For state-relevant runtime activity:
 
-1. Persist session mutation in DB
+1. Persist session mutation in DB (including `completed_tool_call_groups_json`)
 2. Commit transaction
-3. Emit `session_state`
-4. Emit secondary events (`tool_call`, `tool_result`, `plan_ready`, etc.)
+3. Emit `session_state` snapshot (now reflects persisted groups)
+4. Emit secondary events (`tool_update`, `plan_ready`, etc.)
+
+Critical ordering rule: completed tool groups must be persisted *before* the `session_state` snapshot is built. This ensures the snapshot always contains the latest groups and the frontend never needs client-side reconciliation.
+
+Every emitted SSE event carries a monotonic `session_version` integer. The backend increments this counter before each emission. The frontend discards any event with `session_version ≤ lastVersionSeen`, which prevents stale or reordered events from causing UI inconsistencies.
 
 No event should be emitted that implies a state the DB does not yet hold.
 
@@ -172,7 +184,9 @@ Timeout monitor behavior:
 
 This supports reconnect correctness and multi-tab consistency.
 
-## Active Tool Calls
+## Tool Call State
+
+### Active Tool Calls
 
 `active_tool_calls_json` is bounded, volatile state:
 
@@ -180,6 +194,47 @@ This supports reconnect correctness and multi-tab consistency.
 - Updated with deterministic ordering (`created_at`)
 - Truncated to most recent 50 entries
 - Cleared/shrunk as calls complete
+- Streamed to the frontend via unified `tool_update` SSE events (keyed by `call_id`, status `running` or `done`)
+
+### Completed Tool Groups
+
+`completed_tool_call_groups_json` stores finalized tool execution batches:
+
+- Each group is a structured object: `{sequence, created_at, tools[]}`
+- `sequence` is a monotonic integer from the session's `event_seq` counter, shared with `planning_turns.sequence` for cross-type timeline ordering
+- Groups are persisted before the `session_state` snapshot is emitted (no race condition)
+- Truncated to most recent 50 groups
+- The frontend merges turns and groups by `sequence` into a single chronological timeline
+
+## Issue Graph and Dedupe Configuration
+
+Issue tracking in refinement rounds is graph-backed. Runtime behavior is configurable via
+`planning.issue_dedupe` and `planning.issue_graph`.
+
+Issue dedupe configuration (`planning.issue_dedupe`):
+
+- `embeddings_enabled`: `auto | true | false`
+- `embedding_model`: LiteLLM embedding model string
+- `similarity_threshold`: semantic duplicate threshold
+- `fallback_mode`: `lexical | none`
+
+Issue graph configuration (`planning.issue_graph`):
+
+- `max_nodes`: hard cap for tracked issue nodes
+- `max_edges`: hard cap for tracked issue edges
+- `causality_extraction_enabled`: enable/disable prose-based causal inference
+- `causality_max_edges_per_review`: cap inferred edges per review pass
+- `causality_min_text_len`: minimum phrase length for inferred issue text
+- `causality_patterns`: lexical causal markers used by extractor
+- `causality_negative_patterns`: vague/noisy phrases rejected by extractor
+
+Design intent:
+
+- semantic dedupe can be enabled independently of author/critic model providers
+- when `embeddings_enabled=auto`, runtime attempts semantic matching first and can fall back to lexical matching based on `fallback_mode`
+- duplicate findings are canonicalized via alias mapping (no duplicate issue nodes are created)
+- issue graph persistence is deterministic (`nodes`, `edges`, `duplicate_alias`) and replayable on restart
+- convergence uses root-open + unresolved dependency-chain checks, in addition to existing stability gates
 
 ## Crash Recovery
 
@@ -208,6 +263,38 @@ Before merging runtime/state changes, verify:
 
 - no protected fields are mutated outside `transition_and_snapshot()`
 - command endpoints still use gate order (idempotency -> processing -> allowed)
-- `session_state` remains versioned and snapshot-complete
+- `session_state` remains versioned and snapshot-complete (includes `completed_tool_call_groups`)
+- completed tool groups are persisted before snapshot emission
+- all SSE events carry monotonic `session_version`
+- tool events use unified `tool_update` format (not separate `tool_call`/`tool_result`)
+- new turns and tool groups receive `sequence` from `event_seq` for deterministic ordering
 - reconnect still emits snapshot first
 - UI state still renders correctly from `GET /api/sessions/{id}` alone
+- issue graph snapshot payload remains deterministic (`nodes`, `edges`, `duplicate_alias`, `summary`)
+
+## Runtime Module Map (Ownership)
+
+Use this as a quick ownership guide when making state-machine-adjacent changes:
+
+- `prscope/planning/runtime/orchestration.py`
+  - Session coordinator only: locking, lifecycle entrypoints, core transition calls, and event dispatch wiring.
+  - Should not re-absorb stage implementation logic.
+- `prscope/planning/runtime/pipeline/adversarial_loop.py`
+  - Executes staged refinement round flow and sequencing.
+- `prscope/planning/runtime/pipeline/stages.py`
+  - Stage implementations (`design_review`, `repair_plan`, `revise_plan`, `validation_review`, `convergence_check`).
+  - Uses explicit dependency injection (author, critic, manifesto checker, emit/memory adapters), not full runtime access.
+- `prscope/planning/runtime/author.py`
+  - Author-side planning behavior, including initial draft flow (`run_initial_draft`) and author loop/tool policy.
+- `prscope/planning/runtime/context/*`
+  - Context assembly, token budgeting, critique compression, and clarification gate logic.
+- `prscope/planning/runtime/review/*`
+  - Critique support services: manifesto validation and issue similarity/dedupe.
+- `prscope/planning/runtime/events/*`
+  - Event shaping, token accounting, and tool event state persistence.
+
+Design intent:
+
+- keep `PlanningCore.transition_and_snapshot()` as the only protected-state write path
+- keep orchestration entrypoints thin and explicit
+- keep stage dependencies explicit to avoid hidden coupling

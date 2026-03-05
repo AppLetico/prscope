@@ -1,12 +1,11 @@
 """
-Plan export renderers for PRD/RFC markdown documents.
+Plan export renderers for plan markdown documents.
 """
 
 from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any
 
 from jinja2 import Environment, FileSystemLoader
 
@@ -24,11 +23,6 @@ def _template_env() -> Environment:
     )
 
 
-def extract_file_refs(text: str) -> list[str]:
-    refs = sorted(set(re.findall(r"`([A-Za-z0-9_./-]+\.[A-Za-z0-9]+)`", text)))
-    return refs
-
-
 def _sanitize_title(value: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "-", value.strip())
     cleaned = cleaned.strip("-")
@@ -37,27 +31,11 @@ def _sanitize_title(value: str) -> str:
 
 def render_prd(session: PlanningSession, plan: PlanVersion, repo: RepoProfile) -> str:
     env = _template_env()
-    template = env.get_template("prd.md.j2")
+    template = env.get_template("plan.md.j2")
     return template.render(
         session=session,
         plan=plan,
         repo=repo,
-    )
-
-
-def render_rfc(session: PlanningSession, plan: PlanVersion, repo: RepoProfile) -> str:
-    env = _template_env()
-    template = env.get_template("rfc.md.j2")
-    refs = extract_file_refs(plan.plan_content)
-    ref_rows: list[dict[str, Any]] = []
-    for ref in refs:
-        path = repo.resolved_path / ref
-        ref_rows.append({"path": ref, "exists": path.exists()})
-    return template.render(
-        session=session,
-        plan=plan,
-        repo=repo,
-        referenced_files=ref_rows,
     )
 
 
@@ -78,11 +56,9 @@ def export_plan_documents(
     target_dir.mkdir(parents=True, exist_ok=True)
 
     prd_path = target_dir / "PRD.md"
-    rfc_path = target_dir / "RFC.md"
     conversation_path = target_dir / "conversation.md"
 
     prd_path.write_text(render_prd(session, plan, repo), encoding="utf-8")
-    rfc_path.write_text(render_rfc(session, plan, repo), encoding="utf-8")
     conversation_path.write_text(
         f"# Conversation\n\nSession: `{session.id}`\nRound: `{session.current_round}`\n",
         encoding="utf-8",
@@ -90,6 +66,5 @@ def export_plan_documents(
 
     return {
         "prd": prd_path,
-        "rfc": rfc_path,
         "conversation": conversation_path,
     }

@@ -8,62 +8,194 @@ import asyncio
 import json
 import re
 from collections.abc import Awaitable
-from dataclasses import dataclass, field
 from typing import Any, Callable, Literal
 
 from ...config import PlanningConfig
-from ...pricing import MODEL_CONTEXT_WINDOWS
-from .telemetry import completion_telemetry
-from .tools import CODEBASE_TOOLS, ToolExecutor, extract_file_references
+from .authoring.discovery import (
+    AuthorDesignService,
+    AuthorDiscoveryService,
+    extract_paths_from_mental_model,
+    is_entrypoint_like,
+    is_non_trivial_source,
+    is_test_or_config,
+    path_tokens,
+    requirements_keywords,
+)
+from .authoring.models import (
+    ArchitectureDesign,
+    AuthorResult,
+    DesignRecord,
+    PlanDocument,
+    RepairPlan,
+    RepoCandidates,
+    RepoUnderstanding,
+    RevisionResult,
+)
+from .authoring.models import (
+    apply_section_updates as _apply_section_updates,
+)
+from .authoring.models import (
+    render_markdown as _render_markdown,
+)
+from .authoring.pipeline import AuthorPlannerPipeline
+from .authoring.repair import AuthorRepairService, extract_first_json_object, parse_plan_document
+from .authoring.validation import AuthorValidationService
+from .context import TokenBudgetManager, estimate_tokens
+from .critic import ReviewResult
+from .tools import ToolExecutor, extract_file_references
+from .transport import AuthorLLMClient
+
+apply_section_updates = _apply_section_updates
+render_markdown = _render_markdown
 
 
-@dataclass
-class AuthorResult:
-    plan: str
-    unverified_references: set[str]
-    accessed_paths: set[str]
-    grounding_ratio: float | None = None
-    rejection_counts: dict[str, int] = field(default_factory=dict)
-    rejection_reasons: list[dict[str, str]] = field(default_factory=list)
-    average_read_depth: float | None = None
-    average_time_between_tool_calls: float | None = None
+class StageRunner:
+    def __init__(
+        self,
+        llm_caller: Callable[..., Awaitable[tuple[Any, str]]],
+        tool_executor: ToolExecutor,
+        event_emitter: Callable[[dict[str, Any]], Awaitable[None]],
+    ):
+        self._llm_call = llm_caller
+        self._tool_executor = tool_executor
+        self._emit = event_emitter
 
+    def set_llm_caller(self, llm_caller: Callable[..., Awaitable[tuple[Any, str]]]) -> None:
+        self._llm_call = llm_caller
 
-@dataclass
-class PlanSchema:
-    required_sections: dict[str, str] = field(default_factory=dict)
-    requires_mermaid: bool = True
-    requires_code_blocks: bool = True
-    requires_ordered_todos: bool = True
+    async def execute_tool_calls(
+        self,
+        *,
+        stage: str,
+        conversation: list[dict[str, Any]],
+        content: str,
+        tool_calls: list[Any],
+        clarification_handler: Callable[[str, str], Awaitable[list[str]]] | None = None,
+    ) -> tuple[int, bool, list[float]]:
+        conversation.append(
+            {
+                "role": "assistant",
+                "content": content,
+                "tool_calls": [
+                    {
+                        "id": getattr(tc, "id", None),
+                        "type": "function",
+                        "function": {
+                            "name": getattr(tc.function, "name", ""),
+                            "arguments": getattr(tc.function, "arguments", "{}"),
+                        },
+                    }
+                    for tc in tool_calls
+                ],
+            }
+        )
+        asked_clarification = False
+        timestamps: list[float] = []
+        for tc in tool_calls:
+            timestamps.append(asyncio.get_running_loop().time())
+            tool_name = getattr(getattr(tc, "function", None), "name", "")
+            raw_args = getattr(getattr(tc, "function", None), "arguments", "{}") or "{}"
+            try:
+                parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else {}
+            except json.JSONDecodeError:
+                parsed_args = {}
+            path_hint = parsed_args.get("path") or parsed_args.get("relative_path")
+            query_hint = parsed_args.get("query") or parsed_args.get("pattern")
+            await self._emit(
+                {
+                    "type": "tool_call",
+                    "name": tool_name,
+                    "session_stage": stage,
+                    "path": str(path_hint) if isinstance(path_hint, str) else None,
+                    "query": str(query_hint) if isinstance(query_hint, str) else None,
+                }
+            )
+            if tool_name == "ask_clarification":
+                asked_clarification = True
+                await self._emit(
+                    {
+                        "type": "clarification_needed",
+                        "question": str(parsed_args.get("question", "")),
+                        "context": str(parsed_args.get("context", "")),
+                        "source": stage,
+                    }
+                )
+            try:
+                tool_started = asyncio.get_running_loop().time()
+                if tool_name == "ask_clarification" and clarification_handler is not None:
+                    answers = await clarification_handler(
+                        str(parsed_args.get("question", "")),
+                        str(parsed_args.get("context", "")),
+                    )
+                    result = {
+                        "tool_call_id": getattr(tc, "id", ""),
+                        "name": tool_name,
+                        "result": {
+                            "question": str(parsed_args.get("question", "")),
+                            "context": str(parsed_args.get("context", "")),
+                            "answers": answers,
+                            "timed_out": len(answers) == 0,
+                        },
+                    }
+                else:
+                    result = await asyncio.to_thread(self._tool_executor.execute, tc)
+                tool_elapsed_ms = (asyncio.get_running_loop().time() - tool_started) * 1000.0
+            except Exception as exc:  # noqa: BLE001
+                result = {
+                    "tool_call_id": getattr(tc, "id", ""),
+                    "name": tool_name,
+                    "result": {"error": str(exc)},
+                }
+                tool_elapsed_ms = 0.0
+            await self._emit(
+                {
+                    "type": "tool_result",
+                    "name": tool_name,
+                    "session_stage": stage,
+                    "duration_ms": round(tool_elapsed_ms, 2),
+                }
+            )
+            conversation.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": result["tool_call_id"],
+                    "name": result["name"],
+                    "content": json.dumps(result["result"]),
+                }
+            )
+        return len(tool_calls), asked_clarification, timestamps
 
-
-@dataclass
-class _FunctionCall:
-    name: str
-    arguments: str
-
-
-@dataclass
-class _ToolCall:
-    id: str
-    function: _FunctionCall
-
-
-@dataclass
-class _Message:
-    content: str
-    tool_calls: list[_ToolCall]
-
-
-@dataclass
-class _Choice:
-    message: _Message
-
-
-@dataclass
-class _ChatLikeResponse:
-    choices: list[_Choice]
-    usage: Any | None = None
+    async def run_stage(
+        self,
+        stage: str,
+        messages: list[dict[str, Any]],
+        *,
+        allow_tools: bool = False,
+        max_tool_calls: int = 5,
+        max_output_tokens: int | None = None,
+        model_override: str | None = None,
+    ) -> str:
+        conversation = list(messages)
+        tool_call_count = 0
+        while True:
+            response, _ = await self._llm_call(
+                conversation,
+                allow_tools=allow_tools and tool_call_count < max_tool_calls,
+                max_output_tokens=max_output_tokens,
+                model_override=model_override,
+            )
+            message = response.choices[0].message
+            content = str(getattr(message, "content", None) or "")
+            tool_calls = getattr(message, "tool_calls", None) or []
+            if not tool_calls:
+                return content.strip()
+            executed_count, _, _ = await self.execute_tool_calls(
+                stage=stage,
+                conversation=conversation,
+                content=content,
+                tool_calls=tool_calls,
+            )
+            tool_call_count += executed_count
 
 
 AUTHOR_SYSTEM_PROMPT = """You are an expert software architect creating implementation plans.
@@ -121,84 +253,6 @@ Implementation Steps quality bar:
 - Include explicit acceptance criteria.
 """
 
-DEFAULT_REQUIRED_PLAN_SECTION_PATTERNS: dict[str, str] = {
-    "title": r"^#\s+.+",
-    "summary": r"^##\s+summary\b",
-    "goals": r"^##\s+goals\b",
-    "non_goals": r"^##\s+non-goals\b",
-    "changes": r"^##\s+changes\b",
-    "files_changed": r"^##\s+files\s+changed\b",
-    "todos_in_order": r"^##\s+to-?dos?\s+in\s+order\b",
-    "architecture": r"^##\s+architecture\b",
-    "mermaid_diagram": r"^##\s+mermaid\s+diagram\b",
-    "implementation_steps": r"^##\s+implementation\s+steps\b",
-    "test_strategy": r"^##\s+test\s+strategy\b",
-    "rollback_plan": r"^##\s+rollback\s+plan\b",
-    "example_code_snippets": r"^##\s+example\s+code\s+snippets\b",
-    "open_questions": r"^##\s+open\s+questions\b",
-    "design_decision_records": r"^##\s+design\s+decision\s+records\b",
-    "user_stories": r"^##\s+user\s+stories\b",
-}
-
-REQUIREMENT_STOPWORDS = {
-    "the",
-    "and",
-    "for",
-    "with",
-    "from",
-    "that",
-    "this",
-    "into",
-    "over",
-    "under",
-    "mode",
-    "plan",
-    "planning",
-    "project",
-    "repo",
-    "repository",
-    "should",
-    "must",
-    "will",
-    "can",
-    "about",
-    "after",
-    "before",
-    "while",
-    "when",
-    "where",
-    "what",
-    "then",
-    "than",
-    "use",
-    "using",
-    "add",
-    "make",
-    "more",
-    "less",
-    "only",
-}
-
-NON_TRIVIAL_EXTENSIONS = {
-    ".py",
-    ".ts",
-    ".tsx",
-    ".js",
-    ".jsx",
-    ".go",
-    ".rs",
-    ".java",
-    ".rb",
-    ".yaml",
-    ".yml",
-    ".toml",
-    ".json",
-    ".sql",
-    ".sh",
-}
-
-TRIVIAL_FILENAMES = {"readme", "license", ".gitignore"}
-
 
 class AuthorAgent:
     def __init__(
@@ -212,96 +266,265 @@ class AuthorAgent:
         self.tool_executor = tool_executor
         self.event_callback = event_callback
         self.clarification_handler = clarification_handler
-        self.plan_schema = PlanSchema(required_sections=DEFAULT_REQUIRED_PLAN_SECTION_PATTERNS.copy())
+        self._llm_client = AuthorLLMClient(self.config, self._emit)
+        self.stage_runner = StageRunner(self._llm_client.call, self.tool_executor, self._emit)
+        self._discovery_service = AuthorDiscoveryService(self.tool_executor)
+        self._validation_service = AuthorValidationService(self.tool_executor)
+        self._design_service = AuthorDesignService(self.stage_runner, extract_first_json_object)
+        self._planner_pipeline = AuthorPlannerPipeline(
+            tool_executor=self.tool_executor,
+            scan_repo_candidates=self.scan_repo_candidates,
+            explore_repo=self.explore_repo,
+            classify_complexity=self.classify_complexity,
+            design_architecture=self.design_architecture,
+            draft_plan=self.draft_plan,
+            validate_draft=self.validate_draft,
+            design_record_from_architecture=self._design_record_from_architecture,
+        )
+
+    @staticmethod
+    def _excerpt(text: str, max_lines: int = 40) -> str:
+        lines = text.splitlines()
+        return "\n".join(lines[:max_lines]).strip()
+
+    @staticmethod
+    def _requirements_vagueness_score(text: str) -> float:
+        tokens = [token for token in re.split(r"[^a-z0-9]+", text.lower()) if token]
+        if not tokens:
+            return 0.0
+        vague_markers = {
+            "maybe",
+            "possibly",
+            "some",
+            "improve",
+            "better",
+            "stuff",
+            "things",
+            "etc",
+            "roughly",
+            "around",
+        }
+        marker_hits = sum(1 for token in tokens if token in vague_markers)
+        return marker_hits / float(len(tokens))
+
+    @staticmethod
+    def _initial_draft_policy(requirements: str) -> tuple[int, int, float, int]:
+        """Tune startup discovery budget from requirement complexity."""
+        tokens = [token for token in re.split(r"[^a-z0-9]+", requirements.lower()) if token]
+        uniq_tokens = {token for token in tokens if len(token) >= 4}
+        path_mentions = re.findall(r"[A-Za-z0-9_./-]+\.[A-Za-z0-9]+", requirements)
+        complexity_score = len(uniq_tokens) + (3 * len(path_mentions))
+        if complexity_score >= 45:
+            return 3, 4, 0.55, 1800
+        if complexity_score >= 25:
+            return 2, 3, 0.45, 1400
+        return 2, 2, 0.35, 1200
+
+    async def run_initial_draft(
+        self,
+        *,
+        requirements: str,
+        manifesto: str,
+        manifesto_path: str,
+        skills_block: str,
+        recall_block: str,
+        context_index: str,
+        grounding_paths: set[str],
+        model_override: str | None = None,
+    ) -> AuthorResult:
+        manifesto_excerpt = self._excerpt(manifesto, max_lines=40)
+        budget = TokenBudgetManager(context_window=128_000, max_completion_tokens=4000)
+        budget.enforce_required([requirements, f"Manifesto:\n{manifesto_excerpt}"])
+        remaining = budget.available_prompt_tokens - estimate_tokens(requirements)
+        manifesto_block, used_manifesto = budget.allocate(
+            f"PROJECT MANIFESTO (excerpt):\n{manifesto_excerpt}\n\n", remaining
+        )
+        remaining = max(0, remaining - used_manifesto)
+        skills_allocated, used_skills = budget.allocate(skills_block, remaining)
+        remaining = max(0, remaining - used_skills)
+        recall_allocated, used_recall = budget.allocate(recall_block, remaining)
+        remaining = max(0, remaining - used_recall)
+        context_index_block, _ = budget.allocate(
+            f"CONTEXT INDEX:\n{context_index}\n\n",
+            remaining,
+        )
+        initial_ratio = budget.injection_ratio(
+            [requirements, manifesto_block, skills_allocated, recall_allocated, context_index_block]
+        )
+        if initial_ratio > budget.enforce_ratio:
+            target_tokens = int(budget.context_window * budget.enforce_ratio)
+            remaining = max(0, target_tokens - estimate_tokens(requirements))
+            manifesto_block, used_manifesto = budget.allocate(manifesto_block, remaining)
+            remaining = max(0, remaining - used_manifesto)
+            skills_allocated, used_skills = budget.allocate(skills_allocated, remaining)
+            remaining = max(0, remaining - used_skills)
+            recall_allocated, used_recall = budget.allocate(recall_allocated, remaining)
+            remaining = max(0, remaining - used_recall)
+            context_index_block, _ = budget.allocate(context_index_block, remaining)
+        messages = [
+            {
+                "role": "user",
+                "content": (
+                    "You are planning changes to this repository.\n\n"
+                    f"REQUIREMENTS:\n{requirements}\n\n"
+                    f"{manifesto_block}"
+                    f"Full manifesto available at: {manifesto_path}\n\n"
+                    f"{skills_allocated}"
+                    f"{recall_allocated}"
+                    f"{context_index_block}"
+                    "IMPORTANT:\n"
+                    "- Do not assume file paths.\n"
+                    "- Search before referencing files.\n"
+                    "- Read files before proposing changes.\n"
+                    "- Pull additional memory only when needed with get_memory_block(key).\n"
+                ),
+            }
+        ]
+        require_clarification_first = self._requirements_vagueness_score(requirements) > 0.25
+        max_attempts, max_tool_calls, min_grounding_ratio, max_output_tokens = self._initial_draft_policy(requirements)
+        return await self.author_loop(
+            messages,
+            require_tool_calls=True,
+            max_attempts=min(max_attempts, self.config.author_tool_rounds),
+            max_tool_calls=max_tool_calls,
+            min_grounding_ratio=min_grounding_ratio,
+            grounding_paths=grounding_paths,
+            draft_phase="planner",
+            require_clarification_first=require_clarification_first and self.clarification_handler is not None,
+            max_output_tokens=max_output_tokens,
+            model_override=model_override,
+            reset_tool_history=False,
+        )
 
     @staticmethod
     def _requirements_keywords(text: str) -> set[str]:
-        tokens = re.split(r"[^a-z0-9]+", text.lower())
-        return {token for token in tokens if len(token) >= 3 and token not in REQUIREMENT_STOPWORDS}
+        return requirements_keywords(text)
 
     @staticmethod
     def _path_tokens(path: str) -> set[str]:
-        return {token for token in re.split(r"[^a-z0-9]+", path.lower()) if token}
+        return path_tokens(path)
 
     @staticmethod
     def _is_non_trivial_source(path: str) -> bool:
-        lower = path.lower()
-        base = lower.rsplit("/", 1)[-1]
-        stem = base.split(".", 1)[0]
-        if stem in TRIVIAL_FILENAMES or lower == ".prscope/manifesto.md":
-            return False
-        dot = base.rfind(".")
-        ext = base[dot:] if dot >= 0 else ""
-        return ext in NON_TRIVIAL_EXTENSIONS
+        return is_non_trivial_source(path)
 
     @staticmethod
     def _is_entrypoint_like(path: str) -> bool:
-        lower = path.lower()
-        base = lower.rsplit("/", 1)[-1]
-        return (
-            base in {"main.py", "app.py", "server.py", "index.ts", "index.tsx", "index.js"}
-            or "/cli" in lower
-            or "/cmd/" in lower
-            or "/bin/" in lower
-            or "/server/" in lower
-            or "/api/" in lower
-        )
+        return is_entrypoint_like(path)
 
     @staticmethod
     def _is_test_or_config(path: str) -> bool:
-        lower = path.lower()
-        base = lower.rsplit("/", 1)[-1]
-        if any(token in base for token in (".test.", ".spec.")):
-            return True
-        if "/tests/" in lower or "/test/" in lower:
-            return True
-        return base in {
-            "pyproject.toml",
-            "package.json",
-            "package-lock.json",
-            "tsconfig.json",
-            "vite.config.ts",
-            "dockerfile",
-            "docker-compose.yml",
-            ".github/workflows/ci.yml",
-        } or lower.endswith((".yml", ".yaml", ".toml", ".json"))
+        return is_test_or_config(path)
+
+    @staticmethod
+    def _extract_paths_from_mental_model(mental_model: str) -> set[str]:
+        return extract_paths_from_mental_model(mental_model)
+
+    def scan_repo_candidates(
+        self,
+        *,
+        mental_model: str | None = None,
+        max_entries_per_dir: int = 250,
+    ) -> RepoCandidates:
+        return self._discovery_service.scan_repo_candidates(
+            mental_model=mental_model,
+            max_entries_per_dir=max_entries_per_dir,
+        )
+
+    def explore_repo(
+        self,
+        *,
+        requirements: str,
+        candidates: RepoCandidates,
+        mental_model: str | None = None,
+        max_file_reads: int = 5,
+    ) -> RepoUnderstanding:
+        return self._discovery_service.explore_repo(
+            requirements=requirements,
+            candidates=candidates,
+            mental_model=mental_model,
+            max_file_reads=max_file_reads,
+        )
+
+    def classify_complexity(
+        self,
+        *,
+        requirements: str,
+        repo_understanding: RepoUnderstanding,
+    ) -> Literal["simple", "moderate", "complex"]:
+        return self._discovery_service.classify_complexity(
+            requirements=requirements,
+            repo_understanding=repo_understanding,
+        )
+
+    async def design_architecture(
+        self,
+        *,
+        requirements: str,
+        repo_understanding: RepoUnderstanding,
+        model_override: str | None = None,
+    ) -> ArchitectureDesign:
+        return await self._design_service.design_architecture(
+            requirements=requirements,
+            repo_understanding=repo_understanding,
+            model_override=model_override,
+        )
+
+    @staticmethod
+    def _design_record_from_architecture(architecture: ArchitectureDesign) -> DesignRecord:
+        return AuthorDesignService.design_record_from_architecture(architecture)
+
+    async def draft_plan(
+        self,
+        *,
+        requirements: str,
+        repo_understanding: RepoUnderstanding,
+        architecture: ArchitectureDesign | None = None,
+        model_override: str | None = None,
+        revision_hints: list[str] | None = None,
+    ) -> str:
+        messages = [
+            {"role": "system", "content": AUTHOR_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"## Requirements\n{requirements}\n\n"
+                    f"## Repository Understanding\n{json.dumps(repo_understanding.__dict__, indent=2)}\n\n"
+                    f"## Architecture Design\n{json.dumps(architecture.__dict__, indent=2) if architecture else '(none)'}\n\n"
+                    f"## Revision Hints\n{json.dumps(revision_hints or [], indent=2)}\n\n"
+                    "Produce a complete markdown implementation plan."
+                ),
+            },
+        ]
+        return await self.stage_runner.run_stage(
+            "draft_plan",
+            messages,
+            allow_tools=False,
+            max_output_tokens=2600,
+            model_override=model_override,
+        )
+
+    def validate_draft(
+        self,
+        *,
+        plan_content: str,
+        repo_understanding: RepoUnderstanding,
+        draft_phase: Literal["planner", "refiner"] = "refiner",
+        min_grounding_ratio: float | None = None,
+    ) -> list[str]:
+        return self._validation_service.validate_draft(
+            plan_content=plan_content,
+            repo_understanding=repo_understanding,
+            draft_phase=draft_phase,
+            min_grounding_ratio=min_grounding_ratio,
+        )
 
     def _explorer_gate_failures(self, requirements_text: str) -> list[str]:
-        read_history = self.tool_executor.read_history
-        read_paths = set(read_history.keys())
-        failures: list[str] = []
-        if len(read_paths) < 3:
-            failures.append(f"need at least 3 unique `read_file` calls (currently {len(read_paths)})")
-        if not any(self._is_non_trivial_source(path) for path in read_paths):
-            failures.append("need at least 1 non-trivial source/config file read")
-        keywords = self._requirements_keywords(requirements_text)
-        if keywords and not any(self._path_tokens(path) & keywords for path in read_paths):
-            failures.append("need at least 1 requirement-relevant file read")
-        if keywords and not any(
-            (self._path_tokens(path) & keywords)
-            and (int(meta.get("line_count", 0)) >= 20 or int(meta.get("file_size_bytes", 0)) >= 1000)
-            for path, meta in read_history.items()
-        ):
-            failures.append("need at least 1 requirement-relevant substantive read")
-        if not any(
-            int(meta.get("line_count", 0)) >= 30 or int(meta.get("file_size_bytes", 0)) >= 1500
-            for meta in read_history.values()
-        ):
-            failures.append("need at least 1 substantive read (>=30 lines OR >=1.5KB)")
-        if not any(self._is_entrypoint_like(path) for path in read_paths):
-            failures.append("need at least 1 entrypoint/runtime file read")
-        if not any(self._is_test_or_config(path) for path in read_paths):
-            failures.append("need at least 1 test or config file read")
-        return failures
+        return self._validation_service.explorer_gate_failures(requirements_text)
 
     @staticmethod
     def _extract_section(content: str, heading: str) -> str:
-        pattern = re.compile(
-            rf"^##\s+{re.escape(heading)}\b(.*?)(?=^##\s+|\Z)",
-            re.IGNORECASE | re.MULTILINE | re.DOTALL,
-        )
-        match = pattern.search(content)
-        return match.group(1).strip() if match else ""
+        return AuthorValidationService.extract_section(content, heading)
 
     def _grounding_failures(
         self,
@@ -310,93 +533,18 @@ class AuthorAgent:
         min_grounding_ratio: float,
         draft_phase: Literal["planner", "refiner"],
     ) -> tuple[list[str], set[str], float]:
-        referenced = extract_file_references(plan_content)
-        if not referenced:
-            return [], set(), 1.0
-        unverified = referenced - verified_paths
-        grounding_ratio = (len(referenced) - len(unverified)) / float(len(referenced))
-        failures: list[str] = []
-        if grounding_ratio < min_grounding_ratio:
-            failures.append(f"grounding ratio {grounding_ratio:.2f} below required {min_grounding_ratio:.2f}")
-        # Cross-checking Files Changed vs Implementation Steps only applies once
-        # we're in refiner mode where implementation detail sections are required.
-        if draft_phase == "refiner":
-            files_changed = extract_file_references(self._extract_section(plan_content, "Files Changed"))
-            implementation = extract_file_references(self._extract_section(plan_content, "Implementation Steps"))
-            missing_impl_refs = sorted(files_changed - implementation)
-            if missing_impl_refs:
-                failures.append(
-                    "Files Changed entries missing from Implementation Steps: " + ", ".join(missing_impl_refs)
-                )
-        return failures, unverified, grounding_ratio
+        return self._validation_service.grounding_failures(
+            plan_content=plan_content,
+            verified_paths=verified_paths,
+            min_grounding_ratio=min_grounding_ratio,
+            draft_phase=draft_phase,
+        )
 
     def _phase_failures(self, plan_content: str, draft_phase: Literal["planner", "refiner"]) -> list[str]:
-        if draft_phase != "planner":
-            return []
-        failures: list[str] = []
-        fence_count = len(re.findall(r"```", plan_content))
-        if fence_count > 2:
-            failures.append("planner draft has too many code fences")
-        if re.search(r"^##\s+Implementation\s+Steps\b", plan_content, re.IGNORECASE | re.MULTILINE):
-            failures.append("planner draft must not include Implementation Steps section")
-        if re.search(r"^##\s+Test\s+Strategy\b", plan_content, re.IGNORECASE | re.MULTILINE):
-            failures.append("planner draft must not include Test Strategy section")
-        if re.search(r"^##\s+Rollback\s+Plan\b", plan_content, re.IGNORECASE | re.MULTILINE):
-            failures.append("planner draft must not include Rollback Plan section")
-        numbered_items = re.findall(
-            r"^\s*\d+\.\s+.*\b(modify|add|update|delete|replace|rename|refactor)\b.*$",
-            plan_content,
-            flags=re.IGNORECASE | re.MULTILINE,
-        )
-        if len(numbered_items) > 5:
-            failures.append("planner draft contains detailed implementation step list")
-        return failures
+        return AuthorValidationService.phase_failures(plan_content, draft_phase)
 
     def _completion_failures(self, plan_content: str) -> list[str]:
-        failures: list[str] = []
-        lower = plan_content.lower()
-        if re.search(r"\b(todo|tbd|placeholder)\b", lower):
-            failures.append("final draft contains TODO/TBD/placeholder markers")
-        required_non_empty = [
-            "Goals",
-            "Non-Goals",
-            "Files Changed",
-            "Architecture",
-            "Implementation Steps",
-            "Test Strategy",
-            "Rollback Plan",
-        ]
-        for heading in required_non_empty:
-            if not self._extract_section(plan_content, heading):
-                failures.append(f"required section is empty: {heading}")
-        files_changed = extract_file_references(self._extract_section(plan_content, "Files Changed"))
-        if not files_changed:
-            failures.append("Files Changed section is empty")
-        total_references = extract_file_references(plan_content)
-        if len(files_changed) == 1 and len(total_references) > 1:
-            failures.append("under-scoped draft: one file in Files Changed but multiple referenced files")
-        implementation = self._extract_section(plan_content, "Implementation Steps").lower()
-        if implementation and not any(
-            token in implementation for token in ("interface", "signature", "contract", "api shape")
-        ):
-            failures.append("Implementation Steps missing interface/signature impact notes")
-        test_strategy = self._extract_section(plan_content, "Test Strategy").lower()
-        if test_strategy and not any(
-            token in test_strategy
-            for token in ("assert", "expects", "status code", "error path", "failure", "regression")
-        ):
-            failures.append("Test Strategy lacks concrete assertions or failure-path checks")
-        rollback = self._extract_section(plan_content, "Rollback Plan").lower()
-        if rollback and not any(token in rollback for token in ("trigger", "if ", "on ", "when ")):
-            failures.append("Rollback Plan missing rollback trigger conditions")
-        if rollback and not any(token in rollback for token in ("revert", "disable", "restore", "rollback action")):
-            failures.append("Rollback Plan missing explicit rollback actions")
-        architecture = self._extract_section(plan_content, "Architecture").lower()
-        if architecture and not any(
-            token in architecture for token in ("metric", "log", "alert", "observe", "monitor")
-        ):
-            failures.append("Architecture missing observability/monitoring specifics")
-        return failures
+        return self._validation_service.completion_failures(plan_content)
 
     async def _emit(self, event: dict[str, Any]) -> None:
         if self.event_callback is None:
@@ -448,54 +596,7 @@ class AuthorAgent:
         )
 
     def _missing_required_sections(self, plan_content: str, draft_phase: Literal["planner", "refiner"]) -> list[str]:
-        missing: list[str] = []
-        if draft_phase == "planner":
-            planner_required = {
-                "title",
-                "goals",
-                "non_goals",
-                "files_changed",
-                "architecture",
-            }
-            for section_name, pattern in self.plan_schema.required_sections.items():
-                if section_name not in planner_required:
-                    continue
-                if not re.search(pattern, plan_content, re.IGNORECASE | re.MULTILINE):
-                    missing.append(section_name)
-            return missing
-        planner_forbidden = {
-            "implementation_steps",
-            "test_strategy",
-            "rollback_plan",
-            "example_code_snippets",
-            "user_stories",
-        }
-        for section_name, pattern in self.plan_schema.required_sections.items():
-            if draft_phase == "planner" and section_name in planner_forbidden:
-                continue
-            if not re.search(pattern, plan_content, re.IGNORECASE | re.MULTILINE):
-                missing.append(section_name)
-
-        if self.plan_schema.requires_mermaid:
-            has_mermaid_block = "```mermaid" in plan_content.lower()
-            has_explicit_mermaid_waiver = (
-                "mermaid diagram is unnecessary" in plan_content.lower()
-                or "no mermaid diagram needed" in plan_content.lower()
-            )
-            if not has_mermaid_block and not has_explicit_mermaid_waiver:
-                missing.append("mermaid_content")
-
-        if self.plan_schema.requires_code_blocks and draft_phase == "refiner":
-            has_any_code_fence = bool(re.search(r"```[a-zA-Z0-9_-]*\n", plan_content))
-            if not has_any_code_fence:
-                missing.append("example_code_fence")
-
-        if self.plan_schema.requires_ordered_todos:
-            has_ordered_todos = bool(re.search(r"^\s*1\.\s+.+", plan_content, re.MULTILINE))
-            if not has_ordered_todos:
-                missing.append("ordered_todos")
-
-        return missing
+        return AuthorValidationService.missing_required_sections(plan_content, draft_phase)
 
     async def _llm_call(
         self,
@@ -505,14 +606,7 @@ class AuthorAgent:
         max_output_tokens: int | None = None,
         model_override: str | None = None,
     ):
-        import litellm
-
-        litellm.drop_params = True  # gpt-5 models don't support all params (e.g. temperature)
-        # Prevent verbose LiteLLM debug logging from blocking runtime under load.
-        if hasattr(litellm, "set_verbose"):
-            litellm.set_verbose = False
-        return await self._safe_completion_call(
-            litellm=litellm,
+        return await self._llm_client.call(
             messages=messages,
             allow_tools=allow_tools,
             max_output_tokens=max_output_tokens,
@@ -520,360 +614,105 @@ class AuthorAgent:
         )
 
     @staticmethod
-    def _prefer_responses_api(model: str) -> bool:
-        return model.startswith("gpt-5")
+    def _extract_first_json_object(raw: str) -> tuple[str, str]:
+        return extract_first_json_object(raw)
 
     @staticmethod
-    def _responses_tools() -> list[dict[str, Any]]:
-        tools: list[dict[str, Any]] = []
-        for entry in CODEBASE_TOOLS:
-            fn = entry.get("function", {})
-            tools.append(
-                {
-                    "type": "function",
-                    "name": str(fn.get("name", "")),
-                    "description": str(fn.get("description", "")),
-                    "parameters": fn.get("parameters", {"type": "object", "properties": {}}),
-                }
-            )
-        return tools
+    def _parse_plan_document(raw: str) -> PlanDocument:
+        return parse_plan_document(raw)
 
-    @staticmethod
-    def _as_responses_input(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        payload: list[dict[str, Any]] = []
-        for message in messages:
-            role = str(message.get("role", "user"))
-            if role == "tool":
-                payload.append(
-                    {
-                        "type": "function_call_output",
-                        "call_id": str(message.get("tool_call_id", "")),
-                        "output": str(message.get("content", "")),
-                    }
-                )
-                continue
-            if role == "assistant":
-                content = str(message.get("content", ""))
-                if content:
-                    payload.append(
-                        {
-                            "role": "assistant",
-                            "content": [{"type": "output_text", "text": content}],
-                        }
-                    )
-                tool_calls = message.get("tool_calls", []) or []
-                if isinstance(tool_calls, list):
-                    for tc in tool_calls:
-                        fn = tc.get("function", {}) if isinstance(tc, dict) else {}
-                        payload.append(
-                            {
-                                "type": "function_call",
-                                "call_id": str(tc.get("id", "")) if isinstance(tc, dict) else "",
-                                "name": str(fn.get("name", "")),
-                                "arguments": str(fn.get("arguments", "{}")),
-                            }
-                        )
-                continue
-            payload.append(
-                {
-                    "role": role,
-                    "content": [{"type": "input_text", "text": str(message.get("content", ""))}],
-                }
-            )
-        return payload
-
-    @staticmethod
-    def _extract_responses_text(response: Any) -> str:
-        output_text = getattr(response, "output_text", None)
-        if isinstance(output_text, str) and output_text.strip():
-            return output_text.strip()
-        output = getattr(response, "output", None)
-        if isinstance(output, list):
-            chunks: list[str] = []
-            for item in output:
-                content = getattr(item, "content", None)
-                if not isinstance(content, list):
-                    continue
-                for part in content:
-                    text = getattr(part, "text", None)
-                    if isinstance(text, str) and text:
-                        chunks.append(text)
-            if chunks:
-                return "\n".join(chunks).strip()
-        return ""
-
-    @staticmethod
-    def _extract_responses_tool_calls(response: Any) -> list[_ToolCall]:
-        tool_calls: list[_ToolCall] = []
-        output = getattr(response, "output", None)
-        if not isinstance(output, list):
-            return tool_calls
-        for item in output:
-            item_type = str(getattr(item, "type", "") or "")
-            if item_type != "function_call":
-                continue
-            name = str(getattr(item, "name", "") or "")
-            arguments = str(getattr(item, "arguments", "") or "{}")
-            call_id = str(getattr(item, "call_id", None) or getattr(item, "id", None) or f"call_{len(tool_calls)}")
-            if not name:
-                continue
-            tool_calls.append(
-                _ToolCall(
-                    id=call_id,
-                    function=_FunctionCall(name=name, arguments=arguments),
-                )
-            )
-        return tool_calls
-
-    async def _safe_completion_call(
+    async def plan_repair(
         self,
-        *,
-        litellm: Any,
-        messages: list[dict[str, Any]],
-        allow_tools: bool,
-        max_output_tokens: int | None,
-        model_override: str | None,
-    ) -> tuple[Any, str]:
-        """Call completion with fallback for non-chat model misconfiguration."""
-        fallback_model = "gpt-4o"
-        per_call_timeout_seconds = max(5, int(self.config.author_call_timeout_seconds))
-        output_cap = max(512, min(4000, int(max_output_tokens or 4000)))
-        primary_model = model_override or self.config.author_model
-        models_to_try = [primary_model]
-        if fallback_model != primary_model:
-            models_to_try.append(fallback_model)
-
-        last_error: Exception | None = None
-        for idx, model in enumerate(models_to_try):
-            try:
-                if self._prefer_responses_api(model):
-                    from openai import OpenAI
-
-                    client = OpenAI()
-                    responses_kwargs: dict[str, Any] = {
-                        "model": model,
-                        "input": self._as_responses_input(messages),
-                        "max_output_tokens": output_cap,
-                    }
-                    if allow_tools:
-                        responses_kwargs["tools"] = self._responses_tools()
-                        responses_kwargs["tool_choice"] = "auto"
-                    llm_started = asyncio.get_running_loop().time()
-                    response = await asyncio.wait_for(
-                        asyncio.to_thread(client.responses.create, **responses_kwargs),
-                        timeout=per_call_timeout_seconds,
-                    )
-                    llm_elapsed_ms = (asyncio.get_running_loop().time() - llm_started) * 1000.0
-                    text = self._extract_responses_text(response)
-                    tool_calls = self._extract_responses_tool_calls(response)
-                    chat_like = _ChatLikeResponse(
-                        choices=[
-                            _Choice(
-                                message=_Message(
-                                    content=text,
-                                    tool_calls=tool_calls,
-                                )
-                            )
-                        ],
-                        usage=getattr(response, "usage", None),
-                    )
-                    telemetry = completion_telemetry(response, model=model)
-                    context_window = MODEL_CONTEXT_WINDOWS.get(model)
-                    if model not in MODEL_CONTEXT_WINDOWS:
-                        await self._emit(
-                            {
-                                "type": "warning",
-                                "message": f"Unknown model '{model}' - context window tracking disabled",
-                            }
-                        )
-                    if model not in MODEL_CONTEXT_WINDOWS:
-                        await self._emit(
-                            {
-                                "type": "warning",
-                                "message": f"Unknown model '{model}' - cost tracking disabled for this call",
-                            }
-                        )
-                    await self._emit(
-                        {
-                            "type": "token_usage",
-                            "session_stage": "author",
-                            "model": model,
-                            "prompt_tokens": telemetry.usage.prompt_tokens,
-                            "completion_tokens": telemetry.usage.completion_tokens,
-                            "call_cost_usd": telemetry.cost.total_cost_usd,
-                            "llm_call_latency_ms": round(llm_elapsed_ms, 2),
-                            "context_window_tokens": context_window,
-                            "context_usage_ratio": (
-                                round(float(telemetry.usage.prompt_tokens) / float(context_window), 4)
-                                if context_window and context_window > 0
-                                else None
-                            ),
-                        }
-                    )
-                    if context_window and telemetry.usage.prompt_tokens > int(context_window * 0.75):
-                        await self._emit(
-                            {
-                                "type": "warning",
-                                "message": (
-                                    f"Prompt tokens {telemetry.usage.prompt_tokens} exceed "
-                                    f"75% of context window ({context_window}) for {model}"
-                                ),
-                            }
-                        )
-                    return chat_like, model
-                completion_kwargs: dict[str, Any] = {
-                    "model": model,
-                    "messages": messages,
-                    "max_tokens": output_cap,
-                }
-                if allow_tools:
-                    completion_kwargs["tools"] = CODEBASE_TOOLS
-                    completion_kwargs["tool_choice"] = "auto"
-                llm_started = asyncio.get_running_loop().time()
-                response = await asyncio.wait_for(
-                    asyncio.to_thread(litellm.completion, **completion_kwargs),
-                    timeout=per_call_timeout_seconds,
-                )
-                llm_elapsed_ms = (asyncio.get_running_loop().time() - llm_started) * 1000.0
-                telemetry = completion_telemetry(response, model=model)
-                context_window = MODEL_CONTEXT_WINDOWS.get(model)
-                if model not in MODEL_CONTEXT_WINDOWS:
-                    await self._emit(
-                        {
-                            "type": "warning",
-                            "message": f"Unknown model '{model}' - context window tracking disabled",
-                        }
-                    )
-                if model not in MODEL_CONTEXT_WINDOWS:
-                    await self._emit(
-                        {
-                            "type": "warning",
-                            "message": f"Unknown model '{model}' - cost tracking disabled for this call",
-                        }
-                    )
-                await self._emit(
-                    {
-                        "type": "token_usage",
-                        "session_stage": "author",
-                        "model": model,
-                        "prompt_tokens": telemetry.usage.prompt_tokens,
-                        "completion_tokens": telemetry.usage.completion_tokens,
-                        "call_cost_usd": telemetry.cost.total_cost_usd,
-                        "llm_call_latency_ms": round(llm_elapsed_ms, 2),
-                        "context_window_tokens": context_window,
-                        "context_usage_ratio": (
-                            round(float(telemetry.usage.prompt_tokens) / float(context_window), 4)
-                            if context_window and context_window > 0
-                            else None
-                        ),
-                    }
-                )
-                if context_window and telemetry.usage.prompt_tokens > int(context_window * 0.75):
-                    await self._emit(
-                        {
-                            "type": "warning",
-                            "message": (
-                                f"Prompt tokens {telemetry.usage.prompt_tokens} exceed "
-                                f"75% of context window ({context_window}) for {model}"
-                            ),
-                        }
-                    )
-                return response, model
-            except asyncio.TimeoutError as exc:
-                last_error = RuntimeError(f"Model '{model}' timed out after {per_call_timeout_seconds}s")
-                await self._emit(
-                    {
-                        "type": "warning",
-                        "message": (
-                            f"Author call timeout on {model} after {per_call_timeout_seconds}s; trying fallback model."
-                        ),
-                    }
-                )
-                if idx == len(models_to_try) - 1:
-                    raise RuntimeError(
-                        "Configured planning author model timed out and fallback also timed out."
-                    ) from exc
-                continue
-            except Exception as exc:  # noqa: BLE001
-                last_error = exc
-                err_text = str(exc).lower()
-                non_chat_model = (
-                    "not a chat model" in err_text
-                    or "v1/chat/completions" in err_text
-                    or "did you mean to use v1/completions" in err_text
-                )
-                if not non_chat_model or idx == len(models_to_try) - 1:
-                    break
-
-        if last_error is not None:
-            raise RuntimeError(f"Configured planning author model failed. Last error: {last_error}") from last_error
-        raise RuntimeError("Unknown completion failure during authoring.")
-
-    async def author_loop(
-        self,
-        messages: list[dict[str, Any]],
-        require_tool_calls: bool = True,
-        max_attempts: int | None = None,
-        max_tool_calls: int | None = None,
-        min_grounding_ratio: float | None = None,
-        grounding_paths: set[str] | None = None,
-        draft_phase: Literal["planner", "refiner"] = "refiner",
-        require_clarification_first: bool = False,
-        max_output_tokens: int | None = None,
-        quick_start_mode: bool = False,
+        review: ReviewResult,
+        plan: PlanDocument,
+        requirements: str,
+        design_record: dict[str, Any] | None = None,
         model_override: str | None = None,
-        reset_tool_history: bool = True,
-    ) -> AuthorResult:
-        if max_attempts is None:
-            max_attempts = self.config.author_tool_rounds
-        if reset_tool_history:
-            self.tool_executor.accessed_paths.clear()
-            self.tool_executor.read_history.clear()
-        conversation = [
-            {"role": "system", "content": AUTHOR_SYSTEM_PROMPT},
-            *messages,
-        ]
-        if draft_phase == "planner" and quick_start_mode:
-            if max_output_tokens is None:
-                max_output_tokens = 1400
-            conversation.append(
-                {
-                    "role": "user",
-                    "content": (
-                        "Startup quick-draft mode is active. Return a concise but grounded starter plan.\n"
-                        "Strict constraints:\n"
-                        "- Keep to planner-phase sections only (title, goals, non-goals, files changed, architecture).\n"
-                        "- No code fences.\n"
-                        "- Keep total response under ~900 words.\n"
-                        "- Prefer concrete file paths and short rationale over broad prose."
-                    ),
-                }
-            )
-        rejection_counts = {
-            "rejected_for_no_discovery": 0,
-            "rejected_for_grounding": 0,
-            "rejected_for_budget": 0,
-        }
-        rejection_reasons: list[dict[str, str]] = []
-        tool_call_timestamps: list[float] = []
-        asked_clarification = False
-        total_tool_calls = 0
-        best_non_empty_content: str = ""
-        requirements_text = "\n".join(
-            str(message.get("content", "")) for message in messages if str(message.get("role", "")) == "user"
+    ) -> RepairPlan:
+        return await AuthorRepairService(self._llm_call).plan_repair(
+            review=review,
+            plan=plan,
+            requirements=requirements,
+            design_record=design_record,
+            model_override=model_override,
         )
 
-        try:
-            import litellm  # noqa: F401
-        except ImportError:
-            fallback = self._fallback_plan("\n".join(m.get("content", "") for m in messages))
-            refs = extract_file_references(fallback)
-            return AuthorResult(
-                plan=fallback,
-                unverified_references=refs - self.tool_executor.accessed_paths,
-                accessed_paths=self.tool_executor.accessed_paths.copy(),
-                rejection_counts=rejection_counts,
-            )
+    async def update_design_record(
+        self,
+        *,
+        design_record: dict[str, Any],
+        review: ReviewResult,
+        requirements: str,
+        model_override: str | None = None,
+    ) -> dict[str, Any]:
+        return await AuthorRepairService(self._llm_call).update_design_record(
+            design_record=design_record,
+            review=review,
+            requirements=requirements,
+            model_override=model_override,
+        )
+
+    async def revise_plan(
+        self,
+        repair_plan: RepairPlan,
+        current_plan: PlanDocument,
+        requirements: str,
+        design_record: dict[str, Any] | None = None,
+        revision_budget: int = 3,
+        model_override: str | None = None,
+        simplest_possible_design: str | None = None,
+    ) -> RevisionResult:
+        return await AuthorRepairService(self._llm_call).revise_plan(
+            repair_plan=repair_plan,
+            current_plan=current_plan,
+            requirements=requirements,
+            design_record=design_record,
+            revision_budget=revision_budget,
+            model_override=model_override,
+            simplest_possible_design=simplest_possible_design,
+        )
+
+    async def _run_planner_pipeline(
+        self,
+        *,
+        requirements: str,
+        min_grounding_ratio: float | None,
+        grounding_paths: set[str] | None,
+        model_override: str | None,
+        rejection_counts: dict[str, int],
+        rejection_reasons: list[dict[str, str]],
+    ) -> AuthorResult:
+        return await self._planner_pipeline.run(
+            requirements=requirements,
+            min_grounding_ratio=min_grounding_ratio,
+            grounding_paths=grounding_paths,
+            model_override=model_override,
+            rejection_counts=rejection_counts,
+            rejection_reasons=rejection_reasons,
+        )
+
+    async def _run_legacy_authoring_loop(
+        self,
+        *,
+        conversation: list[dict[str, Any]],
+        messages: list[dict[str, Any]],
+        requirements_text: str,
+        require_tool_calls: bool,
+        max_attempts: int,
+        max_tool_calls: int | None,
+        min_grounding_ratio: float | None,
+        grounding_paths: set[str] | None,
+        draft_phase: Literal["planner", "refiner"],
+        require_clarification_first: bool,
+        max_output_tokens: int | None,
+        model_override: str | None,
+        rejection_counts: dict[str, int],
+        rejection_reasons: list[dict[str, str]],
+    ) -> tuple[AuthorResult | None, str, int]:
+        asked_clarification = False
+        total_tool_calls = 0
+        best_non_empty_content = ""
+        tool_call_timestamps: list[float] = []
 
         try:
             for attempt in range(max_attempts):
@@ -954,98 +793,16 @@ class AuthorAgent:
                             }
                         )
                         continue
-                    conversation.append(
-                        {
-                            "role": "assistant",
-                            "content": content,
-                            "tool_calls": [
-                                {
-                                    "id": getattr(tc, "id", None),
-                                    "type": "function",
-                                    "function": {
-                                        "name": getattr(tc.function, "name", ""),
-                                        "arguments": getattr(tc.function, "arguments", "{}"),
-                                    },
-                                }
-                                for tc in tool_calls
-                            ],
-                        }
+                    executed_count, asked_now, timestamps = await self.stage_runner.execute_tool_calls(
+                        stage="author",
+                        conversation=conversation,
+                        content=content,
+                        tool_calls=tool_calls,
+                        clarification_handler=self.clarification_handler,
                     )
-                    for tc in tool_calls:
-                        total_tool_calls += 1
-                        tool_call_timestamps.append(asyncio.get_running_loop().time())
-                        tool_name = getattr(getattr(tc, "function", None), "name", "")
-                        raw_args = getattr(getattr(tc, "function", None), "arguments", "{}") or "{}"
-                        try:
-                            parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else {}
-                        except json.JSONDecodeError:
-                            parsed_args = {}
-                        path_hint = parsed_args.get("path") or parsed_args.get("relative_path")
-                        query_hint = parsed_args.get("query") or parsed_args.get("pattern")
-                        await self._emit(
-                            {
-                                "type": "tool_call",
-                                "name": tool_name,
-                                "session_stage": "author",
-                                "path": str(path_hint) if isinstance(path_hint, str) else None,
-                                "query": str(query_hint) if isinstance(query_hint, str) else None,
-                            }
-                        )
-                        if tool_name == "ask_clarification":
-                            asked_clarification = True
-                            await self._emit(
-                                {
-                                    "type": "clarification_needed",
-                                    "question": str(parsed_args.get("question", "")),
-                                    "context": str(parsed_args.get("context", "")),
-                                    "source": "author",
-                                }
-                            )
-                        try:
-                            tool_started = asyncio.get_running_loop().time()
-                            if tool_name == "ask_clarification" and self.clarification_handler is not None:
-                                answers = await self.clarification_handler(
-                                    str(parsed_args.get("question", "")),
-                                    str(parsed_args.get("context", "")),
-                                )
-                                result = {
-                                    "tool_call_id": getattr(tc, "id", ""),
-                                    "name": tool_name,
-                                    "result": {
-                                        "question": str(parsed_args.get("question", "")),
-                                        "context": str(parsed_args.get("context", "")),
-                                        "answers": answers,
-                                        "timed_out": len(answers) == 0,
-                                    },
-                                }
-                            else:
-                                # Tool execution can include filesystem/subprocess work.
-                                # Run it off the event loop so API polling stays responsive.
-                                result = await asyncio.to_thread(self.tool_executor.execute, tc)
-                            tool_elapsed_ms = (asyncio.get_running_loop().time() - tool_started) * 1000.0
-                        except Exception as exc:  # noqa: BLE001
-                            result = {
-                                "tool_call_id": getattr(tc, "id", ""),
-                                "name": getattr(getattr(tc, "function", None), "name", ""),
-                                "result": {"error": str(exc)},
-                            }
-                            tool_elapsed_ms = 0.0
-                        await self._emit(
-                            {
-                                "type": "tool_result",
-                                "name": tool_name,
-                                "session_stage": "author",
-                                "duration_ms": round(tool_elapsed_ms, 2),
-                            }
-                        )
-                        conversation.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": result["tool_call_id"],
-                                "name": result["name"],
-                                "content": json.dumps(result["result"]),
-                            }
-                        )
+                    total_tool_calls += executed_count
+                    asked_clarification = asked_clarification or asked_now
+                    tool_call_timestamps.extend(timestamps)
                     continue
 
                 if require_tool_calls and attempt == 0 and not self.tool_executor.read_history:
@@ -1136,9 +893,7 @@ class AuthorAgent:
                         conversation.append(
                             {
                                 "role": "user",
-                                "content": (
-                                    "Your previous response was empty. Return a complete non-empty plan draft now."
-                                ),
+                                "content": "Your previous response was empty. Return a complete non-empty plan draft now.",
                             }
                         )
                         continue
@@ -1283,15 +1038,19 @@ class AuthorAgent:
                         for i in range(1, len(tool_call_timestamps))
                     ]
                     avg_call_spacing = sum(deltas) / float(len(deltas))
-                return AuthorResult(
-                    plan=plan_content,
-                    unverified_references=unverified,
-                    accessed_paths=verified_paths.copy(),
-                    grounding_ratio=grounding_ratio,
-                    rejection_counts=rejection_counts,
-                    rejection_reasons=rejection_reasons,
-                    average_read_depth=avg_read_depth,
-                    average_time_between_tool_calls=avg_call_spacing,
+                return (
+                    AuthorResult(
+                        plan=plan_content,
+                        unverified_references=unverified,
+                        accessed_paths=verified_paths.copy(),
+                        grounding_ratio=grounding_ratio,
+                        rejection_counts=rejection_counts,
+                        rejection_reasons=rejection_reasons,
+                        average_read_depth=avg_read_depth,
+                        average_time_between_tool_calls=avg_call_spacing,
+                    ),
+                    best_non_empty_content,
+                    total_tool_calls,
                 )
         except Exception as exc:  # noqa: BLE001
             rejection_reasons.append(
@@ -1308,13 +1067,104 @@ class AuthorAgent:
             )
             fallback = self._fallback_plan("\n".join(m.get("content", "") for m in messages))
             refs = extract_file_references(fallback)
-            return AuthorResult(
-                plan=fallback,
-                unverified_references=refs - self.tool_executor.accessed_paths,
-                accessed_paths=self.tool_executor.accessed_paths.copy(),
-                rejection_counts=rejection_counts,
-                rejection_reasons=rejection_reasons,
+            return (
+                AuthorResult(
+                    plan=fallback,
+                    unverified_references=refs - self.tool_executor.accessed_paths,
+                    accessed_paths=self.tool_executor.accessed_paths.copy(),
+                    rejection_counts=rejection_counts,
+                    rejection_reasons=rejection_reasons,
+                ),
+                best_non_empty_content,
+                total_tool_calls,
             )
+        return None, best_non_empty_content, total_tool_calls
+
+    async def author_loop(
+        self,
+        messages: list[dict[str, Any]],
+        require_tool_calls: bool = True,
+        max_attempts: int | None = None,
+        max_tool_calls: int | None = None,
+        min_grounding_ratio: float | None = None,
+        grounding_paths: set[str] | None = None,
+        draft_phase: Literal["planner", "refiner"] = "refiner",
+        require_clarification_first: bool = False,
+        max_output_tokens: int | None = None,
+        model_override: str | None = None,
+        reset_tool_history: bool = True,
+    ) -> AuthorResult:
+        if max_attempts is None:
+            max_attempts = self.config.author_tool_rounds
+        if reset_tool_history:
+            self.tool_executor.accessed_paths.clear()
+            self.tool_executor.read_history.clear()
+        # Preserve test/runtime monkeypatch seam: StageRunner follows AuthorAgent `_llm_call`.
+        self.stage_runner.set_llm_caller(self._llm_call)
+        conversation = [
+            {"role": "system", "content": AUTHOR_SYSTEM_PROMPT},
+            *messages,
+        ]
+        rejection_counts = {
+            "rejected_for_no_discovery": 0,
+            "rejected_for_grounding": 0,
+            "rejected_for_budget": 0,
+        }
+        rejection_reasons: list[dict[str, str]] = []
+        requirements_text = "\n".join(
+            str(message.get("content", "")) for message in messages if str(message.get("role", "")) == "user"
+        )
+
+        llm_call_is_overridden = getattr(self._llm_call, "__func__", None) is not AuthorAgent._llm_call
+        try:
+            import litellm  # noqa: F401
+        except ImportError:
+            if not llm_call_is_overridden:
+                fallback = self._fallback_plan("\n".join(m.get("content", "") for m in messages))
+                refs = extract_file_references(fallback)
+                return AuthorResult(
+                    plan=fallback,
+                    unverified_references=refs - self.tool_executor.accessed_paths,
+                    accessed_paths=self.tool_executor.accessed_paths.copy(),
+                    rejection_counts=rejection_counts,
+                )
+
+        if draft_phase == "planner":
+            try:
+                return await self._run_planner_pipeline(
+                    requirements=requirements_text,
+                    min_grounding_ratio=min_grounding_ratio,
+                    grounding_paths=grounding_paths,
+                    model_override=model_override,
+                    rejection_counts=rejection_counts,
+                    rejection_reasons=rejection_reasons,
+                )
+            except Exception as exc:  # noqa: BLE001
+                rejection_reasons.append(
+                    {
+                        "reason": "PIPELINE_FALLBACK",
+                        "details": f"planner pipeline failed, using legacy loop: {exc}",
+                    }
+                )
+
+        legacy_result, best_non_empty_content, total_tool_calls = await self._run_legacy_authoring_loop(
+            conversation=conversation,
+            messages=messages,
+            requirements_text=requirements_text,
+            require_tool_calls=require_tool_calls,
+            max_attempts=max_attempts,
+            max_tool_calls=max_tool_calls,
+            min_grounding_ratio=min_grounding_ratio,
+            grounding_paths=grounding_paths,
+            draft_phase=draft_phase,
+            require_clarification_first=require_clarification_first,
+            max_output_tokens=max_output_tokens,
+            model_override=model_override,
+            rejection_counts=rejection_counts,
+            rejection_reasons=rejection_reasons,
+        )
+        if legacy_result is not None:
+            return legacy_result
 
         if best_non_empty_content:
             recovered = best_non_empty_content

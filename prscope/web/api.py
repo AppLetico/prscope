@@ -10,6 +10,7 @@ import os
 import time
 from contextlib import asynccontextmanager
 from dataclasses import asdict
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 from uuid import uuid4
@@ -36,6 +37,13 @@ from .events import SessionEventEmitter
 
 COMMAND_LEASE_SECONDS = 120
 COMMAND_HEARTBEAT_SECONDS = 60
+
+
+def _to_int(value: Any, fallback: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
 
 
 class StartSessionRequest(BaseModel):
@@ -223,14 +231,26 @@ def _session_to_dict(session: Any) -> dict[str, Any]:
                 active_tool_calls = [item for item in parsed if isinstance(item, dict)]
         except json.JSONDecodeError:
             active_tool_calls = []
-    completed_tool_call_groups: list[list[dict[str, Any]]] = []
+    completed_tool_call_groups: list[dict[str, Any]] = []
     if data.get("completed_tool_call_groups_json"):
         try:
             parsed = json.loads(str(data["completed_tool_call_groups_json"]))
             if isinstance(parsed, list):
-                completed_tool_call_groups = [
-                    [entry for entry in group if isinstance(entry, dict)] for group in parsed if isinstance(group, list)
-                ]
+                for idx, group in enumerate(parsed):
+                    if isinstance(group, dict) and "tools" in group:
+                        completed_tool_call_groups.append(group)
+                    elif isinstance(group, list):
+                        tools = [e for e in group if isinstance(e, dict)]
+                        first_ts = ""
+                        if tools:
+                            first_ts = str(tools[0].get("created_at", ""))
+                        completed_tool_call_groups.append(
+                            {
+                                "sequence": idx,
+                                "created_at": first_ts,
+                                "tools": tools,
+                            }
+                        )
         except json.JSONDecodeError:
             completed_tool_call_groups = []
     data["pending_questions"] = pending_questions
@@ -239,6 +259,67 @@ def _session_to_dict(session: Any) -> dict[str, Any]:
     data["active_tool_calls"] = active_tool_calls
     data["completed_tool_call_groups"] = completed_tool_call_groups
     return data
+
+
+def _coerce_stale_processing_payload(
+    *,
+    session: Any,
+    payload: dict[str, Any],
+    store: Store,
+) -> dict[str, Any]:
+    """Normalize stale runtime state when no live command exists.
+
+    If a command lease has expired, the session row can still indicate processing
+    with running tools. For read endpoints, reconcile that view by treating
+    lingering running tools as done and clearing active processing state.
+    """
+    live = store.get_live_running_planning_command(session.id)
+    if live is not None:
+        return payload
+
+    active_tools = payload.get("active_tool_calls")
+    normalized_active: list[dict[str, Any]] = []
+    had_running = False
+    if isinstance(active_tools, list):
+        for item in active_tools:
+            if not isinstance(item, dict):
+                continue
+            status = str(item.get("status", ""))
+            if status == "running":
+                had_running = True
+                normalized_active.append({**item, "status": "done"})
+            else:
+                normalized_active.append(item)
+
+    # Chat setup runs outside the registered command lease flow. During that
+    # window we still want readers to see "processing" so the setup UI renders.
+    is_chat_setup_phase = str(payload.get("status", "")) == "draft" and str(
+        payload.get("phase_message", "")
+    ).startswith("Preparing codebase memory")
+    should_clear_processing = had_running or (bool(payload.get("is_processing")) and not is_chat_setup_phase)
+    if should_clear_processing:
+        payload["is_processing"] = False
+        payload["phase_message"] = None
+
+    if had_running and normalized_active:
+        existing_groups = payload.get("completed_tool_call_groups")
+        groups: list[dict[str, Any]] = []
+        if isinstance(existing_groups, list):
+            groups = [g for g in existing_groups if isinstance(g, dict)]
+        next_seq = max((_to_int(group.get("sequence"), 0) for group in groups), default=0) + 1
+        groups.append(
+            {
+                "sequence": next_seq,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "tools": normalized_active,
+            }
+        )
+        payload["completed_tool_call_groups"] = groups
+        payload["active_tool_calls"] = []
+    else:
+        payload["active_tool_calls"] = normalized_active
+
+    return payload
 
 
 def _turn_to_dict(turn: Any) -> dict[str, Any]:
@@ -303,9 +384,9 @@ def create_app() -> FastAPI:
         return model_id
 
     COMMAND_MATRIX: dict[str, set[str]] = {
-        "draft": {"message", "reset"},
-        "refining": {"run_round", "reset", "message"},
-        "converged": {"run_round", "approve", "reset", "message"},
+        "draft": {"message", "reset", "export"},
+        "refining": {"run_round", "reset", "message", "export"},
+        "converged": {"run_round", "approve", "reset", "message", "export"},
         "approved": {"export", "reset"},
         "error": {"reset"},
     }
@@ -317,17 +398,22 @@ def create_app() -> FastAPI:
         return sorted(COMMAND_MATRIX.get(session.status, set()))
 
     def _build_session_snapshot(session_id: str, store: Store) -> dict[str, Any]:
+        store.fail_expired_running_planning_commands()
         session = store.get_planning_session(session_id)
         if session is None:
             raise ValueError("session not found")
         active = store.get_live_running_planning_command(session_id)
-        payload = _session_to_dict(session)
+        payload = _coerce_stale_processing_payload(
+            session=session,
+            payload=_session_to_dict(session),
+            store=store,
+        )
         return {
             "type": "session_state",
             "v": 1,
             "status": payload.get("status"),
             "phase_message": payload.get("phase_message"),
-            "is_processing": bool(active is not None),
+            "is_processing": bool(payload.get("is_processing")) if active is None else True,
             "current_round": int(payload.get("current_round", 0) or 0),
             "pending_questions": payload.get("pending_questions"),
             "active_tool_calls": payload.get("active_tool_calls", []),
@@ -460,11 +546,6 @@ def create_app() -> FastAPI:
                             "name": "prd.md",
                             "kind": "prd",
                             "url": f"/api/sessions/{ctx.session_id}/download/prd",
-                        },
-                        {
-                            "name": "rfc.md",
-                            "kind": "rfc",
-                            "url": f"/api/sessions/{ctx.session_id}/download/rfc",
                         },
                         {
                             "name": "conversation.md",
@@ -724,6 +805,18 @@ def create_app() -> FastAPI:
 
             # Chat session starts as draft; memory build runs in background, progress via SSE.
             async def emit_setup_event(event: dict[str, Any]) -> None:
+                event_type = str(event.get("type", ""))
+                if event_type == "setup_progress":
+                    logger.info(
+                        "api.sessions chat setup progress session_id={} step={}",
+                        session.id,
+                        str(event.get("step", "")),
+                    )
+                elif event_type == "discovery_ready":
+                    logger.info(
+                        "api.sessions chat setup event session_id={} type=discovery_ready",
+                        session.id,
+                    )
                 registry.note_event(session.id, event)
                 await emitter.emit(session.id, event)
 
@@ -735,11 +828,11 @@ def create_app() -> FastAPI:
                         event_callback=emit_setup_event,
                     )
                     logger.info(
-                        "api.sessions chat setup complete session_id=%s",
+                        "api.sessions chat setup complete session_id={}",
                         session.id,
                     )
                 except Exception as exc:  # noqa: BLE001
-                    logger.exception("api.sessions chat setup failed session_id=%s", session.id)
+                    logger.exception("api.sessions chat setup failed session_id={}", session.id)
                     await emit_setup_event({"type": "error", "message": str(exc)})
 
             asyncio.create_task(run_chat_setup())
@@ -768,20 +861,41 @@ def create_app() -> FastAPI:
         session = store.get_planning_session(session_id)
         if session is None:
             raise HTTPException(status_code=404, detail="session not found")
+        store.fail_expired_running_planning_commands()
+        session = store.get_planning_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="session not found")
+        session_payload = _coerce_stale_processing_payload(
+            session=session,
+            payload=_session_to_dict(session),
+            store=store,
+        )
         versions = store.get_plan_versions(session_id, limit=200)
         current_plan = versions[0] if versions else None
         timing = registry._session_timing.get(session_id)
         if lightweight:
             return {
-                "session": _session_to_dict(session),
+                "session": session_payload,
                 "current_plan": _version_to_dict(current_plan) if current_plan else None,
                 "draft_timing": timing,
             }
         turns = store.get_planning_turns(session_id)
         round_metrics_rows = store.get_round_metrics(session_id)
         score_by_round = {v.round: v.convergence_score for v in versions}  # O(n) lookup
+        issue_graph_summary: dict[str, Any] | None = None
+        try:
+            _, _, runtime = _runtime_for(repo_name=session.repo_name)
+            snapshot_payload = runtime.read_state_snapshot(session_id)
+            if isinstance(snapshot_payload, dict):
+                graph = snapshot_payload.get("issue_graph")
+                if isinstance(graph, dict):
+                    summary = graph.get("summary")
+                    if isinstance(summary, dict):
+                        issue_graph_summary = summary
+        except Exception:  # noqa: BLE001
+            issue_graph_summary = None
         return {
-            "session": _session_to_dict(session),
+            "session": session_payload,
             "conversation": [_turn_to_dict(t) for t in turns],
             "plan_versions": [_version_to_dict(v) for v in versions],
             "current_plan": _version_to_dict(current_plan) if current_plan else None,
@@ -794,6 +908,7 @@ def create_app() -> FastAPI:
                     "critic_confidence": m.critic_confidence,
                     "convergence_score": score_by_round.get(m.round),
                     "call_cost_usd": m.call_cost_usd,
+                    "issue_graph_summary": issue_graph_summary,
                 }
                 for m in round_metrics_rows
             ],
@@ -805,6 +920,23 @@ def create_app() -> FastAPI:
                 ][:20]
             },
         }
+
+    @app.get("/api/sessions/{session_id}/snapshot")
+    async def get_session_snapshot(
+        session_id: str,
+        repo: Optional[str] = Query(default=None),
+    ) -> dict[str, Any]:
+        repo_name = _repo_for_session(session_id, repo)
+        _, _, runtime = _runtime_for(repo_name=repo_name)
+        payload = runtime.read_state_snapshot(session_id)
+        if payload is None:
+            raise HTTPException(status_code=404, detail="snapshot not found")
+        return {"snapshot": payload}
+
+    @app.get("/api/snapshots")
+    async def list_session_snapshots(repo: Optional[str] = Query(default=None)) -> dict[str, Any]:
+        _, _, runtime = _runtime_for(repo_name=repo)
+        return {"items": runtime.list_state_snapshots()}
 
     @app.delete("/api/sessions/{session_id}")
     async def delete_session(session_id: str, repo: Optional[str] = Query(default=None)) -> dict[str, Any]:
@@ -978,6 +1110,6 @@ def create_app() -> FastAPI:
                 for runtime in registry._runtimes.values():
                     runtime.abort_clarification(session_id)
 
-        return EventSourceResponse(event_generator())
+        return EventSourceResponse(event_generator(), ping=20)
 
     return app

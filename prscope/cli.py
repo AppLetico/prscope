@@ -5,7 +5,7 @@ Commands:
     init      - Initialize Prscope in current repository
     profile   - Scan and profile local codebase
     upstream  - Upstream sync/evaluate/history utilities
-    plan      - Interactive planning (PRD + RFC generation)
+    plan      - Interactive planning (plan generation)
     repos     - Repo profile management
 """
 
@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import platform
+import shlex
 import shutil
 import subprocess
 import sys
@@ -98,10 +100,15 @@ upstream_eval:
   temperature: 0.2       # Lower = more consistent decisions
   max_tokens: 3000
 
-# Planning mode configuration (PRD + RFC generation)
+# Planning mode configuration (plan generation)
 planning:
   author_model: gpt-4o
   critic_model: claude-3-5-sonnet-20241022
+  issue_dedupe:
+    embeddings_enabled: auto
+    embedding_model: text-embedding-3-small
+    similarity_threshold: 0.82
+    fallback_mode: lexical
   max_adversarial_rounds: 10
   convergence_threshold: 0.05
   output_dir: ./plans
@@ -916,6 +923,77 @@ def _open_web_session(session_id: str, host: str = DEFAULT_HOST, port: int = DEF
     webbrowser.open(f"{base_url}/sessions/{session_id}")
 
 
+def _open_dev_in_separate_terminals(
+    host: str,
+    port: int,
+    repo_name: str | None,
+    repo_root: str | None,
+) -> None:
+    if platform.system() != "Darwin":
+        raise click.ClickException("--separate-terminals is currently supported on macOS only.")
+
+    workspace_root = Path(repo_root).expanduser().resolve() if repo_root else Path(__file__).resolve().parents[1]
+    frontend_dir = Path(__file__).parent / "web" / "frontend"
+    if not frontend_dir.exists():
+        raise click.ClickException(f"Frontend directory not found: {frontend_dir}")
+
+    python_bin = shlex.quote(sys.executable)
+    backend_command = (
+        f"cd {shlex.quote(str(workspace_root))} && "
+        f"{python_bin} -m prscope.cli web --host {shlex.quote(host)} --port {port}"
+    )
+    if repo_name:
+        backend_command += f" --repo {shlex.quote(repo_name)}"
+    backend_command += f" --repo-root {shlex.quote(str(workspace_root))}"
+
+    frontend_command = f"cd {shlex.quote(str(frontend_dir))} && npm run dev"
+
+    subprocess.run(["osascript", "-e", 'tell application "Terminal" to activate'], check=True)
+    subprocess.run(["osascript", "-e", f'tell application "Terminal" to do script "{backend_command}"'], check=True)
+    subprocess.run(["osascript", "-e", f'tell application "Terminal" to do script "{frontend_command}"'], check=True)
+
+
+def _open_dev_in_terminal_tabs(
+    host: str,
+    port: int,
+    repo_name: str | None,
+    repo_root: str | None,
+) -> None:
+    if platform.system() != "Darwin":
+        raise click.ClickException("--terminal-tabs is currently supported on macOS only.")
+
+    workspace_root = Path(repo_root).expanduser().resolve() if repo_root else Path(__file__).resolve().parents[1]
+    frontend_dir = Path(__file__).parent / "web" / "frontend"
+    if not frontend_dir.exists():
+        raise click.ClickException(f"Frontend directory not found: {frontend_dir}")
+
+    python_bin = shlex.quote(sys.executable)
+    backend_command = (
+        f"cd {shlex.quote(str(workspace_root))} && "
+        f"{python_bin} -m prscope.cli web --host {shlex.quote(host)} --port {port}"
+    )
+    if repo_name:
+        backend_command += f" --repo {shlex.quote(repo_name)}"
+    backend_command += f" --repo-root {shlex.quote(str(workspace_root))}"
+    frontend_command = f"cd {shlex.quote(str(frontend_dir))} && npm run dev"
+
+    script_lines = [
+        'tell application "Terminal"',
+        "activate",
+        "if not (exists front window) then reopen",
+        "set targetWindow to front window",
+        "set backendTab to selected tab of targetWindow",
+        f'do script "{backend_command}" in backendTab',
+        "delay 0.2",
+        'set frontendTab to (do script "" in targetWindow)',
+        "delay 0.2",
+        f'do script "{frontend_command}" in frontendTab',
+        "end tell",
+    ]
+    script = "\n".join(script_lines)
+    subprocess.run(["osascript", "-e", script], check=True)
+
+
 @main.group(name="repos")
 def repos_group() -> None:
     """Repository profile utilities."""
@@ -1122,6 +1200,10 @@ def plan_round(session_id: str, repo_name: str | None, user_input: str | None) -
 
 @main.command("web")
 @click.option("--dev", is_flag=True, help="Run frontend Vite dev server with backend")
+@click.option("--separate-terminals", is_flag=True, help="Open backend + frontend in separate terminal windows (macOS)")
+@click.option(
+    "--terminal-tabs", is_flag=True, help="Open backend + frontend in one Terminal window as two tabs (macOS)"
+)
 @click.option("--host", default=DEFAULT_HOST, show_default=True)
 @click.option("--port", default=DEFAULT_PORT, show_default=True, type=int)
 @click.option("--resume", "resume_session_id", default=None, help="Open specific session ID")
@@ -1130,6 +1212,8 @@ def plan_round(session_id: str, repo_name: str | None, user_input: str | None) -
 @click.option("--background", "-b", is_flag=True, help="Detach server to background")
 def run_web(
     dev: bool,
+    separate_terminals: bool,
+    terminal_tabs: bool,
     host: str,
     port: int,
     resume_session_id: str | None,
@@ -1145,6 +1229,22 @@ def run_web(
 
     base_url = f"http://{host}:{port}"
     repo_query = f"?repo={repo_name}" if repo_name else ""
+
+    if separate_terminals and not dev:
+        raise click.ClickException("--separate-terminals requires --dev.")
+    if terminal_tabs and not dev:
+        raise click.ClickException("--terminal-tabs requires --dev.")
+    if separate_terminals and terminal_tabs:
+        raise click.ClickException("Choose only one of --separate-terminals or --terminal-tabs.")
+
+    if separate_terminals:
+        _open_dev_in_separate_terminals(host=host, port=port, repo_name=repo_name, repo_root=repo_root)
+        click.echo("Opened backend and frontend in separate terminal windows.")
+        return
+    if terminal_tabs:
+        _open_dev_in_terminal_tabs(host=host, port=port, repo_name=repo_name, repo_root=repo_root)
+        click.echo("Opened backend and frontend in one Terminal window with two tabs.")
+        return
 
     if dev:
         _, base_url = ensure_server_running(host=host, port=port, open_browser=False)
@@ -1208,12 +1308,12 @@ def plan_list(repo_name: str | None) -> None:
 @click.argument("session_id")
 @click.option("--repo", "repo_name", help="Repo profile name")
 def plan_export(session_id: str, repo_name: str | None) -> None:
-    """Export PRD and RFC markdown files."""
+    """Export plan markdown file."""
     _, store, runtime = _load_planning_runtime(repo_name)
     if store.get_planning_session(session_id) is None:
         raise click.ClickException(f"Session not found: {session_id}")
     paths = runtime.export(session_id)
-    click.echo(f"Exported:\n- {paths['prd']}\n- {paths['rfc']}\n- {paths['conversation']}")
+    click.echo(f"Exported:\n- {paths['prd']}\n- {paths['conversation']}")
 
 
 @plan_group.command("diff")
@@ -1436,10 +1536,13 @@ def plan_reset(repo_name: str | None, yes: bool) -> None:
         return
 
     store = Store()
-    total_sessions = 0
-    for repo in repos:
-        sessions = store.list_planning_sessions(repo_name=repo.name, limit=10_000)
-        total_sessions += len(sessions)
+    if repo_name:
+        target_sessions = store.list_planning_sessions(repo_name=repo_name, limit=10_000)
+    else:
+        # True blank-slate reset should clear every session row, including
+        # historical/test repo names that are no longer configured.
+        target_sessions = store.list_planning_sessions(limit=10_000)
+    total_sessions = len(target_sessions)
 
     scope = f"repo '{repo_name}'" if repo_name else f"all {len(repos)} repo(s)"
     click.echo(f"Reset {scope}:")
@@ -1449,12 +1552,20 @@ def plan_reset(repo_name: str | None, yes: bool) -> None:
     if not yes:
         click.confirm("Continue?", abort=True)
 
-    for repo in repos:
-        sessions = store.list_planning_sessions(repo_name=repo.name, limit=10_000)
-        _delete_session_cache(sessions, repo.name, config)
-        store.delete_all_planning_sessions(repo_name=repo.name)
-        _clear_repo_planning_cache(repo)
-        click.echo(f"  Reset {repo.name}.")
+    if repo_name:
+        for repo in repos:
+            sessions = store.list_planning_sessions(repo_name=repo.name, limit=10_000)
+            _delete_session_cache(sessions, repo.name, config)
+            store.delete_all_planning_sessions(repo_name=repo.name)
+            _clear_repo_planning_cache(repo)
+            click.echo(f"  Reset {repo.name}.")
+    else:
+        _delete_session_cache(target_sessions, repo_name=None, config=config)
+        deleted = store.delete_all_planning_sessions()
+        for repo in repos:
+            _clear_repo_planning_cache(repo)
+            click.echo(f"  Reset {repo.name}.")
+        click.echo(f"  Deleted {deleted} session row(s) across all repo names.")
 
     click.echo("Reset complete. You can test from scratch.")
 

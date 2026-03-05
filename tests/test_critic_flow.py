@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -7,7 +8,7 @@ import pytest
 
 from prscope.config import PlanningConfig, RepoProfile
 from prscope.memory import ParsedConstraint
-from prscope.planning.runtime.critic import CriticAgent
+from prscope.planning.runtime.critic import CriticAgent, ImplementabilityResult
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -32,33 +33,39 @@ def _make_agent(tmp_path: Path) -> CriticAgent:
     return CriticAgent(config=PlanningConfig(critic_model="gpt-4o-mini"), repo=repo)
 
 
-def _critic_json(violations: list[str], major: int = 1) -> str:
-    ids = ", ".join(f'"{v}"' for v in violations)
-    return (
-        f'{{"major_issues_remaining":{major},"minor_issues_remaining":0,'
-        f'"hard_constraint_violations":[{ids}],'
-        '"critique_complete":false,"failure_modes":[],'
-        '"design_tradeoff_risks":[],"unsupported_claims":[],'
-        '"missing_evidence":[],"critic_confidence":0.5,'
-        '"operational_readiness":false,"clarification_questions":[]}}'
-    )
+def _review_json(
+    *,
+    score: float = 7.5,
+    confidence: str = "medium",
+    include_optional: bool = True,
+) -> str:
+    payload: dict[str, object] = {
+        "strengths": ["Clear decomposition"],
+        "architectural_concerns": ["Coupling in orchestration"],
+        "risks": ["Retry storm under partial failure"],
+        "simplification_opportunities": ["Merge two persistence layers"],
+        "blocking_issues": ["No rollback guard for schema migration"],
+        "reviewer_questions": ["How is idempotency guaranteed?"],
+        "recommended_changes": ["Add migration rollback playbook"],
+        "design_quality_score": score,
+        "confidence": confidence,
+        "review_complete": False,
+        "resolved_issues": [],
+    }
+    if include_optional:
+        payload["simplest_possible_design"] = "Single orchestrator with derived state"
+        payload["primary_issue"] = "Missing rollback strategy"
+    return json.dumps(payload)
 
 
 @pytest.mark.asyncio
-async def test_critic_tolerates_unknown_ids_when_no_constraints(tmp_path):
+async def test_run_critic_parses_new_review_schema(tmp_path):
     repo = RepoProfile(name="alpha", path=str(Path(tmp_path)))
     agent = CriticAgent(config=PlanningConfig(critic_model="gpt-4o-mini"), repo=repo)
 
     def fake_llm_call(messages, temperature, model_override=None):
         del messages, temperature, model_override
-        raw = (
-            '{"major_issues_remaining":1,"minor_issues_remaining":0,'
-            '"hard_constraint_violations":["HARD_CONSTRAINT_001"],'
-            '"critique_complete":false,"failure_modes":[],'
-            '"design_tradeoff_risks":[],"unsupported_claims":[],'
-            '"missing_evidence":[],"critic_confidence":0.5,'
-            '"operational_readiness":false,"clarification_questions":[]}'
-        )
+        raw = _review_json() + "\nStrong design direction, but rollout needs hardening."
         return raw, SimpleNamespace(usage=None), "gpt-4o-mini"
 
     agent._llm_call = fake_llm_call  # type: ignore[method-assign]
@@ -69,24 +76,21 @@ async def test_critic_tolerates_unknown_ids_when_no_constraints(tmp_path):
         architecture="A",
         constraints=[],
     )
-    assert result.hard_constraint_violations == []
+    assert result.parse_error is None
+    assert result.design_quality_score == 7.5
+    assert result.confidence == "medium"
+    assert result.primary_issue == "Missing rollback strategy"
+    assert result.prose == "Strong design direction, but rollout needs hardening."
 
 
 @pytest.mark.asyncio
-async def test_critic_keeps_strict_unknown_id_validation_with_known_ids(tmp_path):
+async def test_run_critic_defaults_optional_fields_to_none(tmp_path):
     repo = RepoProfile(name="alpha", path=str(Path(tmp_path)))
     agent = CriticAgent(config=PlanningConfig(critic_model="gpt-4o-mini"), repo=repo)
 
     def fake_llm_call(messages, temperature, model_override=None):
         del messages, temperature, model_override
-        raw = (
-            '{"major_issues_remaining":1,"minor_issues_remaining":0,'
-            '"hard_constraint_violations":["UNKNOWN_ID"],'
-            '"critique_complete":false,"failure_modes":[],'
-            '"design_tradeoff_risks":[],"unsupported_claims":[],'
-            '"missing_evidence":[],"critic_confidence":0.5,'
-            '"operational_readiness":false,"clarification_questions":[]}'
-        )
+        raw = _review_json(include_optional=False)
         return raw, SimpleNamespace(usage=None), "gpt-4o-mini"
 
     agent._llm_call = fake_llm_call  # type: ignore[method-assign]
@@ -98,24 +102,19 @@ async def test_critic_keeps_strict_unknown_id_validation_with_known_ids(tmp_path
         constraints=[ParsedConstraint(id="HARD_CONSTRAINT_001", text="T", severity="hard", optional=False)],
         max_retries=0,
     )
-    assert result.parse_error is not None
+    assert result.parse_error is None
+    assert result.simplest_possible_design is None
+    assert result.primary_issue is None
 
 
 @pytest.mark.asyncio
-async def test_critic_accepts_object_style_constraint_violations(tmp_path):
+async def test_run_critic_normalizes_confidence_to_lowercase(tmp_path):
     repo = RepoProfile(name="alpha", path=str(Path(tmp_path)))
     agent = CriticAgent(config=PlanningConfig(critic_model="gpt-4o-mini"), repo=repo)
 
     def fake_llm_call(messages, temperature, model_override=None):
         del messages, temperature, model_override
-        raw = (
-            '{"major_issues_remaining":1,"minor_issues_remaining":0,'
-            '"hard_constraint_violations":[{"constraint_id":"HARD_CONSTRAINT_001","evidence":"`api_key` in config"}],'
-            '"critique_complete":false,"failure_modes":[],'
-            '"design_tradeoff_risks":[],"unsupported_claims":[],'
-            '"missing_evidence":[],"critic_confidence":0.5,'
-            '"operational_readiness":false,"clarification_questions":[]}'
-        )
+        raw = _review_json(confidence="HIGH")
         return raw, SimpleNamespace(usage=None), "gpt-4o-mini"
 
     agent._llm_call = fake_llm_call  # type: ignore[method-assign]
@@ -128,24 +127,19 @@ async def test_critic_accepts_object_style_constraint_violations(tmp_path):
         max_retries=0,
     )
     assert result.parse_error is None
-    assert result.hard_constraint_violations == ["HARD_CONSTRAINT_001"]
+    assert result.confidence == "high"
 
 
 @pytest.mark.asyncio
-async def test_critic_rejects_object_violation_without_constraint_id(tmp_path):
+async def test_run_critic_returns_parse_error_on_missing_required_field(tmp_path):
     repo = RepoProfile(name="alpha", path=str(Path(tmp_path)))
     agent = CriticAgent(config=PlanningConfig(critic_model="gpt-4o-mini"), repo=repo)
 
     def fake_llm_call(messages, temperature, model_override=None):
         del messages, temperature, model_override
-        raw = (
-            '{"major_issues_remaining":1,"minor_issues_remaining":0,'
-            '"hard_constraint_violations":[{"evidence":"missing id"}],'
-            '"critique_complete":false,"failure_modes":[],'
-            '"design_tradeoff_risks":[],"unsupported_claims":[],'
-            '"missing_evidence":[],"critic_confidence":0.5,'
-            '"operational_readiness":false,"clarification_questions":[]}'
-        )
+        payload = json.loads(_review_json())
+        del payload["strengths"]
+        raw = json.dumps(payload)
         return raw, SimpleNamespace(usage=None), "gpt-4o-mini"
 
     agent._llm_call = fake_llm_call  # type: ignore[method-assign]
@@ -158,21 +152,16 @@ async def test_critic_rejects_object_violation_without_constraint_id(tmp_path):
         max_retries=0,
     )
     assert result.parse_error is not None
-
-
-# ---------------------------------------------------------------------------
-# Evidence-gate filter tests
-# ---------------------------------------------------------------------------
+    assert "Missing required field: strengths" in result.parse_error
 
 
 @pytest.mark.asyncio
-async def test_filter_suppresses_violation_when_no_evidence_in_plan(tmp_path):
-    """Violation with evidence_keywords but no matching text in plan → suppressed."""
+async def test_run_critic_returns_parse_error_on_out_of_range_score(tmp_path):
     agent = _make_agent(tmp_path)
 
     def fake_llm_call(messages, temperature, model_override=None):
         del messages, temperature, model_override
-        return _critic_json(["HARD_CONSTRAINT_001"]), SimpleNamespace(usage=None), "gpt-4o-mini"
+        return _review_json(score=10.5), SimpleNamespace(usage=None), "gpt-4o-mini"
 
     agent._llm_call = fake_llm_call  # type: ignore[method-assign]
     result = await agent.run_critic(
@@ -181,113 +170,40 @@ async def test_filter_suppresses_violation_when_no_evidence_in_plan(tmp_path):
         manifesto="M",
         architecture="A",
         constraints=[_HC001],
-        session_id="s1",
-        round_number=1,
+        max_retries=0,
     )
-    assert result.hard_constraint_violations == []
-    assert result.suppressed_violations == ["HARD_CONSTRAINT_001"]
-    assert result.major_issues_remaining == 0
+    assert result.parse_error is not None
+    assert "design_quality_score must be in [0,10]" in result.parse_error
 
 
 @pytest.mark.asyncio
-async def test_filter_keeps_violation_when_keyword_found_in_plan(tmp_path):
-    """Violation with a matching evidence keyword in plan text → kept."""
+async def test_run_design_review_implementability_mode_parses_contract(tmp_path):
     agent = _make_agent(tmp_path)
 
     def fake_llm_call(messages, temperature, model_override=None):
         del messages, temperature, model_override
-        return _critic_json(["HARD_CONSTRAINT_001"]), SimpleNamespace(usage=None), "gpt-4o-mini"
-
-    agent._llm_call = fake_llm_call  # type: ignore[method-assign]
-    result = await agent.run_critic(
-        requirements="R",
-        plan_content='Store api_key = "sk-..." in config.py',
-        manifesto="M",
-        architecture="A",
-        constraints=[_HC001],
-        session_id="s1",
-        round_number=1,
-    )
-    assert "HARD_CONSTRAINT_001" in result.hard_constraint_violations
-    assert result.suppressed_violations == []
-
-
-@pytest.mark.asyncio
-async def test_filter_passes_through_unknown_constraint_id(tmp_path):
-    """Custom constraint with no evidence_keywords → always kept (safe default)."""
-    agent = _make_agent(tmp_path)
-    custom = ParsedConstraint(id="MY_CONSTRAINT_XYZ", text="Custom rule.", severity="hard")
-
-    def fake_llm_call(messages, temperature, model_override=None):
-        del messages, temperature, model_override
-        return _critic_json(["MY_CONSTRAINT_XYZ"]), SimpleNamespace(usage=None), "gpt-4o-mini"
-
-    agent._llm_call = fake_llm_call  # type: ignore[method-assign]
-    result = await agent.run_critic(
-        requirements="R",
-        plan_content="Some plan without matching keywords.",
-        manifesto="M",
-        architecture="A",
-        constraints=[custom],
-        session_id="s1",
-        round_number=1,
-    )
-    assert "MY_CONSTRAINT_XYZ" in result.hard_constraint_violations
-    assert result.suppressed_violations == []
-
-
-@pytest.mark.asyncio
-async def test_filter_mixed_violations_keeps_evidenced_suppresses_other(tmp_path):
-    """HC001 evidenced (api_key in plan), HC002 not evidenced → HC001 kept, HC002 suppressed."""
-    agent = _make_agent(tmp_path)
-
-    def fake_llm_call(messages, temperature, model_override=None):
-        del messages, temperature, model_override
+        payload = {
+            "implementable": True,
+            "missing_details": [],
+            "implementation_risks": ["Edge case in retry sequencing"],
+            "suggested_additions": ["Add idempotency note to execution_flow"],
+        }
         return (
-            _critic_json(["HARD_CONSTRAINT_001", "HARD_CONSTRAINT_002"], major=2),
+            json.dumps(payload) + "\nImplementation-ready with minor caveats.",
             SimpleNamespace(usage=None),
             "gpt-4o-mini",
         )
 
     agent._llm_call = fake_llm_call  # type: ignore[method-assign]
-    result = await agent.run_critic(
+    result = await agent.run_design_review(
         requirements="R",
-        plan_content='Store api_key = "sk-..." in config.py',
-        manifesto="M",
-        architecture="A",
-        constraints=[_HC001, _HC002],
-        session_id="s1",
-        round_number=2,
-    )
-    assert result.hard_constraint_violations == ["HARD_CONSTRAINT_001"]
-    assert result.suppressed_violations == ["HARD_CONSTRAINT_002"]
-    # major_issues_remaining is NOT zeroed — HC001 is real, so LLM count is left intact
-    assert result.major_issues_remaining == 2
-
-
-@pytest.mark.asyncio
-async def test_filter_quoted_evidence_override(tmp_path):
-    """No keyword in plan text, but LLM prose quotes `api_key` in backticks → kept."""
-    agent = _make_agent(tmp_path)
-
-    def fake_llm_call(messages, temperature, model_override=None):
-        del messages, temperature, model_override
-        # Plan has no keyword, but prose contains a backtick-quoted api_key reference.
-        raw = (
-            _critic_json(["HARD_CONSTRAINT_001"])
-            + "\nThe plan at step 3 stores `api_key` in the config which violates the constraint."
-        )
-        return raw, SimpleNamespace(usage=None), "gpt-4o-mini"
-
-    agent._llm_call = fake_llm_call  # type: ignore[method-assign]
-    result = await agent.run_critic(
-        requirements="R",
-        plan_content="Add a public /health endpoint. No credentials involved.",
+        plan_content="P",
         manifesto="M",
         architecture="A",
         constraints=[_HC001],
-        session_id="s1",
-        round_number=3,
+        mode="implementability",
     )
-    assert "HARD_CONSTRAINT_001" in result.hard_constraint_violations
-    assert result.suppressed_violations == []
+    assert isinstance(result, ImplementabilityResult)
+    assert result.parse_error is None
+    assert result.implementable is True
+    assert result.implementation_risks == ["Edge case in retry sequencing"]

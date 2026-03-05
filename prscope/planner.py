@@ -35,9 +35,9 @@ class PlanningEngine:
                 "change_pct": convergence.change_pct,
             },
             "critic": {
-                "major_issues_remaining": critic.major_issues_remaining,
-                "minor_issues_remaining": critic.minor_issues_remaining,
-                "hard_constraint_violations": critic.hard_constraint_violations,
+                "blocking_issues": critic.blocking_issues,
+                "architectural_concerns": critic.architectural_concerns,
+                "design_quality_score": critic.design_quality_score,
             },
         }
 

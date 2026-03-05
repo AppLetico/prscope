@@ -20,7 +20,7 @@ export interface PlanningSession {
   phase_message?: string | null;
   is_processing?: boolean;
   active_tool_calls?: ToolCallEntry[];
-  completed_tool_call_groups?: ToolCallEntry[][];
+  completed_tool_call_groups?: ToolCallGroup[];
   created_at: string;
   updated_at: string;
   session_total_cost_usd?: number | null;
@@ -38,6 +38,7 @@ export interface PlanningTurn {
   hard_constraint_violations?: string[] | null;
   parse_error?: string | null;
   created_at: string;
+  sequence?: number;
 }
 
 export interface PlanVersion {
@@ -79,12 +80,20 @@ export interface ClarificationPrompt {
 
 export interface ToolCallEntry {
   id: number | string;
+  call_id?: string;
   name: string;
   sessionStage?: string;
   path?: string;
   query?: string;
   status: "running" | "done";
   durationMs?: number;
+  created_at?: string;
+}
+
+export interface ToolCallGroup {
+  sequence: number;
+  created_at: string;
+  tools: ToolCallEntry[];
 }
 
 export interface RoundMetric {
@@ -94,6 +103,62 @@ export interface RoundMetric {
   critic_confidence?: number | null;
   convergence_score?: number | null;
   call_cost_usd?: number | null;
+  issue_graph_summary?: {
+    open_total: number;
+    root_open: number;
+    resolved_total: number;
+    unresolved_dependency_chains?: number;
+  } | null;
+}
+
+export interface SessionSnapshotSummary {
+  session_id: string;
+  updated_at: string;
+  path: string;
+}
+
+export interface IssueGraphNode {
+  id: string;
+  description: string;
+  status: "open" | "resolved";
+  raised_round: number;
+  resolved_round?: number | null;
+  severity?: "major" | "minor" | "info";
+  source?: "critic" | "validation" | "inference";
+}
+
+export interface IssueGraphEdge {
+  source: string;
+  target: string;
+  relation: "causes" | "depends_on" | "duplicate";
+}
+
+export interface IssueGraphSnapshot {
+  nodes: IssueGraphNode[];
+  edges: IssueGraphEdge[];
+  duplicate_alias?: Record<string, string>;
+  summary?: {
+    open_total?: number;
+    root_open?: number;
+    resolved_total?: number;
+    open_major?: number;
+    open_minor?: number;
+    open_info?: number;
+    unresolved_dependency_chains?: number;
+  };
+}
+
+export interface SessionStateSnapshot {
+  session_id: string;
+  updated_at: string;
+  open_issues?: Array<{ id: string; description: string; status: string }>;
+  issue_graph?: IssueGraphSnapshot | null;
+  constraint_eval?: { constraint_violations?: string[] } | null;
+  author_prompt_tokens?: number;
+  author_completion_tokens?: number;
+  critic_prompt_tokens?: number;
+  critic_completion_tokens?: number;
+  round_cost_usd?: number;
 }
 
 export interface ModelCatalogItem {
@@ -110,7 +175,9 @@ export interface RepoProfileSummary {
   path: string;
 }
 
-export type UIEvent =
+export type UIEventBase = { session_version?: number };
+
+export type UIEvent = UIEventBase & (
   | { type: "thinking"; message: string }
   | {
       type: "session_state";
@@ -121,24 +188,10 @@ export type UIEvent =
       current_round: number;
       pending_questions: DiscoveryQuestion[] | null;
       active_tool_calls: ToolCallEntry[];
-      completed_tool_call_groups: ToolCallEntry[][];
+      completed_tool_call_groups: ToolCallGroup[];
       active_command_id?: string | null;
     }
-  | {
-      type: "tool_call";
-      name: string;
-      path?: string;
-      query?: string;
-      session_stage?: string;
-      command_id?: string;
-    }
-  | {
-      type: "tool_result";
-      name: string;
-      session_stage?: string;
-      duration_ms?: number;
-      command_id?: string;
-    }
+  | { type: "tool_update"; tool: ToolCallEntry }
   | {
       type: "context_compaction";
       enabled: boolean;
@@ -167,4 +220,5 @@ export type UIEvent =
       recommendations?: string[];
     }
   | { type: "setup_progress"; step: string }
-  | { type: "discovery_ready"; opening: string };
+  | { type: "discovery_ready"; opening: string }
+);

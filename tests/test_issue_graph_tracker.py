@@ -1,0 +1,120 @@
+from __future__ import annotations
+
+from prscope.config import IssueDedupeConfig, IssueGraphConfig
+from prscope.planning.runtime.critic import ReviewResult
+from prscope.planning.runtime.review import IssueCausalityExtractor, IssueGraphTracker, IssueSimilarityService
+
+
+def _tracker() -> IssueGraphTracker:
+    similarity = IssueSimilarityService(
+        IssueDedupeConfig(
+            embeddings_enabled="false",
+            embedding_model="unused",
+            similarity_threshold=0.95,
+            fallback_mode="none",
+        )
+    )
+    return IssueGraphTracker(similarity=similarity, max_nodes=50, max_edges=100)
+
+
+def _review(*, prose: str) -> ReviewResult:
+    return ReviewResult(
+        strengths=[],
+        architectural_concerns=[],
+        risks=[],
+        simplification_opportunities=[],
+        blocking_issues=[],
+        reviewer_questions=[],
+        recommended_changes=[],
+        design_quality_score=7.0,
+        confidence="medium",
+        review_complete=False,
+        simplest_possible_design=None,
+        primary_issue=None,
+        resolved_issues=[],
+        constraint_violations=[],
+        issue_priority=[],
+        prose=prose,
+    )
+
+
+def test_canonicalization_applies_to_add_edge_and_resolve():
+    tracker = _tracker()
+    root = tracker.add_issue("Architecture layering violation", 1, preferred_id="issue_1")
+    child = tracker.add_issue("Module dependency cycle", 1, preferred_id="issue_2")
+    tracker.alias_duplicate("issue_alias_1", root.id)
+    tracker.add_edge("issue_alias_1", child.id, "causes")
+
+    snapshot = tracker.graph_snapshot()
+    assert snapshot["edges"] == [{"source": "issue_1", "target": "issue_2", "relation": "causes"}]
+
+    tracker.resolve_issue("issue_alias_1", 2)
+    open_ids = [issue.id for issue in tracker.open_issues()]
+    assert "issue_1" not in open_ids
+    assert "issue_2" not in open_ids
+
+
+def test_resolution_propagation_uses_causes_and_dependency_gate():
+    tracker = _tracker()
+    a = tracker.add_issue("Architecture issue", 1, preferred_id="issue_1")
+    b = tracker.add_issue("Layering issue", 1, preferred_id="issue_2")
+    c = tracker.add_issue("Testing blocked", 1, preferred_id="issue_3")
+    d = tracker.add_issue("Dependency fix required", 1, preferred_id="issue_4")
+
+    tracker.add_edge(a.id, c.id, "causes")
+    tracker.add_edge(b.id, c.id, "causes")
+    tracker.add_edge(c.id, d.id, "depends_on")
+
+    tracker.resolve_issue(a.id, 2)
+    assert any(issue.id == c.id for issue in tracker.open_issues())
+
+    tracker.resolve_issue(b.id, 2)
+    assert any(issue.id == c.id for issue in tracker.open_issues())
+
+    tracker.resolve_issue(d.id, 3)
+    tracker.resolve_issue(b.id, 3)
+    assert all(issue.id != c.id for issue in tracker.open_issues())
+
+
+def test_root_open_excludes_dependency_edges():
+    tracker = _tracker()
+    a = tracker.add_issue("Architecture issue", 1, preferred_id="issue_1")
+    b = tracker.add_issue("Testing issue", 1, preferred_id="issue_2")
+    tracker.add_edge(b.id, a.id, "depends_on")
+
+    roots = {issue.id for issue in tracker.root_open_issues()}
+    assert roots == {"issue_1", "issue_2"}
+
+
+def test_unresolved_dependency_chain_count():
+    tracker = _tracker()
+    a = tracker.add_issue("Root issue", 1, preferred_id="issue_1")
+    b = tracker.add_issue("Derived issue", 1, preferred_id="issue_2")
+    tracker.add_edge(b.id, a.id, "depends_on")
+    assert tracker.unresolved_dependency_chains() == 1
+    tracker.resolve_issue(a.id, 2)
+    assert tracker.unresolved_dependency_chains() == 0
+
+
+def test_graph_snapshot_includes_duplicate_alias():
+    tracker = _tracker()
+    root = tracker.add_issue("Root issue", 1, preferred_id="issue_1")
+    tracker.alias_duplicate("issue_alias_9", root.id)
+    snapshot = tracker.graph_snapshot()
+    assert snapshot["duplicate_alias"] == {"issue_alias_9": "issue_1"}
+
+
+def test_causality_extractor_adds_causal_edges_with_guardrails():
+    tracker = _tracker()
+    graph_config = IssueGraphConfig(
+        causality_extraction_enabled=True,
+        causality_max_edges_per_review=4,
+        causality_min_text_len=12,
+    )
+    extractor = IssueCausalityExtractor(graph_config)
+    review = _review(prose=("Testing fails because architecture violates layering boundaries. This leads to issues."))
+    result = extractor.extract_edges(graph=tracker, review=review, round_number=1)
+    snapshot = tracker.graph_snapshot()
+    assert result.accepted_edges == 1
+    assert len(snapshot["edges"]) == 1
+    assert snapshot["edges"][0]["relation"] == "causes"

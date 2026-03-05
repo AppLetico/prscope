@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "prscope"
 version = "0.1.0"
-description = "Planning-first PR intelligence with adversarial PRD/RFC generation"
+description = "Planning-first PR intelligence with adversarial plan generation"
 readme = "README.md"
 requires-python = ">=3.9"
 license = "MIT"

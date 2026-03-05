@@ -53,9 +53,15 @@ The `planning/` package has its own internal layering:
 ```
 planning/runtime/orchestration.py   ← top: wires everything together
     ↓
-planning/runtime/{discovery,author,critic,clarification,compression,round_controller}.py
+planning/runtime/{discovery,author,critic,round_controller,state}.py
     ↓
-planning/runtime/{tools,budget,telemetry,analytics_emitter}.py  ← leaf utilities
+planning/runtime/authoring/{models,discovery,validation,repair}.py
+    ↓
+planning/runtime/transport/{llm_client}.py
+    ↓
+planning/runtime/{tools,budget,telemetry}.py  ← leaf utilities
+    ↓
+planning/runtime/{context/*,events/*,pipeline/*,review/*}
     ↓
 planning/{core,executor,render}.py  ← planning kernel
     ↓
@@ -63,7 +69,7 @@ planning/scanners/*                 ← codebase scanning backends
 ```
 
 - `orchestration.py` is the only module that imports broadly across runtime.
-- `tools.py`, `budget.py`, `telemetry.py`, `analytics_emitter.py` are leaf modules with no prscope imports (or only Foundation imports).
+- `tools.py`, `budget.py`, `telemetry.py`, and `transport/llm_client.py` are leaf modules with no imports from orchestration.
 - `core.py` and `executor.py` import from Storage and Foundation only — never from runtime.
 - Runtime agents (`author.py`, `critic.py`, `discovery.py`) import from Foundation + their own leaf utilities. They do **not** import from `core.py` or `executor.py` directly.
 
@@ -108,14 +114,24 @@ prscope/
 │       ├── orchestration.py   [Intelligence] top-level runtime wiring
 │       ├── discovery.py       [Intelligence] generalized intent/evidence discovery engine
 │       ├── author.py          [Intelligence] plan authoring agent
+│       ├── authoring/         [Intelligence] author subsystem package
+│       │   ├── models.py      [Intelligence] author dataclasses + markdown helpers
+│       │   ├── discovery.py   [Intelligence] deterministic author-side repo discovery
+│       │   ├── validation.py  [Intelligence] author draft validation gates
+│       │   ├── repair.py      [Intelligence] author plan repair/revision helpers
+│       │   └── pipeline.py    [Intelligence] planner pipeline coordinator
 │       ├── critic.py          [Intelligence] adversarial critic agent
 │       ├── tools.py           [Intelligence] tool definitions, file ops
 │       ├── budget.py          [Intelligence] token budget management
 │       ├── telemetry.py       [Intelligence] completion telemetry
-│       ├── clarification.py   [Intelligence] non-blocking clarification gate
-│       ├── compression.py     [Intelligence] critique compression
+│       ├── transport/         [Intelligence] LLM transport adapters
+│       │   └── llm_client.py  [Intelligence] responses/chat compatibility layer
+│       ├── context/           [Intelligence] context assembly, budgeting, clarification, compression
+│       ├── events/            [Intelligence] runtime analytics/tool/token event state
+│       ├── pipeline/          [Intelligence] adversarial stage loop and stage orchestration
+│       ├── review/            [Intelligence] issue graph, similarity, causality, manifesto checks
 │       ├── round_controller.py[Intelligence] round progression logic
-│       └── analytics_emitter.py[Intelligence] analytics event emitter
+│       └── state.py           [Intelligence] runtime planning state model
 ├── cli.py                     [Interface] Click CLI
 ├── benchmark.py               [Interface] HTTP-based benchmark harness
 └── web/
@@ -132,7 +148,7 @@ These are enforced by `tests/test_architecture.py`:
 2. **Storage** imports only from Foundation.
 3. **Intelligence** never imports from Interface.
 4. **Interface** never imports from other Interface modules except `web/` internal layering (`server→api→events`).
-5. **Runtime leaf modules** (`tools`, `budget`, `telemetry`, `analytics_emitter`, `clarification`, `compression`) do not import from `planning.core` or `planning.executor`.
+5. **Runtime leaf modules** (`tools`, `budget`, `telemetry`, `transport/llm_client`) do not import from `planning.core` or `planning.executor`.
 
 Violations are caught at CI time. See `tests/test_architecture.py`.
 

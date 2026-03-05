@@ -11,13 +11,13 @@ Grading: **A** = solid, well-tested, documented | **B** = functional, minor gaps
 | **Foundation** (`config`, `pricing`, `model_catalog`, `profile`, `semantic`) | B | Well-tested. `config.py` is stable. `semantic.py` could use more edge-case coverage. |
 | **Storage** (`store.py`) | A | Thorough test coverage. Protected field guards. Schema is stable. |
 | **Planning Core** (`planning/core.py`, `planning/executor.py`) | A | State machine is well-specified with invariant enforcement. Executor has durable command log. |
-| **Planning Runtime** (`planning/runtime/*`) | B | Orchestration is complex but well-documented. Discovery, author, critic agents have good test coverage. `orchestration.py` is the largest file and carries the most risk. |
+| **Planning Runtime** (`planning/runtime/*`) | A- | Runtime is now split into `pipeline/`, `context/`, `review/`, and `events/` subpackages with explicit stage dependency injection and author-owned initial draft flow. `orchestration.py` remains large but risk is reduced. |
 | **Planning Scanners** (`planning/scanners/*`) | B | grep backend is reliable. repomap/repomix backends are less exercised. |
 | **Memory** (`memory.py`) | B | Rebuild logic and skill loading are tested. Manifesto parsing is solid. Memory block summarization depends on LLM availability. |
 | **Scoring** (`scoring.py`) | B | Rule-based scoring with good unit tests. Feature config is stable. |
 | **GitHub Integration** (`github.py`) | B | PR sync tested. Rate limiting and pagination could be more robust. |
 | **Web API** (`web/api.py`) | B | Command model is well-tested. SSE contract is documented. Some wrapper endpoints have lighter coverage. |
-| **Web Frontend** (`web/frontend/`) | C | Functional but has limited test coverage (2 test files). No integration or e2e tests. |
+| **Web Frontend** (`web/frontend/`) | B | 2 test files with 12 tests covering timeline reducer, buildTimeline, upsertToolCall, and hasRunningToolCalls. No integration or e2e tests. Timeline architecture is well-structured with reducer-based state management. |
 | **Benchmark** (`benchmark.py`) | B | HTTP-based, repeatable. Historical tracking works. No automated regression gate in CI yet. |
 | **Documentation** | B | Runtime docs are strong (`agent-harness.md`, `planning-state-machine.md`). Architecture and design docs are new. |
 | **CI / Linting** | B | Standard ruff + eslint. Structural import lints are new (`test_architecture.py`). No custom lint rules with agent-friendly remediation messages yet. |
@@ -26,9 +26,9 @@ Grading: **A** = solid, well-tested, documented | **B** = functional, minor gaps
 
 ### High Priority
 
-- [ ] Frontend test coverage: only `PlanningView.test.ts` and `ChatPanel.test.ts` exist. No component unit tests for `ActionBar`, `PlanPanel`, `ToolCallStream`.
+- [ ] Frontend test coverage: `PlanningView.test.ts` (10 tests: reducer, buildTimeline, upsertToolCall) and `ChatPanel.test.ts` (2 tests: hasRunningToolCalls) exist. No component unit tests for `ActionBar`, `PlanPanel`, `ToolCallStream`.
 - [ ] No e2e test harness for the web UI (no Playwright/Cypress).
-- [ ] `orchestration.py` is ~large and carries high coupling risk. Consider extracting phase handlers.
+- [ ] `orchestration.py` is still the largest runtime module. Continue migrating formatting/prompt helper logic into specialized modules to reduce coordinator size further.
 
 ### Medium Priority
 

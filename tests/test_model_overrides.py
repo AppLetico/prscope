@@ -50,11 +50,12 @@ async def test_critic_run_forwards_model_override(tmp_path):
         del messages, temperature
         captured["model"] = model_override
         raw = (
-            '{"major_issues_remaining":0,"minor_issues_remaining":0,'
-            '"hard_constraint_violations":[],"critique_complete":true,'
-            '"failure_modes":[],"design_tradeoff_risks":[],"unsupported_claims":[],'
-            '"missing_evidence":[],"critic_confidence":0.9,"operational_readiness":true,'
-            '"clarification_questions":[]}'
+            '{"strengths":["good decomposition"],'
+            '"architectural_concerns":[],"risks":[],"simplification_opportunities":[],'
+            '"blocking_issues":[],"reviewer_questions":[],"recommended_changes":[],'
+            '"design_quality_score":9.0,"confidence":"high","review_complete":true,'
+            '"simplest_possible_design":"","primary_issue":"","resolved_issues":[],'
+            '"constraint_violations":[],"issue_priority":[]}'
         )
         response = SimpleNamespace(usage=None)
         return raw, response, "gpt-4o-mini"
@@ -69,4 +70,4 @@ async def test_critic_run_forwards_model_override(tmp_path):
         model_override="gpt-4o-mini",
     )
     assert captured["model"] == "gpt-4o-mini"
-    assert result.major_issues_remaining == 0
+    assert result.review_complete is True
