@@ -41,10 +41,16 @@ upstream_eval:
   max_tokens: 3000
 
 # Planning mode (Author + Critic)
-# Both models can be any LiteLLM-supported model — same provider or different.
+# author_model / critic_model / memory_model can be any LiteLLM-supported model.
+# memory_model: used only for "Preparing codebase memory"; defaults to author_model if omitted.
 # Only set ANTHROPIC_API_KEY if you use a Claude model here.
 planning:
+  # author_model: gpt-4o-mini    # drafts + discovery (default)
+  # critic_model: gpt-4o-mini    # critic (default)
+  # memory_model: gpt-4o-mini    # optional; codebase memory build (defaults to author_model)
   author_call_timeout_seconds: 50
+  memory_prep_timeout_seconds: 120
+  initial_draft_timeout_seconds: 45
   max_adversarial_rounds: 10
   convergence_threshold: 0.05
   output_dir: ./plans

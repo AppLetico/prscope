@@ -44,14 +44,14 @@ jobs:
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: prscope/web/frontend
+        working-directory: src/prscope/web/frontend
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
           cache: "npm"
-          cache-dependency-path: prscope/web/frontend/package-lock.json
+          cache-dependency-path: src/prscope/web/frontend/package-lock.json
       - name: Install frontend dependencies
         run: npm ci
       - name: Lint frontend

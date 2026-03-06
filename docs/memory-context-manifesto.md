@@ -55,7 +55,7 @@ There are two high-level build modes:
 
 - **Grep-backed mode**
   - Scanner builds rich repository context text.
-  - LLM summarizes this into structured block markdown.
+  - LLM summarizes this into structured block markdown (model: `planning.memory_model`, defaults to `author_model`).
   - Block builds run concurrently (`planning.memory_concurrency`).
 - **Repomap/repomix mode**
   - Scanner provides rich context directly.

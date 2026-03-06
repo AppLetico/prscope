@@ -52,10 +52,11 @@ prscope = "prscope.cli:main"
 prscope-benchmark = "prscope.benchmark:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["prscope"]
+packages = ["src/prscope"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+pythonpath = ["src"]
 markers = [
     "asyncio: mark test as an async test (pytest-asyncio)",
 ]
@@ -68,12 +69,12 @@ line-length = 120
 select = ["E", "F", "W", "I", "UP"]
 # Intentional: load_dotenv / dynamic path before other imports
 [tool.ruff.lint.per-file-ignores]
-"prscope/cli.py" = ["E402", "E501"]
-"prscope/web/__init__.py" = ["E402"]
-"prscope/web/server.py" = ["E402", "E501"]
-"prscope/llm.py" = ["E501"]
-"prscope/planning/runtime/author.py" = ["E501"]
-"prscope/planning/runtime/discovery.py" = ["E501"]
-"prscope/planning/runtime/orchestration.py" = ["E501"]
-"prscope/planning/runtime/tools.py" = ["E501"]
-"prscope/web/api.py" = ["E501", "UP045"]
+"src/prscope/cli.py" = ["E402", "E501"]
+"src/prscope/web/__init__.py" = ["E402"]
+"src/prscope/web/server.py" = ["E402", "E501"]
+"src/prscope/llm.py" = ["E501"]
+"src/prscope/planning/runtime/author.py" = ["E501"]
+"src/prscope/planning/runtime/discovery.py" = ["E501"]
+"src/prscope/planning/runtime/orchestration.py" = ["E501"]
+"src/prscope/planning/runtime/tools.py" = ["E501"]
+"src/prscope/web/api.py" = ["E501", "UP045"]

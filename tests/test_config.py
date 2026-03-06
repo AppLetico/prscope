@@ -98,6 +98,27 @@ planning:
     assert config.get_repo("alpha").upstream[0].repo == "owner/repo-a"
     assert config.planning.max_adversarial_rounds == 7
     assert config.planning.require_verified_file_references is True
+    # memory_model defaults to author_model when omitted
+    assert config.planning.memory_model == "gpt-4o"
+
+
+def test_config_memory_model_explicit(tmp_path):
+    """When memory_model is set in YAML it is used; otherwise it defaults to author_model."""
+    (tmp_path / "repo-mem").mkdir()
+    config_path = tmp_path / "prscope.yml"
+    config_path.write_text(
+        """
+repos:
+  memrepo:
+    path: ./repo-mem
+planning:
+  author_model: claude-3-5-sonnet-20241022
+  memory_model: gpt-4o-mini
+        """.strip()
+    )
+    config = PrscopeConfig.load(tmp_path)
+    assert config.planning.author_model == "claude-3-5-sonnet-20241022"
+    assert config.planning.memory_model == "gpt-4o-mini"
 
 
 def test_config_resolve_repo_from_cwd(tmp_path):

@@ -198,6 +198,31 @@ def test_create_planning_session_persists_no_recall(tmp_path):
     assert loaded.no_recall == 1
 
 
+def test_session_diagnostics_json_persists(tmp_path):
+    db_path = tmp_path / "prscope.db"
+    store = Store(db_path=db_path)
+    session = store.create_planning_session(
+        repo_name="alpha",
+        title="Diagnostics",
+        requirements="Track timing",
+        seed_type="requirements",
+    )
+    loaded = store.get_planning_session(session.id)
+    assert loaded is not None
+    assert loaded.diagnostics_json == "{}"
+
+    payload = {"warnings_total": 2, "author_call_timeouts": 1}
+    updated = store.update_planning_session(
+        session.id,
+        diagnostics_json=json.dumps(payload),
+    )
+    assert updated.diagnostics_json == json.dumps(payload)
+
+    reloaded = store.get_planning_session(session.id)
+    assert reloaded is not None
+    assert reloaded.diagnostics_json == json.dumps(payload)
+
+
 def test_planning_commands_claim_complete_and_idempotency(tmp_path):
     db_path = tmp_path / "prscope.db"
     store = Store(db_path=db_path)

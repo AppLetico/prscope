@@ -1,6 +1,6 @@
 # Frontend Architecture
 
-This document covers the React/Vite frontend in `prscope/web/frontend/`.
+This document covers the React/Vite frontend in `src/prscope/web/frontend/`.
 
 ## Stack
 
@@ -14,6 +14,8 @@ This document covers the React/Vite frontend in `prscope/web/frontend/`.
 
 ## Directory Layout
 
+Layout under `src/prscope/web/frontend/src/`:
+
 ```
 src/
 ├── main.tsx                    ← app entry point, React Router setup
@@ -23,7 +25,7 @@ src/
 ├── pages/
 │   ├── SessionList.tsx         ← session list / home page
 │   ├── NewSession.tsx          ← session creation form
-│   ├── PlanningView.tsx        ← main planning workspace (chat + plan)
+│   ├── PlanningView.tsx        ← main planning workspace (chat + plan + issues)
 │   └── PlanningView.test.ts   ← tests for timeline reducer, buildTimeline, upsertToolCall
 ├── components/
 │   ├── ActionBar.tsx           ← session action buttons (round, approve, export)
@@ -31,6 +33,7 @@ src/
 │   ├── ChatPanel.test.ts      ← tests for hasRunningToolCalls
 │   ├── chatPanelUtils.ts      ← timeline reducer, buildTimeline, upsertToolCall utilities
 │   ├── PlanPanel.tsx           ← rendered plan with diff view
+│   ├── IssuePanel.tsx          ← issue graph / open issues view
 │   ├── ResizableLayout.tsx     ← draggable split pane
 │   ├── ToolCallStream.tsx      ← live tool call display
 │   ├── ModelSelector.tsx       ← model picker dropdown
@@ -110,6 +113,7 @@ The frontend handles `409` responses gracefully — they indicate the session is
 | `ChatPanel` | Pure timeline rendering, message input, discovery flow | State management, timeline construction |
 | `chatPanelUtils` | `timelineReducer`, `buildTimeline`, `upsertToolCall` | Component rendering |
 | `PlanPanel` | Plan rendering, diff view, export | Round execution |
+| `IssuePanel` | Issue graph / open issues display | State management |
 | `ActionBar` | Command dispatch (round, approve, export) | State management |
 | `ToolCallStream` | Tool call display and filtering | Tool execution |
 
@@ -130,15 +134,15 @@ The frontend handles `409` responses gracefully — they indicate the session is
 ## Build and Lint
 
 ```bash
-cd prscope/web/frontend
+cd src/prscope/web/frontend
 npm ci               # install deps
 npm run dev           # vite dev server on :5173
-npm run build         # production build → prscope/web/static/
+npm run build         # production build → src/prscope/web/static/
 npm run lint          # eslint
 npx tsc --noEmit      # typecheck
 ```
 
-Production builds are committed to `prscope/web/static/` for the Python server to serve directly.
+Production builds are committed to `src/prscope/web/static/` for the Python server to serve directly.
 
 ## Adding a New Component
 

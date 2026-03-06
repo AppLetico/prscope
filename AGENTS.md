@@ -25,8 +25,8 @@ plans/                     ← versioned execution plans (plan, conversation log
 .prscope/
 ├── manifesto.md           ← hard/soft constraints enforced by Critic
 └── skills/*.md            ← stable team planning patterns
-prscope/                   ← Python package (see ARCHITECTURE.md)
-prscope/web/frontend/      ← React/Vite frontend (see docs/FRONTEND.md)
+src/prscope/               ← Python package (see ARCHITECTURE.md)
+src/prscope/web/frontend/  ← React/Vite frontend (see docs/FRONTEND.md)
 tests/                     ← pytest suite, co-located with package
 benchmarks/                ← prompt suites, configs, historical results
 ```

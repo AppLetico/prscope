@@ -14,7 +14,7 @@ import ast
 import re
 from pathlib import Path
 
-PACKAGE_ROOT = Path(__file__).resolve().parent.parent / "prscope"
+PACKAGE_ROOT = Path(__file__).resolve().parent.parent / "src" / "prscope"
 
 # ---------------------------------------------------------------------------
 # Layer definitions
@@ -30,6 +30,15 @@ FOUNDATION = {
 
 STORAGE = {
     "store",
+    "store.service",
+    "store.connection",
+    "store.schema",
+    "store.models",
+    "store.repo_data",
+    "store.planning_commands",
+    "store.planning_sessions",
+    "store.planning_history",
+    "store.file_stats",
 }
 
 INTELLIGENCE = {
@@ -50,6 +59,19 @@ INTELLIGENCE = {
     "planning.runtime",
     "planning.runtime.orchestration",
     "planning.runtime.discovery",
+    "planning.runtime.discovery_support",
+    "planning.runtime.discovery_support.models",
+    "planning.runtime.discovery_support.signals",
+    "planning.runtime.discovery_support.existing_feature",
+    "planning.runtime.discovery_support.bootstrap",
+    "planning.runtime.discovery_support.llm",
+    "planning.runtime.orchestration_support",
+    "planning.runtime.orchestration_support.event_router",
+    "planning.runtime.orchestration_support.state_snapshots",
+    "planning.runtime.orchestration_support.initial_draft",
+    "planning.runtime.orchestration_support.session_starts",
+    "planning.runtime.orchestration_support.chat_flow",
+    "planning.runtime.orchestration_support.round_entry",
     "planning.runtime.author",
     "planning.runtime.authoring",
     "planning.runtime.authoring.models",
@@ -126,7 +148,7 @@ _RELATIVE_IMPORT_RE = re.compile(r"^from\s+(\.+)(\S*)\s+import")
 
 
 def _resolve_relative(dots: str, remainder: str, module_path: Path) -> str:
-    """Resolve a relative import to a dotted module name relative to prscope/."""
+    """Resolve a relative import to a dotted module name relative to src/prscope/."""
     levels = len(dots)
     parts = list(module_path.relative_to(PACKAGE_ROOT).with_suffix("").parts)
     # Go up `levels` directories (first level goes to parent of the file's package)

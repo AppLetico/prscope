@@ -32,7 +32,7 @@ def test_round_endpoint_enqueues_job_and_is_idempotent(tmp_path, monkeypatch):
         lambda self, *args, **kwargs: __import__("asyncio").sleep(0),
     )
     app = create_app()
-    client = TestClient(app)
+    client = TestClient(app, raise_server_exceptions=False)
 
     repo_name = tmp_path.name
     store = Store()
@@ -144,7 +144,7 @@ def test_command_events_include_command_id_for_distinct_runs(tmp_path, monkeypat
     )
 
     app = create_app()
-    client = TestClient(app)
+    client = TestClient(app, raise_server_exceptions=False)
 
     repo_name = tmp_path.name
     store = Store()
@@ -168,3 +168,61 @@ def test_command_events_include_command_id_for_distinct_runs(tmp_path, monkeypat
     tool_results = [event for event in emitted_events if event.get("type") == "tool_result"]
     assert [event.get("command_id") for event in tool_calls] == ["cmd-run-1", "cmd-run-2"]
     assert [event.get("command_id") for event in tool_results] == ["cmd-run-1", "cmd-run-2"]
+
+
+def test_command_failure_emits_recovery_snapshot_and_error(tmp_path, monkeypatch):
+    _write_minimal_config(tmp_path)
+    monkeypatch.setenv("PRSCOPE_CONFIG_ROOT", str(tmp_path))
+    monkeypatch.setenv("PRSCOPE_DISABLE_ROUND_WORKER", "1")
+    monkeypatch.setattr("prscope.store.get_prscope_dir", lambda repo_root=None: tmp_path / ".prscope")
+
+    emitted_events: list[dict[str, object]] = []
+
+    async def capture_emit(self, session_id: str, event: dict[str, object]) -> None:  # type: ignore[no-untyped-def]
+        del self, session_id
+        emitted_events.append(dict(event))
+
+    async def failing_run_adversarial_round(  # type: ignore[no-untyped-def]
+        self,
+        session_id: str,
+        user_input: str | None = None,
+        author_model_override: str | None = None,
+        critic_model_override: str | None = None,
+        event_callback=None,
+    ):
+        del self, session_id, user_input, author_model_override, critic_model_override, event_callback
+        raise RuntimeError("validation blew up")
+
+    monkeypatch.setattr("prscope.web.events.SessionEventEmitter.emit", capture_emit)
+    monkeypatch.setattr(
+        "prscope.planning.runtime.orchestration.PlanningRuntime.run_adversarial_round",
+        failing_run_adversarial_round,
+    )
+
+    app = create_app()
+    client = TestClient(app, raise_server_exceptions=False)
+
+    repo_name = tmp_path.name
+    store = Store()
+    session = store.create_planning_session(
+        repo_name=repo_name,
+        title="Failing round",
+        requirements="r",
+        seed_type="requirements",
+        status="refining",
+    )
+
+    response = client.post(
+        f"/api/sessions/{session.id}/command",
+        params={"repo": repo_name},
+        json={"command": "run_round", "command_id": "cmd-run-fail"},
+    )
+    assert response.status_code == 500
+
+    error_events = [event for event in emitted_events if event.get("type") == "error"]
+    assert error_events
+    assert error_events[-1]["message"] == "validation blew up"
+
+    recovery_events = [event for event in emitted_events if "status" in event and "is_processing" in event]
+    assert recovery_events
+    assert recovery_events[-1]["status"] == "refining"

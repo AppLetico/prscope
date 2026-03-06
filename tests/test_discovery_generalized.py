@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import re
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -109,10 +110,72 @@ def test_existing_feature_evidence_lines_fallback_prefers_runtime_path() -> None
     assert lines == ["Found existing status endpoint in `prscope/web/api.py`"]
 
 
+def test_concrete_enhancement_request_requires_specific_scope() -> None:
+    manager = DiscoveryManager.__new__(DiscoveryManager)
+    assert manager._is_concrete_enhancement_request("improve observability") is True
+    assert manager._is_concrete_enhancement_request("add request timing logs") is True
+    assert manager._is_concrete_enhancement_request("yes") is False
+    assert manager._is_concrete_enhancement_request("B") is False
+    assert manager._is_concrete_enhancement_request("what logging framework should we use?") is False
+
+
+@pytest.mark.asyncio
+async def test_existing_feature_enhancement_choice_requests_priority_clarification() -> None:
+    manager = DiscoveryManager.__new__(DiscoveryManager)
+    manager.config = SimpleNamespace(discovery_max_turns=4)
+    manager.turn_counts_by_session = {"s1": 1}
+    manager.event_callback = None
+    manager.bootstrap_insights_by_session = {
+        "s1": {
+            "existing_feature": True,
+            "feature_label": "status endpoint",
+            "matched_paths": ["prscope/web/api.py"],
+            "matched_evidence": ["`prscope/web/api.py:111` @app.get('/status')"],
+        }
+    }
+
+    sys.modules.setdefault("litellm", SimpleNamespace())
+
+    result = await manager.handle_turn(
+        [
+            {
+                "role": "user",
+                "content": "Propose targeted enhancements without creating a duplicate implementation.",
+            }
+        ],
+        session_id="s1",
+    )
+
+    assert result.complete is False
+    assert result.reply == "Tell me which area to prioritize first."
+    assert result.questions == []
+    assert result.summary is None
+
+
+def test_bootstrap_seed_paths_collects_paths_from_evidence_lines() -> None:
+    manager = DiscoveryManager.__new__(DiscoveryManager)
+    manager.bootstrap_insights_by_session = {
+        "s1": {
+            "matched_paths": ["prscope/web/api.py"],
+            "matched_evidence": ["`tests/test_web_api_models.py:56` response = client.get('/health')"],
+        }
+    }
+
+    assert manager.bootstrap_seed_paths("s1") == {
+        "prscope/web/api.py",
+        "tests/test_web_api_models.py",
+    }
+
+
 def test_select_scan_directories_skips_vendor_and_hidden() -> None:
     manager = DiscoveryManager.__new__(DiscoveryManager)
     ranked = manager._select_scan_directories(
         [
+            {"path": "prscope", "type": "dir"},
+            {"path": "prscope/web", "type": "dir"},
+            {"path": "docs", "type": "dir"},
+            {"path": "plans", "type": "dir"},
+            {"path": "benchmarks", "type": "dir"},
             {"path": "src", "type": "dir"},
             {"path": "src/server.ts", "type": "file"},
             {"path": "backend", "type": "dir"},
@@ -124,6 +187,9 @@ def test_select_scan_directories_skips_vendor_and_hidden() -> None:
     assert ranked
     assert "node_modules" not in ranked
     assert ".github" not in ranked
+    assert "prscope" in ranked
+    assert "docs" not in ranked
+    assert "plans" not in ranked
 
 
 def test_build_signal_index_and_detect_code_signals() -> None:
@@ -142,16 +208,17 @@ def test_build_signal_index_and_detect_code_signals() -> None:
     assert scores["cli"] >= 1
 
 
-def test_detect_framework_prefers_highest_score() -> None:
+def test_detect_framework_prefers_runtime_code_over_test_fixtures() -> None:
     manager = DiscoveryManager.__new__(DiscoveryManager)
     matches = [
-        {"path": "src/server.ts", "line": 1, "text": "const app = express()"},
-        {"path": "src/server.ts", "line": 2, "text": "app.get('/users', handler)"},
-        {"path": "src/router.ts", "line": 5, "text": "router.post('/login', login)"},
+        {"path": "tests/test_discovery_parser.py", "line": 1, "text": "const app = express()"},
+        {"path": "tests/test_discovery_parser.py", "line": 2, "text": "app.get('/users', handler)"},
+        {"path": "tests/test_discovery_parser.py", "line": 3, "text": "router.post('/login', login)"},
         {"path": "api/main.py", "line": 2, "text": "from fastapi import FastAPI"},
+        {"path": "prscope/web/api.py", "line": 960, "text": "@app.get('/health')"},
     ]
     index = manager._build_signal_index(matches)
-    assert manager._detect_framework(index) == "express"
+    assert manager._detect_framework(index) == "fastapi"
 
 
 def test_detect_architecture_from_signal_scores() -> None:
@@ -270,7 +337,7 @@ def test_detect_code_signals_returns_positive_entries_only() -> None:
 
 
 def test_discovery_engine_has_no_feature_specific_logic() -> None:
-    source = Path("prscope/planning/runtime/discovery.py").read_text()
+    source = Path("src/prscope/planning/runtime/discovery.py").read_text()
     tree = ast.parse(source)
     forbidden_tokens = ["health", "graphql", "websocket", "celery"]
     allow = {"_extract_feature_intent"}

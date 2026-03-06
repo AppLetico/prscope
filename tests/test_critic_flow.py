@@ -8,7 +8,7 @@ import pytest
 
 from prscope.config import PlanningConfig, RepoProfile
 from prscope.memory import ParsedConstraint
-from prscope.planning.runtime.critic import CriticAgent, ImplementabilityResult
+from prscope.planning.runtime.critic import CriticAgent, CriticContractError, ImplementabilityResult
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -108,6 +108,37 @@ async def test_run_critic_defaults_optional_fields_to_none(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_run_critic_coerces_optional_text_fields_from_lists(tmp_path):
+    agent = _make_agent(tmp_path)
+
+    def fake_llm_call(messages, temperature, model_override=None):
+        del messages, temperature, model_override
+        payload = json.loads(_review_json())
+        payload["simplest_possible_design"] = [
+            "Keep the existing `/health` route",
+            "Add lightweight timing and counters only",
+        ]
+        payload["primary_issue"] = ["No observability baseline"]
+        return json.dumps(payload), SimpleNamespace(usage=None), "gpt-4o-mini"
+
+    agent._llm_call = fake_llm_call  # type: ignore[method-assign]
+    result = await agent.run_critic(
+        requirements="R",
+        plan_content="P",
+        manifesto="M",
+        architecture="A",
+        constraints=[_HC001],
+        max_retries=0,
+    )
+
+    assert result.parse_error is None
+    assert result.simplest_possible_design == (
+        "Keep the existing `/health` route; Add lightweight timing and counters only"
+    )
+    assert result.primary_issue == "No observability baseline"
+
+
+@pytest.mark.asyncio
 async def test_run_critic_normalizes_confidence_to_lowercase(tmp_path):
     repo = RepoProfile(name="alpha", path=str(Path(tmp_path)))
     agent = CriticAgent(config=PlanningConfig(critic_model="gpt-4o-mini"), repo=repo)
@@ -131,7 +162,7 @@ async def test_run_critic_normalizes_confidence_to_lowercase(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_run_critic_returns_parse_error_on_missing_required_field(tmp_path):
+async def test_run_critic_raises_on_missing_required_field(tmp_path):
     repo = RepoProfile(name="alpha", path=str(Path(tmp_path)))
     agent = CriticAgent(config=PlanningConfig(critic_model="gpt-4o-mini"), repo=repo)
 
@@ -143,20 +174,19 @@ async def test_run_critic_returns_parse_error_on_missing_required_field(tmp_path
         return raw, SimpleNamespace(usage=None), "gpt-4o-mini"
 
     agent._llm_call = fake_llm_call  # type: ignore[method-assign]
-    result = await agent.run_critic(
-        requirements="R",
-        plan_content="P",
-        manifesto="M",
-        architecture="A",
-        constraints=[ParsedConstraint(id="HARD_CONSTRAINT_001", text="T", severity="hard", optional=False)],
-        max_retries=0,
-    )
-    assert result.parse_error is not None
-    assert "Missing required field: strengths" in result.parse_error
+    with pytest.raises(CriticContractError, match="Missing required field: strengths"):
+        await agent.run_critic(
+            requirements="R",
+            plan_content="P",
+            manifesto="M",
+            architecture="A",
+            constraints=[ParsedConstraint(id="HARD_CONSTRAINT_001", text="T", severity="hard", optional=False)],
+            max_retries=0,
+        )
 
 
 @pytest.mark.asyncio
-async def test_run_critic_returns_parse_error_on_out_of_range_score(tmp_path):
+async def test_run_critic_raises_on_out_of_range_score(tmp_path):
     agent = _make_agent(tmp_path)
 
     def fake_llm_call(messages, temperature, model_override=None):
@@ -164,16 +194,15 @@ async def test_run_critic_returns_parse_error_on_out_of_range_score(tmp_path):
         return _review_json(score=10.5), SimpleNamespace(usage=None), "gpt-4o-mini"
 
     agent._llm_call = fake_llm_call  # type: ignore[method-assign]
-    result = await agent.run_critic(
-        requirements="R",
-        plan_content="Add a public /health endpoint to prscope/web/api.py",
-        manifesto="M",
-        architecture="A",
-        constraints=[_HC001],
-        max_retries=0,
-    )
-    assert result.parse_error is not None
-    assert "design_quality_score must be in [0,10]" in result.parse_error
+    with pytest.raises(CriticContractError, match="design_quality_score must be in"):
+        await agent.run_critic(
+            requirements="R",
+            plan_content="Add a public /health endpoint to prscope/web/api.py",
+            manifesto="M",
+            architecture="A",
+            constraints=[_HC001],
+            max_retries=0,
+        )
 
 
 @pytest.mark.asyncio
@@ -207,3 +236,36 @@ async def test_run_design_review_implementability_mode_parses_contract(tmp_path)
     assert result.parse_error is None
     assert result.implementable is True
     assert result.implementation_risks == ["Edge case in retry sequencing"]
+
+
+@pytest.mark.asyncio
+async def test_run_design_review_skips_multi_perspective_for_small_plan(tmp_path):
+    agent = _make_agent(tmp_path)
+    perspective_calls = {"count": 0}
+
+    async def fake_run_perspective(**kwargs):  # type: ignore[no-untyped-def]
+        del kwargs
+        perspective_calls["count"] += 1
+        return "unused"
+
+    def fake_llm_call(messages, temperature, model_override=None):
+        del messages, temperature, model_override
+        return _review_json(include_optional=False), SimpleNamespace(usage=None), "gpt-4o-mini"
+
+    agent._run_perspective = fake_run_perspective  # type: ignore[method-assign]
+    agent._llm_call = fake_llm_call  # type: ignore[method-assign]
+    result = await agent.run_design_review(
+        requirements="R",
+        plan_content=(
+            "# Plan\n\n## Files Changed\n- `prscope/web/api.py`\n\n"
+            "## Changes\n- Add lightweight observability to the health endpoint."
+        ),
+        manifesto="M",
+        architecture="A",
+        constraints=[_HC001],
+        round_number=1,
+        mode="initial",
+    )
+
+    assert result.parse_error is None
+    assert perspective_calls["count"] == 0

@@ -5,7 +5,7 @@ import json
 import pytest
 
 from prscope.config import IssueDedupeConfig, PlanningConfig, PrscopeConfig, RepoProfile
-from prscope.planning.runtime.critic import ReviewResult
+from prscope.planning.runtime.critic import ImplementabilityResult, ReviewResult
 from prscope.planning.runtime.orchestration import PlanningRuntime
 from prscope.planning.runtime.pipeline.round_context import PlanningRoundContext
 from prscope.planning.runtime.review.issue_similarity import IssueSimilarityService
@@ -20,6 +20,16 @@ def _runtime(tmp_path, *, planning: PlanningConfig | None = None) -> PlanningRun
     )
     repo = RepoProfile(name="repo", path=str(tmp_path))
     return PlanningRuntime(store=store, config=config, repo=repo)
+
+
+def test_orchestration_support_helpers_are_wired(tmp_path):
+    runtime = _runtime(tmp_path)
+    assert runtime._event_router is not None  # noqa: SLF001
+    assert runtime._snapshot_io is not None  # noqa: SLF001
+    assert runtime._initial_draft is not None  # noqa: SLF001
+    assert runtime._session_starts is not None  # noqa: SLF001
+    assert runtime._chat_flow is not None  # noqa: SLF001
+    assert runtime._round_entry is not None  # noqa: SLF001
 
 
 def test_state_bootstrap_is_lazy_for_repo_memory(tmp_path):
@@ -172,6 +182,161 @@ async def test_convergence_uses_stability_signals(tmp_path):
     assert convergence.reason == "stability_not_met"
 
 
+@pytest.mark.asyncio
+async def test_convergence_allows_stable_clean_round_without_explicit_review_complete(tmp_path):
+    runtime = _runtime(tmp_path)
+    session = runtime.store.create_planning_session(
+        repo_name="repo",
+        title="stable-clean",
+        requirements="r",
+        seed_type="requirements",
+        status="refining",
+    )
+    state = runtime._state(session.id, session)  # noqa: SLF001
+    state.architecture_change_rounds = [False, False]
+    state.review_score_history = [7.9, 8.0]
+    state.open_issue_history = [1, 0]
+    issue_tracker = state.issue_tracker
+    assert issue_tracker is not None
+
+    review = ReviewResult(
+        strengths=[],
+        architectural_concerns=[],
+        risks=[],
+        simplification_opportunities=[],
+        blocking_issues=[],
+        reviewer_questions=[],
+        recommended_changes=[],
+        design_quality_score=8.0,
+        confidence="high",
+        review_complete=False,
+        simplest_possible_design=None,
+        primary_issue=None,
+        resolved_issues=[],
+        constraint_violations=[],
+        issue_priority=[],
+        prose="",
+    )
+
+    async def emit_tool(*args, **kwargs):  # type: ignore[no-untyped-def]
+        del args, kwargs
+        return None
+
+    async def fake_run_design_review(**kwargs):  # type: ignore[no-untyped-def]
+        if kwargs.get("mode") == "implementability":
+            return ImplementabilityResult(
+                implementable=True,
+                missing_details=[],
+                implementation_risks=[],
+                suggested_additions=[],
+                prose="ok",
+            )
+        raise AssertionError("unexpected critic mode in convergence test")
+
+    runtime.critic.run_design_review = fake_run_design_review  # type: ignore[method-assign]
+
+    ctx = PlanningRoundContext(
+        core=runtime._core(session.id),  # noqa: SLF001
+        session_id=session.id,
+        round_number=2,
+        requirements="r",
+        state=state,
+        issue_tracker=issue_tracker,
+        selected_author_model="gpt-4o-mini",
+        selected_critic_model="gpt-4o-mini",
+        event_callback=None,
+    )
+    implementability, convergence = await runtime._stage_convergence_check(  # noqa: SLF001
+        ctx=ctx,
+        updated_markdown="# plan",
+        validation_review=review,
+        emit_tool=emit_tool,
+    )
+
+    assert implementability.implementable is True
+    assert convergence.converged is True
+    assert convergence.reason == "review_complete"
+
+
+@pytest.mark.asyncio
+async def test_convergence_stops_stalled_refinement_loop(tmp_path):
+    runtime = _runtime(tmp_path)
+    session = runtime.store.create_planning_session(
+        repo_name="repo",
+        title="stalled",
+        requirements="r",
+        seed_type="requirements",
+        status="refining",
+    )
+    state = runtime._state(session.id, session)  # noqa: SLF001
+    state.architecture_change_rounds = [True, True]
+    state.review_score_history = [7.0, 7.0]
+    state.open_issue_history = [2, 2]
+    issue_tracker = state.issue_tracker
+    assert issue_tracker is not None
+    issue_tracker.add_issue("Logging framework detail remains open", 1)
+    issue_tracker.add_issue("Metrics naming detail remains open", 1)
+    state.open_issue_history = [2, 2]
+
+    review = ReviewResult(
+        strengths=[],
+        architectural_concerns=[],
+        risks=[],
+        simplification_opportunities=[],
+        blocking_issues=[],
+        reviewer_questions=[],
+        recommended_changes=[],
+        design_quality_score=7.0,
+        confidence="medium",
+        review_complete=False,
+        simplest_possible_design=None,
+        primary_issue="Logging framework detail remains open",
+        resolved_issues=[],
+        constraint_violations=[],
+        issue_priority=[],
+        prose="",
+    )
+
+    async def emit_tool(*args, **kwargs):  # type: ignore[no-untyped-def]
+        del args, kwargs
+        return None
+
+    async def fake_run_design_review(**kwargs):  # type: ignore[no-untyped-def]
+        if kwargs.get("mode") == "implementability":
+            return ImplementabilityResult(
+                implementable=True,
+                missing_details=[],
+                implementation_risks=[],
+                suggested_additions=[],
+                prose="ok",
+            )
+        raise AssertionError("unexpected critic mode in stalled convergence test")
+
+    runtime.critic.run_design_review = fake_run_design_review  # type: ignore[method-assign]
+
+    ctx = PlanningRoundContext(
+        core=runtime._core(session.id),  # noqa: SLF001
+        session_id=session.id,
+        round_number=3,
+        requirements="r",
+        state=state,
+        issue_tracker=issue_tracker,
+        selected_author_model="gpt-4o-mini",
+        selected_critic_model="gpt-4o-mini",
+        event_callback=None,
+    )
+    implementability, convergence = await runtime._stage_convergence_check(  # noqa: SLF001
+        ctx=ctx,
+        updated_markdown="# plan",
+        validation_review=review,
+        emit_tool=emit_tool,
+    )
+
+    assert implementability.implementable is True
+    assert convergence.converged is True
+    assert convergence.reason == "stalled_refinement"
+
+
 def test_config_parses_issue_dedupe_settings(tmp_path):
     config_path = tmp_path / "prscope.yml"
     config_path.write_text(
@@ -229,6 +394,33 @@ def test_state_snapshot_persists_issue_graph_payload(tmp_path):
     assert "nodes" in issue_graph
     assert "edges" in issue_graph
     assert "duplicate_alias" in issue_graph
+
+
+def test_state_snapshot_persists_round_histories(tmp_path):
+    runtime = _runtime(tmp_path)
+    session = runtime.store.create_planning_session(
+        repo_name="repo",
+        title="history-snapshot",
+        requirements="r",
+        seed_type="requirements",
+        status="refining",
+    )
+    state = runtime._state(session.id, session)  # noqa: SLF001
+    state.architecture_change_rounds = [True, False, True]
+    state.review_score_history = [6.0, 7.0, 7.0]
+    state.open_issue_history = [4, 2, 2]
+    state.accessed_paths = {"prscope/web/api.py"}
+    state.plan_markdown = "# plan"
+
+    runtime._persist_state_snapshot(session.id)  # noqa: SLF001
+    runtime.cleanup_session_resources(session.id)
+
+    restored = runtime._state(session.id, session)  # noqa: SLF001
+    assert restored.architecture_change_rounds == [True, False, True]
+    assert restored.review_score_history == [6.0, 7.0, 7.0]
+    assert restored.open_issue_history == [4, 2, 2]
+    assert restored.accessed_paths == {"prscope/web/api.py"}
+    assert restored.plan_markdown == "# plan"
 
 
 def test_state_bootstrap_legacy_snapshot_dedupes_and_aliases(tmp_path):

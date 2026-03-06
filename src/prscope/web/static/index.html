@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>prscope</title>
+    <script>
+      (function() {
+        try {
+          var theme = localStorage.getItem('prscope-theme');
+          if (theme === 'light' || (theme !== 'dark' && window.matchMedia('(prefers-color-scheme: light)').matches)) {
+            document.documentElement.classList.add('light');
+          }
+        } catch (e) {}
+      })();
+    </script>
+    <script type="module" crossorigin src="/assets/index-Capr2NER.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-BM_TfM5g.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
+</html>

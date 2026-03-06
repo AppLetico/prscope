@@ -11,7 +11,7 @@ Prscope has four domains. Each domain owns a slice of functionality and has clea
 | Domain | Responsibility | Key Modules |
 |---|---|---|
 | **Foundation** | Config, pricing, models, profile | `config.py`, `pricing.py`, `model_catalog.py`, `profile.py`, `semantic.py` |
-| **Storage** | Persistence, session state, PR data | `store.py` |
+| **Storage** | Persistence, session state, PR data | `store/` |
 | **Intelligence** | Planning runtime, author/critic, memory, scoring | `planning/`, `memory.py`, `scoring.py`, `llm.py`, `planner.py` |
 | **Interface** | CLI, web API, frontend, benchmark | `cli.py`, `web/`, `benchmark.py` |
 
@@ -31,7 +31,7 @@ Layers are ordered top-to-bottom. A module may import from its own layer or any 
 │  llm.py, planner.py, github.py                     │
 ├─────────────────────────────────────────────────────┤
 │  Storage                                            │
-│  store.py                                           │
+│  store/*                                            │
 ├─────────────────────────────────────────────────────┤
 │  Foundation                                         │
 │  config.py, pricing.py, model_catalog.py,           │
@@ -55,21 +55,26 @@ planning/runtime/orchestration.py   ← top: wires everything together
     ↓
 planning/runtime/{discovery,author,critic,round_controller,state}.py
     ↓
-planning/runtime/authoring/{models,discovery,validation,repair}.py
+planning/runtime/orchestration_support/{event_router,state_snapshots,initial_draft,session_starts,chat_flow,round_entry}.py
+    ↓
+planning/runtime/discovery_support/{models,signals,existing_feature,bootstrap,llm}.py
+    ↓
+planning/runtime/authoring/{models,discovery,validation,repair,pipeline}.py
     ↓
 planning/runtime/transport/{llm_client}.py
     ↓
-planning/runtime/{tools,budget,telemetry}.py  ← leaf utilities
+planning/runtime/{tools,telemetry}.py  ← leaf utilities
     ↓
-planning/runtime/{context/*,events/*,pipeline/*,review/*}
+planning/runtime/{context/*,events/*,pipeline/*,review/*}  ← context/ includes budget
     ↓
 planning/{core,executor,render}.py  ← planning kernel
     ↓
 planning/scanners/*                 ← codebase scanning backends
 ```
 
-- `orchestration.py` is the only module that imports broadly across runtime.
-- `tools.py`, `budget.py`, `telemetry.py`, and `transport/llm_client.py` are leaf modules with no imports from orchestration.
+- `orchestration.py` remains the public coordinator/facade; orchestration internals live under `orchestration_support/*`.
+- `discovery.py` is the runtime entrypoint for discovery orchestration; helper logic lives in `discovery_support/*`.
+- `tools.py`, `telemetry.py`, and `transport/llm_client.py` are leaf modules with no imports from orchestration; `context/` (including budget) holds context assembly and budgeting.
 - `core.py` and `executor.py` import from Storage and Foundation only — never from runtime.
 - Runtime agents (`author.py`, `critic.py`, `discovery.py`) import from Foundation + their own leaf utilities. They do **not** import from `core.py` or `executor.py` directly.
 
@@ -88,14 +93,24 @@ Frontend (`web/frontend/`) is a separate Vite/React app that communicates with t
 ## Package Map
 
 ```
-prscope/
+src/prscope/
 ├── __init__.py
 ├── config.py                  [Foundation] config loading, repo profiles
 ├── pricing.py                 [Foundation] model pricing tables
 ├── model_catalog.py           [Foundation] model registry and availability
 ├── profile.py                 [Foundation] codebase profiling
 ├── semantic.py                [Foundation] code search utilities
-├── store.py                   [Storage]    SQLite persistence, session/turn/PR schema
+├── store/                     [Storage]    SQLite persistence package
+│   ├── __init__.py            [Storage]    stable storage exports and compatibility surface
+│   ├── service.py             [Storage]    composed Store facade
+│   ├── connection.py          [Storage]    sqlite connection + timestamp helpers
+│   ├── schema.py              [Storage]    schema DDL + migrations
+│   ├── models.py              [Storage]    storage dataclasses
+│   ├── repo_data.py           [Storage]    repo/PR/evaluation/artifact persistence
+│   ├── planning_commands.py   [Storage]    command queue/lease lifecycle
+│   ├── planning_sessions.py   [Storage]    planning session CRUD/search/update guards
+│   ├── planning_history.py    [Storage]    turns/plan versions/round metrics persistence
+│   └── file_stats.py          [Storage]    filesystem-backed stats and rounds logs
 ├── memory.py                  [Intelligence] memory blocks, manifesto, skills
 ├── llm.py                     [Intelligence] LLM call abstraction
 ├── scoring.py                 [Intelligence] PR scoring rules
@@ -112,7 +127,20 @@ prscope/
 │   │   └── repomix.py         [Intelligence] repomix scanner
 │   └── runtime/
 │       ├── orchestration.py   [Intelligence] top-level runtime wiring
-│       ├── discovery.py       [Intelligence] generalized intent/evidence discovery engine
+│       ├── orchestration_support/ [Intelligence] orchestration helper package
+│       │   ├── event_router.py [Intelligence] SSE versioning + tool event normalization/persistence
+│       │   ├── state_snapshots.py [Intelligence] runtime snapshot persistence/list/read helpers
+│       │   ├── initial_draft.py [Intelligence] memory-prep + initial-draft bootstrap flow
+│       │   ├── session_starts.py [Intelligence] requirements/chat/PR start-mode adapters
+│       │   ├── chat_flow.py    [Intelligence] discovery turn + author chat + clarification flows
+│       │   └── round_entry.py  [Intelligence] adversarial round entry/context setup
+│       ├── discovery.py       [Intelligence] discovery orchestrator / compatibility façade
+│       ├── discovery_support/ [Intelligence] discovery helper package
+│       │   ├── models.py      [Intelligence] discovery dataclasses + parsing helpers
+│       │   ├── signals.py     [Intelligence] intent extraction + framework/signal heuristics
+│       │   ├── existing_feature.py [Intelligence] existing-feature evidence/summarization helpers
+│       │   ├── bootstrap.py   [Intelligence] first-turn bootstrap scanning + evidence ingest
+│       │   └── llm.py         [Intelligence] discovery LLM/tool-call loop wrapper
 │       ├── author.py          [Intelligence] plan authoring agent
 │       ├── authoring/         [Intelligence] author subsystem package
 │       │   ├── models.py      [Intelligence] author dataclasses + markdown helpers
@@ -122,11 +150,10 @@ prscope/
 │       │   └── pipeline.py    [Intelligence] planner pipeline coordinator
 │       ├── critic.py          [Intelligence] adversarial critic agent
 │       ├── tools.py           [Intelligence] tool definitions, file ops
-│       ├── budget.py          [Intelligence] token budget management
 │       ├── telemetry.py       [Intelligence] completion telemetry
 │       ├── transport/         [Intelligence] LLM transport adapters
 │       │   └── llm_client.py  [Intelligence] responses/chat compatibility layer
-│       ├── context/           [Intelligence] context assembly, budgeting, clarification, compression
+│       ├── context/           [Intelligence] budget, context assembly, clarification, compression
 │       ├── events/            [Intelligence] runtime analytics/tool/token event state
 │       ├── pipeline/          [Intelligence] adversarial stage loop and stage orchestration
 │       ├── review/            [Intelligence] issue graph, similarity, causality, manifesto checks
@@ -148,7 +175,7 @@ These are enforced by `tests/test_architecture.py`:
 2. **Storage** imports only from Foundation.
 3. **Intelligence** never imports from Interface.
 4. **Interface** never imports from other Interface modules except `web/` internal layering (`server→api→events`).
-5. **Runtime leaf modules** (`tools`, `budget`, `telemetry`, `transport/llm_client`) do not import from `planning.core` or `planning.executor`.
+5. **Runtime leaf modules** (`tools`, `telemetry`, `transport/llm_client`) do not import from `planning.core` or `planning.executor`.
 
 Violations are caught at CI time. See `tests/test_architecture.py`.
 

@@ -1,6 +1,11 @@
 from __future__ import annotations
 
-from prscope.memory import load_skills
+import sys
+from types import SimpleNamespace
+
+import pytest
+
+from prscope.memory import MemoryStore, load_skills
 
 
 def test_load_skills_sorted_and_boundary_safe(tmp_path):
@@ -36,3 +41,32 @@ def test_load_skills_truncates_at_boundaries(tmp_path):
     assert "### a.md" in content
     assert "### b.md" not in content
     assert content.endswith("... (truncated due to token budget)")
+
+
+@pytest.mark.asyncio
+async def test_memory_complete_emits_usage_without_logging_format_error(monkeypatch):
+    fake_response = SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content="summary block"))],
+        usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
+    )
+    fake_litellm = SimpleNamespace(completion=lambda **_: fake_response)
+    monkeypatch.setitem(sys.modules, "litellm", fake_litellm)
+
+    fake_store = SimpleNamespace(config=SimpleNamespace(memory_model="gpt-4o-mini"))
+    events: list[dict[str, object]] = []
+
+    async def _capture(event: dict[str, object]) -> None:
+        events.append(event)
+
+    result = await MemoryStore._complete(
+        fake_store,  # type: ignore[arg-type]
+        "Summarize the repo.",
+        block_name="modules",
+        event_callback=_capture,
+    )
+
+    assert result == "summary block"
+    assert len(events) == 1
+    assert events[0]["type"] == "token_usage"
+    assert events[0]["memory_block"] == "modules"
+    assert events[0]["model"] == "gpt-4o-mini"

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import json
+from types import SimpleNamespace
+
 from fastapi.testclient import TestClient
 
 from prscope.store import Store
-from prscope.web.api import create_app
+from prscope.web.api import RuntimeRegistry, _coerce_stale_processing_payload, create_app
 
 
 def _write_minimal_config(tmp_path):
@@ -62,6 +65,69 @@ def test_health_endpoint_returns_healthy(tmp_path, monkeypatch):
     assert response.json() == {"status": "healthy"}
 
 
+def test_reset_clears_visible_session_history(tmp_path, monkeypatch):
+    _write_minimal_config(tmp_path)
+    monkeypatch.setenv("PRSCOPE_CONFIG_ROOT", str(tmp_path))
+    store = Store()
+    session = store.create_planning_session(
+        repo_name=tmp_path.name,
+        title="reset me",
+        requirements="add health observability",
+        seed_type="chat",
+        status="refining",
+    )
+    store.add_planning_turn(session.id, role="user", content="create health api endpoint", round_number=0)
+    store.add_planning_turn(session.id, role="author", content="Draft ready.", round_number=0)
+    store.save_plan_version(
+        session.id,
+        round_number=0,
+        plan_content="# Old Plan\n\n## Summary\nstale",
+        plan_sha="sha-old-plan",
+    )
+    store.update_planning_session(
+        session.id,
+        _bypass_protection=True,
+        completed_tool_call_groups_json=json.dumps(
+            [
+                {
+                    "sequence": 1,
+                    "created_at": "2026-03-06T00:00:00Z",
+                    "tools": [{"name": "read_file", "status": "done"}],
+                }
+            ]
+        ),
+        diagnostics_json=json.dumps({"warnings_total": 3, "draft_phase": "planner_redraft"}),
+    )
+
+    app = create_app()
+    client = TestClient(app)
+
+    initial = client.get(f"/api/sessions/{session.id}")
+    assert initial.status_code == 200
+    assert initial.json()["current_plan"] is not None
+    assert initial.json()["conversation"]
+    assert initial.json()["session"]["completed_tool_call_groups"]
+    assert initial.json()["draft_timing"]["warnings_total"] == 3
+
+    reset = client.post(
+        f"/api/sessions/{session.id}/command",
+        json={"command": "reset", "command_id": "reset-visible-history", "payload": {}},
+    )
+    assert reset.status_code == 200
+
+    refreshed = client.get(f"/api/sessions/{session.id}")
+    assert refreshed.status_code == 200
+    payload = refreshed.json()
+    assert payload["session"]["status"] == "draft"
+    assert payload["conversation"] == []
+    assert payload["plan_versions"] == []
+    assert payload["current_plan"] is None
+    assert payload["session"]["active_tool_calls"] == []
+    assert payload["session"]["completed_tool_call_groups"] == []
+    assert payload["draft_timing"]["warnings_total"] == 0
+    assert payload["draft_timing"]["draft_phase"] is None
+
+
 def test_create_session_rejects_unavailable_model(tmp_path, monkeypatch):
     _write_minimal_config(tmp_path)
     monkeypatch.setenv("PRSCOPE_CONFIG_ROOT", str(tmp_path))
@@ -117,3 +183,109 @@ def test_get_session_snapshot_returns_payload(tmp_path, monkeypatch):
     assert response.status_code == 200
     payload = response.json()
     assert payload["snapshot"]["session_id"] == session.id
+
+
+def test_session_diagnostics_uses_persisted_timing(tmp_path, monkeypatch):
+    _write_minimal_config(tmp_path)
+    monkeypatch.setenv("PRSCOPE_CONFIG_ROOT", str(tmp_path))
+    store = Store()
+    session = store.create_planning_session(
+        repo_name=tmp_path.name,
+        title="diagnostics",
+        requirements="r",
+        seed_type="requirements",
+        status="draft",
+    )
+    persisted = {"warnings_total": 3, "author_call_timeouts": 2}
+    store.update_planning_session(session.id, diagnostics_json=json.dumps(persisted))
+
+    app = create_app()
+    client = TestClient(app)
+    response = client.get(f"/api/sessions/{session.id}/diagnostics?repo={tmp_path.name}")
+    assert response.status_code == 200
+    payload = response.json()
+    assert isinstance(payload.get("draft_timing"), dict)
+    assert payload.get("draft_timing_source") == "persisted_session"
+    assert payload["draft_timing"]["warnings_total"] == 3
+    assert payload["draft_timing"]["author_call_timeouts"] == 2
+
+
+def test_runtime_registry_tracks_tool_update_and_initial_draft_phase() -> None:
+    registry = RuntimeRegistry(emitter=None)  # type: ignore[arg-type]
+
+    registry.note_event(
+        "s1",
+        {
+            "type": "tool_update",
+            "tool": {
+                "status": "done",
+                "durationMs": 12.5,
+                "sessionStage": "discovery",
+            },
+        },
+    )
+    registry.note_event(
+        "s1",
+        {
+            "type": "phase_timing",
+            "session_stage": "initial_draft",
+            "state": "start",
+        },
+    )
+    registry.note_event(
+        "s1",
+        {
+            "type": "phase_timing",
+            "session_stage": "initial_draft",
+            "state": "complete",
+            "elapsed_ms": 1500,
+            "memory_elapsed_s": 0.2,
+            "planner_elapsed_s": 1.3,
+            "cache_hit": True,
+        },
+    )
+
+    timing = registry.get_session_timing("s1")
+    assert timing is not None
+    assert timing["discovery_tool_calls"] == 1
+    assert timing["tool_calls_total"] == 1
+    assert timing["initial_draft_started_at_unix_s"] is not None
+    assert timing["initial_draft_completed_at_unix_s"] is not None
+    assert timing["initial_draft_elapsed_s"] == 1.5
+    assert timing["draft_memory_elapsed_s"] == 0.2
+    assert timing["draft_planner_elapsed_s"] == 1.3
+    assert timing["draft_cache_hit"] is True
+    assert timing["first_plan_saved_at_unix_s"] is not None
+
+
+def test_coerce_stale_payload_moves_done_active_tools_to_completed_groups() -> None:
+    class _StoreStub:
+        def get_live_running_planning_command(self, _session_id: str) -> None:
+            return None
+
+    payload = {
+        "status": "draft",
+        "phase_message": None,
+        "is_processing": False,
+        "active_tool_calls": [
+            {
+                "id": "tool-1",
+                "call_id": "tool-1",
+                "name": "grep_code",
+                "status": "done",
+                "created_at": "2026-03-05T20:55:00+00:00",
+                "duration_ms": 4,
+            }
+        ],
+        "completed_tool_call_groups": [],
+    }
+
+    normalized = _coerce_stale_processing_payload(
+        session=SimpleNamespace(id="s1"),
+        payload=payload,
+        store=_StoreStub(),  # type: ignore[arg-type]
+    )
+
+    assert normalized["active_tool_calls"] == []
+    assert len(normalized["completed_tool_call_groups"]) == 1
+    assert normalized["completed_tool_call_groups"][0]["tools"][0]["name"] == "grep_code"

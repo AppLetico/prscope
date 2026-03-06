@@ -109,6 +109,7 @@ local_repo: .   # path to your repo (default: current directory)
 planning:
   author_model: gpt-4o        # drafts and refines the plan
   critic_model: gpt-4o-mini   # stress-tests it (same provider = one key)
+  memory_model: gpt-4o-mini   # optional: codebase memory build (defaults to author_model)
   output_dir: ./plans
 
 # Optional: seed plans from upstream GitHub PRs
@@ -116,7 +117,7 @@ upstream:
   - repo: owner/upstream-repo
 ```
 
-> **Both models can be any LiteLLM-supported string.** Using two OpenAI models means you only need `OPENAI_API_KEY`. Swap in `claude-3-5-sonnet-20241022` for the critic if you want cross-provider adversarial tension.
+> **All three can be any LiteLLM-supported string.** `memory_model` is used only for the "Preparing codebase memory" step; if omitted it defaults to `author_model`. Using one provider for all three means one API key; you can set `memory_model` to a cheaper/faster model (e.g. `gpt-4o-mini`) while using a stronger `author_model` for planning.
 
 ### 4. (Optional) Define your architecture constraints
 
@@ -339,8 +340,9 @@ llm:
 
 # Planning mode
 planning:
-  author_model: gpt-4o                        # any LiteLLM string
+  author_model: gpt-4o                        # any LiteLLM string (drafts + discovery)
   critic_model: claude-3-5-sonnet-20241022    # any LiteLLM string
+  memory_model: gpt-4o-mini                   # optional: codebase memory build (defaults to author_model)
   issue_dedupe:
     embeddings_enabled: auto                   # auto | true | false
     embedding_model: text-embedding-3-small    # any LiteLLM embedding model
@@ -368,7 +370,8 @@ planning:
 ```
 
 Notes:
-- `issue_dedupe.embedding_model` is independent from `author_model` / `critic_model`, so you can run Claude or Gemini for planning while using a different embedding provider.
+- `memory_model` is used only for the "Preparing codebase memory" step. Omit it to use `author_model` (backward compatible). Set it to a cheaper model (e.g. `gpt-4o-mini`) to reduce cost for memory build while keeping a stronger author/critic.
+- `issue_dedupe.embedding_model` is independent from `author_model` / `critic_model` / `memory_model`, so you can run Claude or Gemini for planning while using a different embedding provider.
 - `embeddings_enabled: auto` attempts semantic dedupe first and falls back to lexical dedupe if embeddings are unavailable.
 - With `fallback_mode: none`, dedupe will not match when embeddings fail.
 - Issue tracking is graph-backed with canonical IDs; duplicates are tracked via alias mapping (not duplicate nodes).
@@ -454,7 +457,7 @@ prscope recall "query terms with enough signal" --full
 | `GOOGLE_API_KEY`    | If using Google models                  | `gemini-pro`, etc.           |
 
 
-Prscope uses [LiteLLM](https://docs.litellm.ai/docs/providers) — any provider it supports works as `author_model`, `critic_model`, or `issue_dedupe.embedding_model`.
+Prscope uses [LiteLLM](https://docs.litellm.ai/docs/providers) — any provider it supports works as `author_model`, `critic_model`, `memory_model`, or `issue_dedupe.embedding_model`.
 Ollama local models need no API key.
 
 ---
@@ -462,7 +465,7 @@ Ollama local models need no API key.
 ## Project Structure
 
 ```
-prscope/
+src/prscope/
 ├── cli.py                      # Click CLI (plan, upstream, recall, repos groups)
 ├── config.py                   # Config + RepoProfile dataclasses
 ├── store.py                    # SQLite storage (sessions, turns, versions, session recall BM25)
@@ -470,38 +473,56 @@ prscope/
 ├── profile.py                  # Local repo file tree profiling
 ├── scoring.py                  # Upstream PR relevance scoring
 ├── github.py                   # GitHub REST client
+├── llm.py                      # LLM call abstraction (LiteLLM)
+├── model_catalog.py            # Model registry and API-key-aware availability
+├── pricing.py                  # Model pricing tables
 ├── planner.py                  # PlanningEngine shim
+├── benchmark.py                # HTTP-based benchmark harness
+├── semantic.py                 # Code search and similarity utilities
 ├── web/
-│   ├── api.py                  # FastAPI endpoints for planning sessions
+│   ├── api.py                  # FastAPI app factory + planning session endpoints
 │   ├── server.py               # Web server bootstrap + lifecycle
+│   ├── events.py               # Session-scoped SSE emitter
 │   ├── frontend/               # Vite/React UI source
 │   └── static/                 # Built frontend assets served by backend
 ├── planning/
 │   ├── core.py                 # Pure state machine + convergence logic
+│   ├── executor.py             # Command reserve/execute/finalize, replay, locking
 │   ├── render.py               # plan Jinja2 rendering
+│   ├── scanners/               # Codebase scanning backends (grep, repomap, repomix)
 │   └── runtime/
 │       ├── orchestration.py    # Session coordinator (locks, lifecycle, command flow)
-│       ├── author.py           # Author agent + initial draft pipeline + tool enforcement
+│       ├── orchestration_support/  # event_router, state_snapshots, initial_draft, session_starts, chat_flow, round_entry
+│       ├── discovery.py        # Discovery orchestrator (intent → evidence → insight)
+│       ├── discovery_support/  # models, signals, existing_feature, bootstrap, llm
+│       ├── author.py           # Author agent + initial draft + tool enforcement
+│       ├── authoring/          # models, discovery, validation, repair, pipeline
 │       ├── critic.py           # Critic LLM + JSON contract validation
-│       ├── discovery.py        # Generalized discovery engine (intent → evidence → insight)
 │       ├── tools.py            # Sandboxed read_file/search_codebase/list_dir
-│       ├── pipeline/           # Adversarial loop + stage implementations + round context
-│       ├── context/            # Budgeting, context assembly, compression, clarification gate
-│       ├── review/             # Issue similarity and manifesto validation helpers
-│       └── events/             # Analytics emitter + token/tool event persistence helpers
+│       ├── pipeline/           # Adversarial loop, stages, round context
+│       ├── context/            # Budgeting, context assembly, compression, clarification
+│       ├── review/             # Issue graph, similarity, causality, manifesto checker
+│       ├── events/             # Analytics emitter, tool event state, token accounting
+│       ├── transport/          # LLM client (responses/chat compatibility)
+│       ├── round_controller.py # Round progression logic
+│       ├── state.py            # Runtime planning state model
+│       └── telemetry.py        # Completion telemetry
 ├── plan_templates/
-│   └── plan.md.j2               # plan Jinja2 template
+│   └── plan.md.j2              # plan Jinja2 template
 tests/
-├── test_config.py              # Config + multi-repo parsing
-├── test_store.py               # DB including planning tables + search_sessions
-├── test_memory_skills.py        # load_skills() boundary and truncation
-├── test_planning_core.py       # Convergence logic + constraint parsing
-├── test_cli.py                 # CLI command surface
-├── test_scoring.py             # PR relevance scoring
-├── test_profile.py             # Codebase profiling
-├── test_github.py              # GitHub client
-└── test_semantic.py            # Semantic similarity
+├── test_config.py             # Config + multi-repo parsing
+├── test_store.py              # DB including planning tables + search_sessions
+├── test_memory_skills.py      # load_skills() boundary and truncation
+├── test_planning_core.py      # Convergence logic + constraint parsing
+├── test_cli.py                # CLI command surface
+├── test_scoring.py            # PR relevance scoring
+├── test_profile.py            # Codebase profiling
+├── test_github.py             # GitHub client
+├── test_semantic.py           # Semantic similarity
+└── test_architecture.py       # Import boundary and layer rules
 ```
+
+For layer ordering, dependency rules, and the full package map, see **`ARCHITECTURE.md`**.
 
 ---
 

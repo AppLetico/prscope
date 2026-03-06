@@ -73,13 +73,13 @@ check: lint
 # Lint and typecheck only (no tests): backend ruff + frontend eslint + tsc
 lint-typecheck: lint
 	ruff format --check .
-	@cd prscope/web/frontend && npm run lint && npx tsc --noEmit
+	@cd src/prscope/web/frontend && npm run lint && npx tsc --noEmit
 
 # Full CI parity: what .github/workflows/ci.yml runs (lint, format check, tests, frontend lint + build)
 ci: lint
 	ruff format --check .
 	pytest -q
-	@cd prscope/web/frontend && npm run lint && npm run build
+	@cd src/prscope/web/frontend && npm run lint && npm run build
 
 # Clean build artifacts
 clean:
@@ -147,7 +147,7 @@ web-backend:
 
 # Start Vite dev server (frontend)
 web-frontend:
-	cd prscope/web/frontend && npm run dev
+	cd src/prscope/web/frontend && npm run dev
 
 # Kill processes on backend (8420) and frontend (5173) ports
 web-kill:

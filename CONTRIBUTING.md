@@ -14,6 +14,8 @@ Thanks for contributing to Prscope.
 
 ```bash
 pip install -e ".[dev]"
+# or
+make dev
 ```
 
 Run checks before opening a PR:
@@ -21,15 +23,23 @@ Run checks before opening a PR:
 ```bash
 ruff check .
 pytest
+# or
+make check
 ```
 
-Frontend changes should also pass:
+Frontend changes should also pass. From repo root:
 
 ```bash
-cd prscope/web/frontend
+cd src/prscope/web/frontend
 npm ci
 npm run lint
 npm run build
+```
+
+Or run full CI parity (Python lint, format check, tests, plus frontend lint and build):
+
+```bash
+make ci
 ```
 
 ## CI Expectations
@@ -47,10 +57,10 @@ If your PR can affect planning behavior, latency, or output quality, benchmarkin
 
 This includes changes in (or adjacent to):
 
-- `prscope/planning/runtime/`
-- `prscope/store.py`
-- `prscope/memory.py`
-- `prscope/scoring.py`
+- `src/prscope/planning/runtime/`
+- `src/prscope/store.py`
+- `src/prscope/memory.py`
+- `src/prscope/scoring.py`
 - model/tool orchestration and prompt behavior
 
 Run benchmark suite:

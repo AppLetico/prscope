@@ -276,21 +276,24 @@ Before merging runtime/state changes, verify:
 
 Use this as a quick ownership guide when making state-machine-adjacent changes:
 
-- `prscope/planning/runtime/orchestration.py`
+- `src/prscope/planning/runtime/orchestration.py`
   - Session coordinator only: locking, lifecycle entrypoints, core transition calls, and event dispatch wiring.
   - Should not re-absorb stage implementation logic.
-- `prscope/planning/runtime/pipeline/adversarial_loop.py`
+- `src/prscope/planning/runtime/orchestration_support/*`
+  - Houses extracted orchestration concerns: event routing/versioning, state snapshot IO,
+    initial-draft bootstrap flow, session start adapters, chat/discovery flow, and round entry setup.
+- `src/prscope/planning/runtime/pipeline/adversarial_loop.py`
   - Executes staged refinement round flow and sequencing.
-- `prscope/planning/runtime/pipeline/stages.py`
+- `src/prscope/planning/runtime/pipeline/stages.py`
   - Stage implementations (`design_review`, `repair_plan`, `revise_plan`, `validation_review`, `convergence_check`).
   - Uses explicit dependency injection (author, critic, manifesto checker, emit/memory adapters), not full runtime access.
-- `prscope/planning/runtime/author.py`
+- `src/prscope/planning/runtime/author.py`
   - Author-side planning behavior, including initial draft flow (`run_initial_draft`) and author loop/tool policy.
-- `prscope/planning/runtime/context/*`
+- `src/prscope/planning/runtime/context/*`
   - Context assembly, token budgeting, critique compression, and clarification gate logic.
-- `prscope/planning/runtime/review/*`
+- `src/prscope/planning/runtime/review/*`
   - Critique support services: manifesto validation and issue similarity/dedupe.
-- `prscope/planning/runtime/events/*`
+- `src/prscope/planning/runtime/events/*`
   - Event shaping, token accounting, and tool event state persistence.
 
 Design intent:

@@ -22,41 +22,47 @@ In `prscope`, the harness is the operational envelope around planning agents and
 
 Core components:
 
-- `prscope/web/api.py`
+- `src/prscope/web/api.py`
   - Canonical command endpoint: `POST /api/sessions/{id}/command`
   - Wrapper endpoints (`/message`, `/round`, `/approve`, `/export`, `/stop`) route through the same executor
   - Command gate order: replay -> allowed revalidation -> processing lock -> reserve row
   - SSE endpoint with **snapshot-on-connect** (`session_state` emitted first)
-- `prscope/web/events.py`
+- `src/prscope/web/events.py`
   - Session-scoped, **multi-subscriber** emitter (`set` of queues per session)
-- `prscope/planning/core.py`
+- `src/prscope/planning/core.py`
   - Canonical state machine (`ALLOWED_TRANSITIONS`, `VALID_COMMANDS`)
   - Only protected-state write path: `transition_and_snapshot()`
   - Invariants for draft coherence, processing derivation, and round monotonicity
-- `prscope/planning/executor.py`
+- `src/prscope/planning/executor.py`
   - Two-phase command execution (`reserve` -> `execute` -> `finalize`)
   - Centralized replay, locking, lease heartbeat, and snapshot persistence
   - Command handlers return `HandlerResult` only (no direct snapshot/lock logic)
-- `prscope/planning/runtime/orchestration.py`
+- `src/prscope/planning/runtime/orchestration.py`
   - Acts as session coordinator (locks, lifecycle, core transitions, command flow)
+  - Delegates orchestration concerns to `src/prscope/planning/runtime/orchestration_support/*`
+    (`event_router`, `state_snapshots`, `initial_draft`, `session_starts`, `chat_flow`, `round_entry`)
   - Delegates initial draft planning prompt construction/execution to `AuthorAgent.run_initial_draft()`
   - Enforces persist-then-emit sequencing for runtime events
   - Emits unified `tool_update` events (replacing separate `tool_call`/`tool_result`)
   - Stamps every SSE event with a monotonic `session_version` for ordering guarantees
   - Persists completed tool groups with `sequence` and `created_at` before emitting snapshots
   - Persists bounded active tool calls (`MAX_ACTIVE_TOOL_CALLS = 50`)
-- `prscope/planning/runtime/pipeline/*`
-  - `AdversarialPlanningLoop` runs staged refinement rounds
-  - `PlanningStages` owns stage implementations (`design_review` -> `repair` -> `revise` -> `validation` -> `convergence`)
+- `src/prscope/planning/runtime/pipeline/*`
+  - `adversarial_loop.py`: runs staged refinement rounds
+  - `stages.py`: stage implementations (`design_review` -> `repair` -> `revise` -> `validation` -> `convergence`)
+  - `round_context.py`: round context assembly
   - Stage dependencies are injected explicitly (author, critic, manifesto checker, event + memory adapters), avoiding full runtime coupling
-- `prscope/planning/runtime/discovery.py`
-  - Generalized discovery engine (feature intent extraction + evidence-first questioning)
-  - Registry-scored framework detection and signal indexing
-  - Session-scoped bootstrap insights (`existing_feature`, `feature_label`, evidence paths)
-- `prscope/store.py`
+- `src/prscope/planning/runtime/discovery.py`
+  - Discovery turn orchestrator and compatibility façade
+  - Delegates helper logic to `src/prscope/planning/runtime/discovery_support/*`
+    (`models`, `signals`, `existing_feature`, `bootstrap`, `llm`)
+  - Keeps session-scoped bootstrap insights (`existing_feature`, `feature_label`, evidence paths)
+- `src/prscope/planning/runtime/authoring/*`
+  - Author subsystem: `models`, `discovery`, `validation`, `repair`, `pipeline`
+- `src/prscope/store.py`
   - Session schema fields for canonical UI state (`status`, `phase_message`, `pending_questions_json`, etc.)
   - Runtime guard preventing direct writes to protected state fields
-- `prscope/benchmark.py`
+- `src/prscope/benchmark.py`
   - Harness validation loop for latency and quality
 
 ## Canonical Session State Model

@@ -19,8 +19,15 @@ async def test_author_loop_forwards_model_override(tmp_path):
 
     captured: dict[str, str | None] = {"model": None}
 
-    async def fake_llm_call(messages, *, allow_tools=True, max_output_tokens=None, model_override=None):
-        del messages, allow_tools, max_output_tokens
+    async def fake_llm_call(
+        messages,
+        *,
+        allow_tools=True,
+        max_output_tokens=None,
+        model_override=None,
+        timeout_seconds_override=None,
+    ):
+        del messages, allow_tools, max_output_tokens, timeout_seconds_override
         captured["model"] = model_override
         content = (
             "# Plan Title\n\n## Goals\n- G\n\n## Non-Goals\n- N\n\n## Files Changed\n- `a.py`\n\n## Architecture\n- A\n"

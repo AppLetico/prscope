@@ -74,6 +74,11 @@ def test_select_scan_directories_skips_vendor_and_hidden():
     manager = DiscoveryManager.__new__(DiscoveryManager)
     ranked = manager._select_scan_directories(
         [
+            {"path": "prscope", "type": "dir"},
+            {"path": "prscope/web", "type": "dir"},
+            {"path": "docs", "type": "dir"},
+            {"path": "plans", "type": "dir"},
+            {"path": "benchmarks", "type": "dir"},
             {"path": "src", "type": "dir"},
             {"path": "src/server.ts", "type": "file"},
             {"path": "backend", "type": "dir"},
@@ -86,6 +91,9 @@ def test_select_scan_directories_skips_vendor_and_hidden():
     assert ranked
     assert "node_modules" not in ranked
     assert ".github" not in ranked
+    assert "prscope" in ranked
+    assert "docs" not in ranked
+    assert "plans" not in ranked
 
 
 def test_build_signal_index_and_detect_code_signals():
@@ -104,16 +112,17 @@ def test_build_signal_index_and_detect_code_signals():
     assert scores["cli"] >= 1
 
 
-def test_detect_framework_prefers_highest_score():
+def test_detect_framework_prefers_runtime_code_over_test_fixtures():
     manager = DiscoveryManager.__new__(DiscoveryManager)
     matches = [
-        {"path": "src/server.ts", "line": 1, "text": "const app = express()"},
-        {"path": "src/server.ts", "line": 2, "text": "app.get('/users', handler)"},
-        {"path": "src/router.ts", "line": 5, "text": "router.post('/login', login)"},
+        {"path": "tests/test_discovery_parser.py", "line": 1, "text": "const app = express()"},
+        {"path": "tests/test_discovery_parser.py", "line": 2, "text": "app.get('/users', handler)"},
+        {"path": "tests/test_discovery_parser.py", "line": 3, "text": "router.post('/login', login)"},
         {"path": "api/main.py", "line": 2, "text": "from fastapi import FastAPI"},
+        {"path": "prscope/web/api.py", "line": 960, "text": "@app.get('/health')"},
     ]
     index = manager._build_signal_index(matches)
-    assert manager._detect_framework(index) == "express"
+    assert manager._detect_framework(index) == "fastapi"
 
 
 def test_detect_architecture_from_signal_scores():
@@ -232,7 +241,7 @@ def test_detect_code_signals_returns_positive_entries_only():
 
 
 def test_discovery_engine_has_no_feature_specific_logic():
-    source = Path("prscope/planning/runtime/discovery.py").read_text()
+    source = Path("src/prscope/planning/runtime/discovery.py").read_text()
     tree = ast.parse(source)
     forbidden_tokens = ["health", "graphql", "websocket", "celery"]
     allow = {"_extract_feature_intent"}

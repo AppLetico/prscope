@@ -2,9 +2,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 from prscope.config import PlanningConfig
 from prscope.planning.runtime.author import AuthorAgent, RepoUnderstanding
+from prscope.planning.runtime.authoring.models import RepoCandidates
+from prscope.planning.runtime.authoring.pipeline import AuthorPlannerPipeline
 from prscope.planning.runtime.tools import ToolExecutor
 
 
@@ -101,3 +106,259 @@ def test_parse_plan_document_accepts_new_markdown_native_fields(tmp_path: Path) 
     parsed = AuthorAgent._parse_plan_document(raw)
     assert parsed.non_goals == "Non-Goals"
     assert "a.py" in parsed.files_changed
+
+
+@pytest.mark.asyncio
+async def test_author_planner_pipeline_run_logs_without_formatting_errors(caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level("INFO")
+    repo_understanding = RepoUnderstanding(
+        entrypoints=["app.py"],
+        core_modules=["app.py"],
+        relevant_modules=["app.py"],
+        relevant_tests=["tests/test_app.py"],
+        architecture_summary="single module",
+        risks=[],
+        file_contents={"app.py": "def health():\n    return {'status': 'healthy'}\n"},
+        from_mental_model=False,
+    )
+
+    async def _draft_plan(**_: object) -> str:
+        return "Update `app.py` and `tests/test_app.py`."
+
+    pipeline = AuthorPlannerPipeline(
+        tool_executor=SimpleNamespace(memory_block_callback=None, read_history={"app.py": "read"}),
+        scan_repo_candidates=lambda **_: RepoCandidates(
+            entrypoints=["app.py"],
+            source_modules=["app.py"],
+            tests_and_config=["tests/test_app.py"],
+            all_paths=["app.py", "tests/test_app.py"],
+        ),
+        explore_repo=lambda **_: repo_understanding,
+        classify_complexity=lambda **_: "simple",
+        draft_plan=_draft_plan,
+        validate_draft=lambda **_: [],
+    )
+
+    result = await pipeline.run(
+        requirements="Improve the health endpoint summary.",
+        min_grounding_ratio=None,
+        grounding_paths={"app.py"},
+        model_override=None,
+        rejection_counts={},
+        rejection_reasons=[],
+        timeout_seconds_override=None,
+    )
+
+    assert result.plan.startswith("Update `app.py`")
+    assert "planner_pipeline total=" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_author_planner_pipeline_redrafts_invalid_planner_output() -> None:
+    repo_understanding = RepoUnderstanding(
+        entrypoints=["prscope/web/api.py"],
+        core_modules=["prscope/web/api.py"],
+        relevant_modules=["prscope/web/api.py"],
+        relevant_tests=["tests/test_web_api_models.py"],
+        architecture_summary="single FastAPI module",
+        risks=[],
+        file_contents={
+            "prscope/web/api.py": "@app.get('/health')\nasync def health():\n    return {'status': 'healthy'}\n"
+        },
+        from_mental_model=False,
+    )
+    calls: list[dict[str, object]] = []
+
+    async def _draft_plan(**kwargs: object) -> str:
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return """# Bad Planner Draft
+
+## Goals
+- Add observability.
+
+## Non-Goals
+- None.
+
+## Files Changed
+- `prscope/web/api.py`
+
+## Architecture
+- Add logs.
+
+## Implementation Steps
+1. Modify `prscope/web/api.py`.
+"""
+        return """# Health Observability Outline
+
+## Summary
+Add lightweight observability to the existing health route without changing its external behavior.
+
+## Goals
+- Add request logging for health checks.
+- Capture simple health endpoint metrics in the existing backend.
+
+## Non-Goals
+- Redesign the health endpoint contract.
+
+## Changes
+- Extend the existing health implementation in `prscope/web/api.py`.
+- Cover the new behavior in `tests/test_web_api_models.py`.
+
+## Files Changed
+- `prscope/web/api.py` to record health-check telemetry.
+- `tests/test_web_api_models.py` to verify the endpoint contract and observability hooks.
+
+## Architecture
+- Keep the FastAPI route in `prscope/web/api.py` as the integration point for health telemetry.
+- Emit lightweight logs/metrics alongside the existing response path so the endpoint stays cheap and deterministic.
+
+## Open Questions
+- None.
+"""
+
+    pipeline = AuthorPlannerPipeline(
+        tool_executor=SimpleNamespace(memory_block_callback=None, read_history={"prscope/web/api.py": "read"}),
+        scan_repo_candidates=lambda **_: RepoCandidates(
+            entrypoints=["prscope/web/api.py"],
+            source_modules=["prscope/web/api.py"],
+            tests_and_config=["tests/test_web_api_models.py"],
+            all_paths=["prscope/web/api.py", "tests/test_web_api_models.py"],
+        ),
+        explore_repo=lambda **_: repo_understanding,
+        classify_complexity=lambda **_: "simple",
+        draft_plan=_draft_plan,
+        validate_draft=AuthorAgent(  # type: ignore[misc]
+            config=PlanningConfig(author_model="gpt-4o-mini"),
+            tool_executor=ToolExecutor(Path(".")),
+        ).validate_draft,
+    )
+
+    result = await pipeline.run(
+        requirements="Enhance the existing health implementation with observability.",
+        min_grounding_ratio=0.35,
+        grounding_paths={"prscope/web/api.py"},
+        model_override=None,
+        rejection_counts={},
+        rejection_reasons=[],
+        timeout_seconds_override=None,
+    )
+
+    assert len(calls) == 2
+    assert calls[0]["draft_phase"] == "planner"
+    assert calls[1]["draft_phase"] == "planner"
+    assert calls[1]["revision_hints"]
+    assert "Implementation Steps" not in result.plan
+    assert "`prscope/web/api.py`" in result.plan
+
+
+@pytest.mark.asyncio
+async def test_author_planner_pipeline_accepts_grounded_seed_path_without_redraft() -> None:
+    repo_understanding = RepoUnderstanding(
+        entrypoints=[],
+        core_modules=[],
+        relevant_modules=[],
+        relevant_tests=[],
+        architecture_summary="seeded by discovery only",
+        risks=[],
+        file_contents={},
+        from_mental_model=False,
+    )
+    calls: list[dict[str, object]] = []
+
+    async def _draft_plan(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return """# Health Observability Outline
+
+## Summary
+Add observability to the existing health route.
+
+## Goals
+- Improve visibility into health checks.
+
+## Non-Goals
+- Create a new route.
+
+## Changes
+- Update the existing health endpoint implementation.
+
+## Files Changed
+- `prscope/web/api.py`: extend the existing health route behavior.
+
+## Architecture
+- Keep the change localized to `prscope/web/api.py`.
+
+## Open Questions
+- None.
+"""
+
+    pipeline = AuthorPlannerPipeline(
+        tool_executor=SimpleNamespace(memory_block_callback=None, read_history={}),
+        scan_repo_candidates=lambda **_: RepoCandidates(
+            entrypoints=[],
+            source_modules=[],
+            tests_and_config=[],
+            all_paths=[],
+        ),
+        explore_repo=lambda **_: repo_understanding,
+        classify_complexity=lambda **_: "simple",
+        draft_plan=_draft_plan,
+        validate_draft=AuthorAgent(  # type: ignore[misc]
+            config=PlanningConfig(author_model="gpt-4o-mini"),
+            tool_executor=ToolExecutor(Path(".")),
+        ).validate_draft,
+    )
+
+    result = await pipeline.run(
+        requirements="Enhance the existing health implementation with observability.",
+        min_grounding_ratio=0.35,
+        grounding_paths={"prscope/web/api.py"},
+        model_override=None,
+        rejection_counts={},
+        rejection_reasons=[],
+        timeout_seconds_override=None,
+    )
+
+    assert len(calls) == 1
+    assert result.rejection_reasons == []
+    assert result.plan.startswith("# Health Observability Outline")
+
+
+@pytest.mark.asyncio
+async def test_draft_plan_uses_planner_specific_prompt(tmp_path: Path) -> None:
+    agent = _make_agent(tmp_path)
+    repo_understanding = RepoUnderstanding(
+        entrypoints=["prscope/web/api.py"],
+        core_modules=["prscope/web/api.py"],
+        relevant_modules=["prscope/web/api.py"],
+        relevant_tests=["tests/test_web_api_models.py"],
+        architecture_summary="single FastAPI module",
+        risks=[],
+        file_contents={"prscope/web/api.py": "async def health():\n    return {'status': 'healthy'}\n"},
+        from_mental_model=False,
+    )
+    captured: dict[str, object] = {}
+
+    async def _fake_run_stage(stage: str, messages: list[dict[str, object]], **kwargs: object) -> str:
+        captured["stage"] = stage
+        captured["messages"] = messages
+        captured["kwargs"] = kwargs
+        return (
+            "# Draft\n\n## Goals\n- x\n\n## Non-Goals\n- y\n\n## Files Changed\n"
+            "- `prscope/web/api.py`\n\n## Architecture\n- z"
+        )
+
+    agent.stage_runner.run_stage = _fake_run_stage  # type: ignore[method-assign]
+
+    await agent.draft_plan(
+        requirements="Enhance the health endpoint with observability.",
+        repo_understanding=repo_understanding,
+        draft_phase="planner",
+    )
+
+    messages = captured["messages"]
+    assert isinstance(messages, list)
+    assert 'Do NOT include "Implementation Steps"' in str(messages[0]["content"])
+    assert "Produce a concise grounded planner draft" in str(messages[1]["content"])
+    assert "## Verified File Paths" in str(messages[1]["content"])
+    assert "`prscope/web/api.py`" in str(messages[1]["content"])
