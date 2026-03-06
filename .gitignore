@@ -15,6 +15,9 @@ dist/
 build/
 .eggs/
 *.egg
+.venv/
+venv/
+env/
 
 # Testing
 .pytest_cache/
@@ -22,10 +25,19 @@ build/
 htmlcov/
 
 # IDE
+.cursor/
 .vscode/
 .idea/
 *.swp
 *.swo
+
+# Node / frontend
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+.env.local
+.env.*.local
 
 # OS
 .DS_Store
