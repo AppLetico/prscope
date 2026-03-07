@@ -174,6 +174,22 @@ export function PlanningViewPage() {
   ]);
 
   useEffect(() => {
+    if (hasCurrentPlan || turns.length > 0 || effectiveStatus === "refining" || effectiveStatus === "converged") {
+      setInitialSetupDone(true);
+    }
+  }, [effectiveStatus, hasCurrentPlan, turns.length]);
+
+  useEffect(() => {
+    if (!id || initialSetupDone || hasCurrentPlan) {
+      return;
+    }
+    const intervalId = window.setInterval(() => {
+      void refetchSession();
+    }, 1500);
+    return () => window.clearInterval(intervalId);
+  }, [hasCurrentPlan, id, initialSetupDone, refetchSession]);
+
+  useEffect(() => {
     dispatchTl({ type: "sync_turns", turns });
   }, [turns]);
 
@@ -234,6 +250,7 @@ export function PlanningViewPage() {
       dispatchTl({ type: "complete" });
       setThinkingMessage(null);
       setWarnings([]);
+      setInitialSetupDone(true);
       const now = Date.now();
       if (now - lastRefetchAtMs.current >= 800) {
         lastRefetchAtMs.current = now;
@@ -244,6 +261,7 @@ export function PlanningViewPage() {
     if (event.type === "plan_ready") {
       dispatchTl({ type: "plan_ready" });
       setThinkingMessage(null);
+      setInitialSetupDone(true);
       if (event.round === 0) {
         setShowCritiquePrompt(true);
       }

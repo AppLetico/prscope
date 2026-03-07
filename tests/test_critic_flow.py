@@ -8,7 +8,12 @@ import pytest
 
 from prscope.config import PlanningConfig, RepoProfile
 from prscope.memory import ParsedConstraint
-from prscope.planning.runtime.critic import CriticAgent, CriticContractError, ImplementabilityResult
+from prscope.planning.runtime.critic import (
+    REVIEWER_SYSTEM_PROMPT,
+    CriticAgent,
+    CriticContractError,
+    ImplementabilityResult,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -31,6 +36,13 @@ _HC002 = ParsedConstraint(
 def _make_agent(tmp_path: Path) -> CriticAgent:
     repo = RepoProfile(name="alpha", path=str(tmp_path))
     return CriticAgent(config=PlanningConfig(critic_model="gpt-4o-mini"), repo=repo)
+
+
+def test_reviewer_prompt_preserves_scope_for_simple_health_endpoints() -> None:
+    assert "Preserve the user's requested scope" in REVIEWER_SYSTEM_PROMPT
+    assert "A public `/health` endpoint is acceptable by default" in REVIEWER_SYSTEM_PROMPT
+    assert 'Add a lightweight /health endpoint and tests for it' in REVIEWER_SYSTEM_PROMPT
+    assert "logging, monitoring, telemetry, or documentation work" in REVIEWER_SYSTEM_PROMPT
 
 
 def _review_json(
@@ -159,6 +171,55 @@ async def test_run_critic_normalizes_confidence_to_lowercase(tmp_path):
     )
     assert result.parse_error is None
     assert result.confidence == "high"
+
+
+@pytest.mark.asyncio
+async def test_run_critic_filters_scope_creep_for_lightweight_health_requests(tmp_path):
+    agent = _make_agent(tmp_path)
+
+    def fake_llm_call(messages, temperature, model_override=None):
+        del messages, temperature, model_override
+        payload = json.loads(_review_json())
+        payload["blocking_issues"] = [
+            "Lack of error handling for the /health endpoint.",
+            "Lack of dependency checks for the /health endpoint.",
+        ]
+        payload["recommended_changes"] = [
+            "Implement graceful error handling for unexpected failures.",
+            "Add database and external-service dependency checks.",
+            "Add authentication to the /health endpoint.",
+            "Add logging and monitoring for every health request.",
+        ]
+        payload["architectural_concerns"] = [
+            "Endpoint may raise an unhandled exception.",
+            "Missing authentication for the /health endpoint.",
+        ]
+        payload["risks"] = [
+            "Unhandled exceptions may return 500 responses.",
+            "Missing dependency checks may misreport service health.",
+        ]
+        payload["issue_priority"] = [
+            "Lack of dependency checks for the /health endpoint.",
+            "Lack of error handling for the /health endpoint.",
+        ]
+        payload["primary_issue"] = "Lack of dependency checks for the /health endpoint."
+        return json.dumps(payload), SimpleNamespace(usage=None), "gpt-4o-mini"
+
+    agent._llm_call = fake_llm_call  # type: ignore[method-assign]
+    result = await agent.run_critic(
+        requirements="Add a lightweight /health endpoint and tests for it.",
+        plan_content="Add `/health` to `src/prscope/web/api.py` and tests in `tests/test_web_api_models.py`.",
+        manifesto="M",
+        architecture="A",
+        constraints=[_HC001],
+        max_retries=0,
+    )
+
+    assert result.primary_issue == "Lack of error handling for the /health endpoint."
+    assert result.blocking_issues == ["Lack of error handling for the /health endpoint."]
+    assert result.recommended_changes == ["Implement graceful error handling for unexpected failures."]
+    assert result.architectural_concerns == ["Endpoint may raise an unhandled exception."]
+    assert result.risks == ["Unhandled exceptions may return 500 responses."]
 
 
 @pytest.mark.asyncio

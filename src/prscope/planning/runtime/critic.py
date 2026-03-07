@@ -22,6 +22,14 @@ from .telemetry import completion_telemetry
 PERSPECTIVE_TIMEOUT_SECONDS = 20.0
 PERSPECTIVE_SYNTHESIS_BUDGET_SECONDS = 45.0
 
+SCOPE_EXPANSION_PATTERNS = (
+    re.compile(r"\bauthentication\b|\bauthorization\b|\bunauthorized\b", re.IGNORECASE),
+    re.compile(r"\bdependency checks?\b|\bcritical dependencies\b|\bexternal services?\b|\bdatabase checks?\b", re.IGNORECASE),
+    re.compile(r"\bconcurrency\b|\bhigh[- ]load\b|\brace conditions?\b", re.IGNORECASE),
+    re.compile(r"\blogging\b|\bmonitoring\b|\btelemetry\b|\bobservability\b", re.IGNORECASE),
+    re.compile(r"\bstartup/shutdown\b|\bdocument(?:ation)?\b", re.IGNORECASE),
+)
+
 
 class CriticParseError(RuntimeError):
     """Raised on malformed reviewer contract responses."""
@@ -119,6 +127,14 @@ CriticResult = ReviewResult
 REVIEWER_SYSTEM_PROMPT = """You are a senior staff engineer reviewing a design proposal.
 Prioritize identifying architectural flaws over minor improvements.
 Your goal is to improve the design, not simply criticize it.
+
+Scope discipline rules:
+- Preserve the user's requested scope unless broader changes are clearly required by repository evidence or explicit constraints.
+- Do not recommend authentication, authorization, cross-service dependency checks, or major contract expansion for a simple health/status endpoint unless the requirements explicitly ask for them or the design would otherwise expose sensitive data.
+- A public `/health` endpoint is acceptable by default; treat it as a problem only if the plan exposes secrets, private diagnostics, or privileged controls.
+- Prefer tightening observability and failure handling within the stated scope over inventing new platform/security requirements.
+- Example: if the request is "Add a lightweight /health endpoint and tests for it", do not escalate to database checks, external-service checks, authentication, or concurrency-control work unless the request or verified evidence explicitly requires that broader behavior.
+- For that same lightweight `/health` example, do not turn the plan into logging, monitoring, telemetry, or documentation work unless the user explicitly asks for those deliverables.
 
 First perform structured analysis using these headings:
 
@@ -536,6 +552,57 @@ class CriticAgent:
         )
 
     @staticmethod
+    def _is_lightweight_health_request(requirements: str) -> bool:
+        lowered = str(requirements or "").lower()
+        if "/health" not in lowered:
+            return False
+        return any(token in lowered for token in ("lightweight", "simple", "basic"))
+
+    @staticmethod
+    def _is_scope_expansion_feedback(text: str) -> bool:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return False
+        return any(pattern.search(normalized) for pattern in SCOPE_EXPANSION_PATTERNS)
+
+    def _apply_scope_discipline(self, requirements: str, review: ReviewResult) -> ReviewResult:
+        if not self._is_lightweight_health_request(requirements):
+            return review
+
+        def _filter(items: list[str]) -> list[str]:
+            return [item for item in items if not self._is_scope_expansion_feedback(item)]
+
+        blocking_issues = _filter(review.blocking_issues)
+        recommended_changes = _filter(review.recommended_changes)
+        architectural_concerns = _filter(review.architectural_concerns)
+        risks = _filter(review.risks)
+        reviewer_questions = _filter(review.reviewer_questions)
+        issue_priority = _filter(review.issue_priority)
+        primary_issue = review.primary_issue
+        if primary_issue and self._is_scope_expansion_feedback(primary_issue):
+            primary_issue = issue_priority[0] if issue_priority else None
+
+        return ReviewResult(
+            strengths=review.strengths,
+            architectural_concerns=architectural_concerns,
+            risks=risks,
+            simplification_opportunities=review.simplification_opportunities,
+            blocking_issues=blocking_issues,
+            reviewer_questions=reviewer_questions,
+            recommended_changes=recommended_changes,
+            design_quality_score=review.design_quality_score,
+            confidence=review.confidence,
+            review_complete=review.review_complete,
+            simplest_possible_design=review.simplest_possible_design,
+            primary_issue=primary_issue,
+            resolved_issues=review.resolved_issues,
+            constraint_violations=review.constraint_violations,
+            issue_priority=issue_priority,
+            prose=review.prose,
+            parse_error=review.parse_error,
+        )
+
+    @staticmethod
     def _coerce_optional_text(value: Any) -> str:
         if value is None:
             return ""
@@ -752,7 +819,8 @@ class CriticAgent:
             try:
                 if mode == "implementability":
                     return self._parse_implementability_response(raw)
-                return self._parse_review_response(raw)
+                parsed = self._parse_review_response(raw)
+                return self._apply_scope_discipline(requirements, parsed)
             except CriticParseError as exc:
                 if strict_mode and attempt >= max_retries:
                     raise CriticContractError(f"Reviewer contract parse failure: {exc}") from exc

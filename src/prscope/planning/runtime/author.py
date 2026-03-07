@@ -211,6 +211,9 @@ Non-negotiable rules:
 3. Reference only concrete file paths in backticks.
 4. Keep the draft concise and avoid speculative implementation detail.
 5. Do not include code fences, example snippets, or mermaid diagrams in this phase.
+6. If the repository evidence shows the requested route, feature, or integration point already exists, plan to modify the existing implementation instead of creating a parallel one.
+7. For endpoint or route changes, mention both the expected success response and minimal failure/error handling, but do not broaden the design into dependency checks, authentication, or platform work unless the requirements require that.
+8. For lightweight endpoint requests, keep observability, logging, and documentation notes proportional; do not turn them into explicit workstreams unless the user asked for them.
 
 Required markdown sections and order:
 - # <Relevant plan title>
@@ -247,6 +250,7 @@ Non-negotiable rules:
 3. Reference concrete file paths in backticks where relevant.
 4. Prefer specific, actionable steps over abstract guidance.
 5. Think 6-12 months ahead: call out lock-in risks, migration impacts, and maintenance cost.
+6. If the repository evidence shows the requested route, feature, or integration point already exists, revise the existing implementation instead of creating a duplicate one unless the requirements explicitly demand a new parallel path.
 
 Required markdown sections and order:
 - # <Relevant plan title>
@@ -510,14 +514,21 @@ class AuthorAgent:
         timeout_seconds_override: int | Callable[[], int] | None = None,
     ) -> str:
         system_prompt = PLANNER_SYSTEM_PROMPT if draft_phase == "planner" else REFINER_SYSTEM_PROMPT
-        verified_paths = sorted(
-            set(repo_understanding.entrypoints)
-            | set(repo_understanding.core_modules)
-            | set(repo_understanding.relevant_modules)
-            | set(repo_understanding.relevant_tests)
-            | set(repo_understanding.file_contents.keys())
+        prioritized_verified_paths: list[str] = []
+        for group in (
+            repo_understanding.relevant_modules,
+            repo_understanding.relevant_tests,
+            list(repo_understanding.file_contents.keys()),
+            repo_understanding.entrypoints,
+            repo_understanding.core_modules,
+        ):
+            for path in group:
+                normalized = str(path).strip()
+                if normalized and normalized not in prioritized_verified_paths:
+                    prioritized_verified_paths.append(normalized)
+        verified_paths_block = (
+            "\n".join(f"- `{path}`" for path in prioritized_verified_paths[:40]) or "- (none captured)"
         )
-        verified_paths_block = "\n".join(f"- `{path}`" for path in verified_paths[:20]) or "- (none captured)"
         messages = [
             {"role": "system", "content": system_prompt},
             {
@@ -528,6 +539,11 @@ class AuthorAgent:
                     f"## Repository Understanding\n{json.dumps(repo_understanding.__dict__, indent=2)}\n\n"
                     f"## Architecture Design\n{json.dumps(architecture.__dict__, indent=2) if architecture else '(none)'}\n\n"
                     f"## Revision Hints\n{json.dumps(revision_hints or [], indent=2)}\n\n"
+                    "## Grounding Rules\n"
+                    "- Use only exact spellings from Verified File Paths when naming files.\n"
+                    "- Do not invent new test filenames or modules.\n"
+                    "- If the provided evidence already shows the requested behavior exists, plan to extend that implementation rather than adding a duplicate.\n"
+                    "- If existing evidence names the same route, endpoint, handler, or test target, do not describe the change as introducing a brand-new feature.\n\n"
                     + (
                         "Produce a concise grounded planner draft that satisfies the planner-phase constraints. "
                         "When you reference files, use the exact spellings from Verified File Paths."

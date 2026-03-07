@@ -29,6 +29,21 @@ REQUIREMENT_STOPWORDS = {
     "only",
 }
 
+LOW_SIGNAL_GREP_KEYWORDS = {
+    "endpoint",
+    "endpoints",
+    "feature",
+    "features",
+    "handler",
+    "handlers",
+    "route",
+    "routes",
+    "tests",
+    "test",
+    "change",
+    "changes",
+}
+
 NON_TRIVIAL_EXTENSIONS = {
     ".py",
     ".ts",
@@ -85,7 +100,7 @@ def is_entrypoint_like(path: str) -> bool:
     lower = path.lower()
     base = lower.rsplit("/", 1)[-1]
     return (
-        base in {"main.py", "app.py", "server.py", "index.ts", "index.tsx", "index.js"}
+        base in {"main.py", "app.py", "server.py", "api.py", "index.ts", "index.tsx", "index.js"}
         or "/cli" in lower
         or "/cmd/" in lower
         or "/bin/" in lower
@@ -118,6 +133,37 @@ def extract_paths_from_mental_model(mental_model: str) -> set[str]:
         return set()
     candidates = re.findall(r"`([A-Za-z0-9_./-]+\.[A-Za-z0-9]+)`", mental_model)
     return {path.strip() for path in candidates if path.strip()}
+
+
+def requirement_search_patterns(text: str) -> list[str]:
+    route_literals = re.findall(r"/[A-Za-z0-9_./:-]+", text)
+    patterns: list[str] = [re.escape(route.strip()) for route in route_literals if route.strip()]
+    keywords = [
+        token
+        for token in sorted(requirements_keywords(text), key=lambda item: (-len(item), item))
+        if token not in LOW_SIGNAL_GREP_KEYWORDS
+    ]
+    for keyword in keywords[:4]:
+        patterns.append(rf"\b{re.escape(keyword)}\b")
+    # Preserve order while removing duplicates.
+    return list(dict.fromkeys(patterns))
+
+
+def grep_match_priority(line: str) -> int:
+    lowered = str(line or "").strip().lower()
+    if not lowered:
+        return 0
+    if re.search(r"@(app|router)\.(get|post|put|patch|delete)\(", lowered):
+        return 6
+    if re.search(r"\bclient\.(get|post|put|patch|delete)\(", lowered):
+        return 5
+    if re.search(r"^\s*(async\s+def|def)\s+\w+", lowered):
+        return 4
+    if lowered.startswith(("assert ", "response = ", "return ")):
+        return 3
+    if lowered.startswith(("#", '"', "'")):
+        return 1
+    return 2
 
 
 class AuthorDiscoveryService:
@@ -175,7 +221,9 @@ class AuthorDiscoveryService:
         discovered_files.update(mental_model_paths)
 
         entrypoints = sorted(path for path in discovered_files if is_entrypoint_like(path))
-        source_modules = sorted(path for path in discovered_files if is_non_trivial_source(path))
+        source_modules = sorted(
+            path for path in discovered_files if is_non_trivial_source(path) and not is_test_or_config(path)
+        )
         tests_and_config = sorted(path for path in discovered_files if is_test_or_config(path))
         return RepoCandidates(
             entrypoints=entrypoints,
@@ -194,6 +242,37 @@ class AuthorDiscoveryService:
     ) -> RepoUnderstanding:
         seeded_paths = extract_paths_from_mental_model(mental_model or "")
         req_keywords = requirements_keywords(requirements)
+        search_roots: list[str | None] = []
+        top_level_roots = []
+        for path in [*candidates.source_modules, *candidates.tests_and_config]:
+            root = str(path).split("/", 1)[0]
+            if root and root not in top_level_roots:
+                top_level_roots.append(root)
+        for preferred in ("src", "tests", "test"):
+            if preferred in top_level_roots:
+                search_roots.append(preferred)
+        search_roots.extend(root for root in top_level_roots if root not in {"src", "tests", "test"})
+        if not search_roots:
+            search_roots = [None]
+        grep_hits_by_path: dict[str, list[tuple[int, str]]] = {}
+        for pattern in requirement_search_patterns(requirements):
+            for root in search_roots:
+                try:
+                    payload = self.tool_executor.grep_code(pattern=pattern, path=root, max_results=40)
+                except Exception:  # noqa: BLE001
+                    continue
+                for match in payload.get("results", []):
+                    path = str(match.get("path", "")).strip()
+                    if not path:
+                        continue
+                    try:
+                        line_number = int(match.get("line", 0) or 0)
+                    except (TypeError, ValueError):
+                        line_number = 0
+                    grep_hits_by_path.setdefault(path, [])
+                    if line_number > 0:
+                        grep_hits_by_path[path].append((line_number, str(match.get("text", ""))))
+        score_by_path: dict[str, int] = {}
         scored_paths: list[tuple[int, str]] = []
         for path in candidates.all_paths:
             tokens = path_tokens(path)
@@ -205,14 +284,53 @@ class AuthorDiscoveryService:
                 score += 1
             if path in seeded_paths:
                 score += 2
+            if path in grep_hits_by_path:
+                score += 5 + min(3, len(grep_hits_by_path[path]))
+            if ("test" in req_keywords or "tests" in req_keywords) and path in candidates.tests_and_config:
+                score += 2
+            score_by_path[path] = score
             scored_paths.append((score, path))
         scored_paths.sort(key=lambda item: (-item[0], item[1]))
-        selected = [path for _, path in scored_paths[: max(1, max_file_reads)]]
+        wants_tests = "test" in req_keywords or "tests" in req_keywords
+        source_candidates = [path for _, path in scored_paths if path in candidates.source_modules]
+        test_candidates = [path for _, path in scored_paths if path in candidates.tests_and_config]
+        selected: list[str] = []
+        if source_candidates:
+            reserved_for_test = 1 if wants_tests and test_candidates and max_file_reads > 1 else 0
+            source_budget = max(1, max_file_reads - reserved_for_test)
+            selected.extend(source_candidates[:source_budget])
+        if wants_tests and test_candidates:
+            source_token_pool: set[str] = set()
+            for path in selected or source_candidates[:2]:
+                source_token_pool |= path_tokens(path)
+            ranked_tests = sorted(
+                test_candidates,
+                key=lambda path: (
+                    -len(path_tokens(path) & source_token_pool),
+                    -(score_by_path.get(path, 0)),
+                    path,
+                ),
+            )
+            for path in ranked_tests:
+                if path not in selected:
+                    selected.append(path)
+                if len(selected) >= max(1, max_file_reads):
+                    break
+        for _, path in scored_paths:
+            if path not in selected:
+                selected.append(path)
+            if len(selected) >= max(1, max_file_reads):
+                break
 
         file_contents: dict[str, str] = {}
         for path in selected:
             try:
-                payload = self.tool_executor.read_file(path=path, max_lines=140)
+                match_lines = grep_hits_by_path.get(path, [])
+                if match_lines:
+                    focus_line, _ = max(match_lines, key=lambda item: (grep_match_priority(item[1]), item[0]))
+                    payload = self.tool_executor.read_file(path=path, around_line=focus_line, radius=60)
+                else:
+                    payload = self.tool_executor.read_file(path=path, max_lines=140)
                 text = str(payload.get("content", "")).strip()
                 if text:
                     file_contents[path] = text
@@ -221,11 +339,23 @@ class AuthorDiscoveryService:
 
         relevant_modules = [path for path in selected if path in candidates.source_modules]
         relevant_tests = [path for path in selected if path in candidates.tests_and_config]
+        evidence_notes: list[str] = []
+        for path in selected:
+            matches = grep_hits_by_path.get(path, [])
+            if not matches:
+                continue
+            focus_line, focus_text = max(matches, key=lambda item: (grep_match_priority(item[1]), item[0]))
+            if grep_match_priority(focus_text) >= 4:
+                evidence_notes.append(f"{path}:{focus_line} {focus_text}")
+            if len(evidence_notes) >= 3:
+                break
         architecture_summary = (
             "Mental model seeded exploration with deterministic candidate scanning."
             if mental_model
-            else "Deterministic repository scan based on entrypoints/source/test-config heuristics."
+            else "Deterministic repository scan based on entrypoints/source/test-config heuristics plus keyword/route grep hits."
         )
+        if evidence_notes:
+            architecture_summary += " Existing matching evidence: " + " | ".join(evidence_notes)
         risks: list[str] = []
         if not file_contents:
             risks.append("Unable to read candidate files during exploration")

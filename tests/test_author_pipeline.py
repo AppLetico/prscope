@@ -8,6 +8,7 @@ import pytest
 
 from prscope.config import PlanningConfig
 from prscope.planning.runtime.author import AuthorAgent, RepoUnderstanding
+from prscope.planning.runtime.authoring.discovery import requirement_search_patterns
 from prscope.planning.runtime.authoring.models import PlanDocument, RepairPlan, RepoCandidates
 from prscope.planning.runtime.authoring.pipeline import AuthorPlannerPipeline
 from prscope.planning.runtime.authoring.repair import AuthorRepairService
@@ -34,6 +35,7 @@ def test_scan_repo_candidates_discovers_entrypoints_and_configs(tmp_path: Path) 
     assert "src/service.py" in candidates.source_modules
     assert "pyproject.toml" in candidates.tests_and_config
     assert "tests/test_service.py" in candidates.tests_and_config
+    assert "tests/test_service.py" not in candidates.source_modules
     assert "src/service.py" in candidates.all_paths
 
 
@@ -54,6 +56,76 @@ def test_explore_repo_reads_ranked_files(tmp_path: Path) -> None:
     assert any(path.endswith(".py") for path in understanding.file_contents)
     assert understanding.architecture_summary
     assert isinstance(understanding.risks, list)
+
+
+def test_requirement_search_patterns_prioritize_route_literals_and_keywords() -> None:
+    patterns = requirement_search_patterns("Add a lightweight /health endpoint and tests for it.")
+
+    assert r"/health" in patterns
+    assert r"\bhealth\b" in patterns
+    assert all("endpoint" not in pattern for pattern in patterns)
+
+
+def test_explore_repo_reads_around_grep_hits_for_deep_route_definitions(tmp_path: Path) -> None:
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "api.py").write_text(
+        "\n".join(
+            [
+                "from fastapi import FastAPI",
+                "app = FastAPI()",
+                *[f'# filler {idx}' for idx in range(1, 190)],
+                '@app.get(\"/health\")',
+                "async def health():",
+                "    return {\"status\": \"healthy\"}",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_api.py").write_text(
+        "def test_health():\n    assert True\n",
+        encoding="utf-8",
+    )
+
+    agent = _make_agent(tmp_path)
+    candidates = agent.scan_repo_candidates(mental_model="")
+    understanding = agent.explore_repo(
+        requirements="Add a lightweight /health endpoint and tests for it.",
+        candidates=candidates,
+    )
+
+    api_contents = understanding.file_contents.get("src/api.py", "")
+    assert "/health" in api_contents
+    assert "async def health" in api_contents
+
+
+def test_explore_repo_prefers_source_files_and_related_tests_for_endpoint_work(tmp_path: Path) -> None:
+    (tmp_path / "src" / "prscope" / "web").mkdir(parents=True)
+    (tmp_path / "src" / "prscope" / "web" / "api.py").write_text(
+        '@app.get("/health")\nasync def health():\n    return {"status": "healthy"}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "prscope" / "web" / "server.py").write_text("from .api import create_app\n", encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_web_api_models.py").write_text(
+        'def test_health_endpoint_returns_healthy():\n    response = client.get("/health")\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "tests" / "test_discovery_parser.py").write_text(
+        'payload = {"text": "Add a lightweight /health endpoint and tests for it."}\n',
+        encoding="utf-8",
+    )
+
+    agent = _make_agent(tmp_path)
+    candidates = agent.scan_repo_candidates(mental_model="")
+    understanding = agent.explore_repo(
+        requirements="Add a lightweight /health endpoint and tests for it.",
+        candidates=candidates,
+    )
+
+    assert "src/prscope/web/api.py" in understanding.file_contents
+    assert "tests/test_web_api_models.py" in understanding.file_contents
 
 
 def test_classify_complexity_uses_module_count_and_keywords(tmp_path: Path) -> None:
@@ -417,3 +489,45 @@ async def test_draft_plan_uses_planner_specific_prompt(tmp_path: Path) -> None:
     assert "Produce a concise grounded planner draft" in str(messages[1]["content"])
     assert "## Verified File Paths" in str(messages[1]["content"])
     assert "`prscope/web/api.py`" in str(messages[1]["content"])
+    assert "minimal failure/error handling" in str(messages[0]["content"])
+    assert "do not turn them into explicit workstreams" in str(messages[0]["content"])
+
+
+@pytest.mark.asyncio
+async def test_draft_plan_prioritizes_relevant_verified_paths_and_existing_guidance(tmp_path: Path) -> None:
+    agent = _make_agent(tmp_path)
+    repo_understanding = RepoUnderstanding(
+        entrypoints=[f"src/module_{idx}.py" for idx in range(30)],
+        core_modules=[f"src/module_{idx}.py" for idx in range(30)],
+        relevant_modules=["src/prscope/web/api.py"],
+        relevant_tests=["tests/test_web_api_models.py"],
+        architecture_summary="single FastAPI module",
+        risks=[],
+        file_contents={"src/prscope/web/api.py": '@app.get("/health")\nasync def health():\n    return {"status": "healthy"}\n'},
+        from_mental_model=False,
+    )
+    captured: dict[str, object] = {}
+
+    async def _fake_run_stage(stage: str, messages: list[dict[str, object]], **kwargs: object) -> str:
+        captured["messages"] = messages
+        return (
+            "# Draft\n\n## Summary\nx\n\n## Goals\n- x\n\n## Non-Goals\n- y\n\n## Changes\n- z\n\n"
+            "## Files Changed\n- `src/prscope/web/api.py`\n\n## Architecture\n- a\n\n## Open Questions\n- None.\n"
+        )
+
+    agent.stage_runner.run_stage = _fake_run_stage  # type: ignore[method-assign]
+
+    await agent.draft_plan(
+        requirements="Add a lightweight /health endpoint and tests for it.",
+        repo_understanding=repo_understanding,
+        draft_phase="planner",
+    )
+
+    messages = captured["messages"]
+    assert isinstance(messages, list)
+    user_prompt = str(messages[1]["content"])
+    assert "`src/prscope/web/api.py`" in user_prompt
+    assert "`tests/test_web_api_models.py`" in user_prompt
+    assert "Do not invent new test filenames or modules." in user_prompt
+    assert "plan to extend that implementation rather than adding a duplicate" in user_prompt
+    assert "do not describe the change as introducing a brand-new feature" in user_prompt
