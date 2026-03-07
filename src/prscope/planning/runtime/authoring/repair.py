@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Awaitable
 from typing import Any, Callable
 
@@ -44,9 +45,22 @@ def extract_first_json_object(raw: str) -> tuple[str, str]:
     return raw[start:end], raw[end:].strip()
 
 
+def load_json_object(raw: str) -> dict[str, Any]:
+    """Parse JSON object with lightweight repair for common LLM syntax slips."""
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        # Common malformed output from LLMs: trailing commas in objects/arrays.
+        repaired = re.sub(r",(\s*[}\]])", r"\1", raw)
+        payload = json.loads(repaired)
+    if not isinstance(payload, dict):
+        raise ValueError("Expected JSON object payload")
+    return payload
+
+
 def parse_plan_document(raw: str) -> PlanDocument:
     json_text, _ = extract_first_json_object(raw)
-    payload = json.loads(json_text)
+    payload = load_json_object(json_text)
     required = [
         "title",
         "summary",
@@ -57,12 +71,13 @@ def parse_plan_document(raw: str) -> PlanDocument:
         "implementation_steps",
         "test_strategy",
         "rollback_plan",
-        "open_questions",
     ]
     missing = [field for field in required if field not in payload]
     if missing:
         raise ValueError(f"Missing required PlanDocument fields: {missing}")
-    return PlanDocument(**{field: str(payload[field]) for field in required})
+    plan_payload = {field: str(payload[field]) for field in required}
+    plan_payload["open_questions"] = str(payload.get("open_questions", ""))
+    return PlanDocument(**plan_payload)
 
 
 class AuthorRepairService:
@@ -113,7 +128,7 @@ class AuthorRepairService:
         )
         raw = str(getattr(response.choices[0].message, "content", None) or "")
         json_text, _ = extract_first_json_object(raw)
-        payload = json.loads(json_text)
+        payload = load_json_object(json_text)
         return RepairPlan(
             problem_understanding=str(payload.get("problem_understanding", "")),
             accepted_issues=[str(item) for item in payload.get("accepted_issues", [])],
@@ -166,7 +181,7 @@ class AuthorRepairService:
         )
         raw = str(getattr(response.choices[0].message, "content", None) or "")
         json_text, _ = extract_first_json_object(raw)
-        payload = json.loads(json_text)
+        payload = load_json_object(json_text)
         return {
             "problem_summary": str(payload.get("problem_summary", "")),
             "constraints": [str(item) for item in payload.get("constraints", [])],
@@ -229,7 +244,7 @@ class AuthorRepairService:
         )
         raw = str(getattr(response.choices[0].message, "content", None) or "")
         json_text, _ = extract_first_json_object(raw)
-        payload = json.loads(json_text)
+        payload = load_json_object(json_text)
         updates_raw = payload.get("updates", {})
         justification_raw = payload.get("justification", {})
         updates = {str(k): str(v) for k, v in updates_raw.items() if isinstance(k, str)}

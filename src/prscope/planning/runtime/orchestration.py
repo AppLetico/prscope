@@ -32,6 +32,13 @@ from .context import ClarificationGate, ContextAssembler, CritiqueCompressor
 from .critic import CriticAgent, CriticResult, ImplementabilityResult, ReviewResult
 from .discovery import DiscoveryManager, DiscoveryTurnResult
 from .events import ToolEventStateManager
+from .followups import (
+    FollowupEngine,
+    decision_graph_from_json,
+    decision_graph_from_open_questions,
+    decision_graph_to_json,
+    followups_to_json,
+)
 from .orchestration_support import (
     RuntimeChatFlow,
     RuntimeEventRouter,
@@ -122,6 +129,7 @@ class PlanningRuntime:
         )
         self._stages = PlanningStages(
             emit_event=self._emit_event,
+            attach_plan_artifacts=self._attach_plan_version_artifacts,
             repo_memory=self._repo_memory,
             critic=self.critic,
             author=self.author,
@@ -142,6 +150,7 @@ class PlanningRuntime:
         self._session_starts = RuntimeSessionStarts(self)
         self._chat_flow = RuntimeChatFlow(self)
         self._round_entry = RuntimeRoundEntry(self)
+        self._followup_engine = FollowupEngine()
 
     def _resolve_author_model(
         self,
@@ -605,6 +614,50 @@ class PlanningRuntime:
             + "Open the plan panel to review and continue refining."
         )
 
+    def _plan_artifact_payloads(
+        self,
+        *,
+        plan_document: PlanDocument,
+        plan_content: str,
+        current_version_id: int | None,
+        previous_graph_json: str | None = None,
+    ) -> tuple[str, str]:
+        current_graph = decision_graph_from_open_questions(getattr(plan_document, "open_questions", ""))
+        previous_graph = decision_graph_from_json(previous_graph_json)
+        if previous_graph.nodes:
+            for node_id, previous in previous_graph.nodes.items():
+                current = current_graph.nodes.get(node_id)
+                if current is not None and current.value is None:
+                    current.value = previous.value
+        followups = self._followup_engine.generate(
+            current_graph=current_graph,
+            plan_content=plan_content,
+            plan_version_id=current_version_id,
+        )
+        return decision_graph_to_json(current_graph), followups_to_json(followups)
+
+    def _attach_plan_version_artifacts(
+        self,
+        *,
+        version_id: int | None,
+        plan_document: PlanDocument,
+        plan_content: str,
+        previous_graph_json: str | None = None,
+    ) -> None:
+        if version_id is None:
+            return
+        decision_graph_json, followups_json = self._plan_artifact_payloads(
+            plan_document=plan_document,
+            plan_content=plan_content,
+            current_version_id=version_id,
+            previous_graph_json=previous_graph_json,
+        )
+        self.store.update_plan_version_artifacts(
+            version_id=version_id,
+            decision_graph_json=decision_graph_json,
+            followups_json=followups_json,
+        )
+
     def _critic_chat_summary(
         self,
         critic: CriticResult,
@@ -766,6 +819,22 @@ class PlanningRuntime:
             session_id=session_id,
             user_message=user_message,
             author_model_override=author_model_override,
+            event_callback=event_callback,
+        )
+
+    async def handle_refinement_message(
+        self,
+        session_id: str,
+        user_message: str,
+        author_model_override: str | None = None,
+        critic_model_override: str | None = None,
+        event_callback: Any | None = None,
+    ) -> tuple[str, str | None]:
+        return await self._chat_flow.handle_refinement_message(
+            session_id=session_id,
+            user_message=user_message,
+            author_model_override=author_model_override,
+            critic_model_override=critic_model_override,
             event_callback=event_callback,
         )
 

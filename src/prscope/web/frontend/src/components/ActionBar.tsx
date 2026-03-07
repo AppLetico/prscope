@@ -41,7 +41,6 @@ export function ActionBar({
   onDelete,
   roundMetrics,
 }: ActionBarProps) {
-  const displayRound = Math.max(1, round + 1);
   const [moreOpen, setMoreOpen] = useState(false);
   const [convOpen, setConvOpen] = useState(false);
   const moreRef = useRef<HTMLDivElement>(null);
@@ -73,6 +72,9 @@ export function ActionBar({
     () => (roundMetrics ? [...roundMetrics].sort((a, b) => b.round - a.round) : []),
     [roundMetrics],
   );
+  const displayRevision = Math.max(1, round + 1);
+  const latestScoredRound = sortedMetrics.length > 0 ? Math.max(1, sortedMetrics[0].round + 1) : null;
+  const hasUnscoredRevision = latestScoredRound !== null && latestScoredRound < displayRevision;
 
   const totalCost = useMemo(
     () => sortedMetrics.reduce((sum, m) => sum + (m.call_cost_usd ?? 0), 0),
@@ -127,9 +129,11 @@ export function ActionBar({
         >
           <div className="flex items-center gap-1 sm:gap-2">
             <Tooltip content={statusTooltip}>
-              <div className="flex items-center gap-1 sm:gap-2 cursor-default">
-                <span className="text-[10px] font-mono text-zinc-400 font-medium bg-zinc-800/60 px-1 sm:px-1.5 py-0.5 rounded border border-zinc-700/50">R{displayRound}</span>
-                <div className="flex items-center gap-1 sm:gap-1.5">
+              <div className="flex items-center gap-2 cursor-default">
+                <div className="flex items-center h-5 px-2 rounded-full bg-zinc-800/50 border border-zinc-700/30 text-[10px] font-mono font-medium text-zinc-400 shadow-sm">
+                  Rev <span className="ml-1 text-zinc-200">{displayRevision}</span>
+                </div>
+                <div className="flex items-center gap-1.5">
                   {isConverged ? (
                     <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]"></div>
                   ) : isRefining ? (
@@ -152,33 +156,72 @@ export function ActionBar({
             <>
               <div className="w-px h-3 bg-zinc-800"></div>
               <div className="relative">
-                <Tooltip content={`Convergence: ${Math.round(convergenceScore * 100)}% — click for round breakdown`}>
+                <Tooltip
+                  content={
+                    hasUnscoredRevision && latestScoredRound !== null
+                      ? `Current revision: R${displayRevision}. Latest scored critique: R${latestScoredRound}. Run Review to refresh the score.`
+                      : `Convergence: ${Math.round(convergenceScore * 100)}% — click for round breakdown`
+                  }
+                >
                   <div
                     className={clsx(
                       "flex items-center gap-1 sm:gap-2 px-1 sm:px-2 py-1 -my-1 rounded-md transition-colors pointer-events-none",
                       convOpen ? "bg-zinc-800/80" : ""
                     )}
                   >
-                    <span className="text-[10px] font-mono text-zinc-500 hidden sm:inline-block">conv</span>
-                    <div className="w-8 sm:w-16 h-1.5 bg-zinc-800 rounded-full overflow-hidden">
-                      <div
-                        className={clsx(
-                          "h-full transition-all duration-1000 ease-out rounded-full",
-                          isConverged ? "bg-emerald-500" : "bg-gradient-to-r from-amber-500 to-amber-400",
-                        )}
-                        style={{ width: `${Math.max(10, Math.min(100, convergenceScore * 100))}%` }}
-                      ></div>
-                    </div>
+                    {hasUnscoredRevision && latestScoredRound !== null ? (
+                      <>
+                        <span className="text-[10px] font-mono text-zinc-500 hidden sm:inline-block">review</span>
+                        <span className="text-[10px] font-mono text-zinc-300">R{latestScoredRound}</span>
+                        <span className="hidden sm:inline-flex rounded-full border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-amber-400">
+                          stale
+                        </span>
+                      </>
+                    ) : (
+                      <>
+                        <span className="text-[10px] font-mono text-zinc-500 hidden sm:inline-block">conv</span>
+                        <div className="w-8 sm:w-16 h-1.5 bg-zinc-800 rounded-full overflow-hidden">
+                          <div
+                            className={clsx(
+                              "h-full transition-all duration-1000 ease-out rounded-full",
+                              isConverged ? "bg-emerald-500" : "bg-gradient-to-r from-amber-500 to-amber-400",
+                            )}
+                            style={{ width: `${Math.max(10, Math.min(100, convergenceScore * 100))}%` }}
+                          ></div>
+                        </div>
+                      </>
+                    )}
                   </div>
                 </Tooltip>
 
                 {convOpen && (
                   <div className="absolute left-1/2 -translate-x-1/2 top-full mt-3 w-[300px] sm:w-[480px] rounded-xl border border-zinc-800 bg-zinc-900/95 backdrop-blur-xl shadow-2xl z-[100] p-4 overflow-hidden">
-                    <div className="flex items-center justify-between mb-4">
+                    <div className="flex items-center justify-between mb-3">
                       <div className="text-[11px] font-semibold text-zinc-300 uppercase tracking-widest">
-                        Round Convergence Detail
+                        Revision and Critique History
                       </div>
                     </div>
+                    {hasUnscoredRevision && latestScoredRound !== null && (
+                      <div className="mb-4 rounded-lg border border-amber-500/20 bg-gradient-to-br from-amber-500/10 to-amber-500/5 p-3">
+                        <div className="flex flex-wrap items-center gap-2 mb-2">
+                          <span className="flex items-center gap-1.5 rounded-md bg-zinc-950/50 px-2 py-1 text-[11px] font-medium text-zinc-300 shadow-sm ring-1 ring-inset ring-white/10">
+                            <span className="text-zinc-500">Revision</span>
+                            <span className="font-mono text-zinc-200">R{displayRevision}</span>
+                          </span>
+                          <span className="text-zinc-600">→</span>
+                          <span className="flex items-center gap-1.5 rounded-md bg-zinc-950/50 px-2 py-1 text-[11px] font-medium text-zinc-300 shadow-sm ring-1 ring-inset ring-white/10">
+                            <span className="text-zinc-500">Last Critique</span>
+                            <span className="font-mono text-zinc-200">R{latestScoredRound}</span>
+                          </span>
+                          <span className="ml-auto inline-flex items-center rounded-full bg-amber-400/10 px-2 py-0.5 text-[10px] font-medium text-amber-400 ring-1 ring-inset ring-amber-400/20">
+                            Stale Score
+                          </span>
+                        </div>
+                        <p className="text-[11px] leading-relaxed text-amber-200/80">
+                          Lightweight edits changed the draft after the last full critique. This panel shows the most recent review score, not a score for the current revision.
+                        </p>
+                      </div>
+                    )}
                     {sortedMetrics.length === 0 ? (
                       <div className="text-xs text-zinc-500 py-4 text-center bg-zinc-900/30 rounded-lg border border-zinc-800">No round data yet</div>
                     ) : (
@@ -187,7 +230,7 @@ export function ActionBar({
                           <table className="w-full text-xs border-collapse">
                             <thead>
                               <tr className="text-[10px] text-zinc-500 uppercase tracking-wider border-b border-zinc-800">
-                                <th className="text-left pb-2.5 font-medium pl-2">Round</th>
+                                <th className="text-left pb-2.5 font-medium pl-2">Critique</th>
                                 <th className="text-left pb-2.5 font-medium">Progress</th>
                                 <th className="text-right pb-2.5 font-medium">Score</th>
                                 <th className="text-right pb-2.5 font-medium hidden sm:table-cell">Major</th>
@@ -200,10 +243,18 @@ export function ActionBar({
                               {sortedMetrics.map((m) => {
                                 const pct = m.convergence_score != null ? m.convergence_score : null;
                                 const barWidth = pct != null ? Math.round(pct * 100) : 0;
+                                const isLatestScored = latestScoredRound === Math.max(1, m.round + 1);
                                 return (
                                   <tr key={m.round} className="group hover:bg-zinc-900/50 transition-colors">
                                     <td className="py-2.5 pl-2 pr-3 text-zinc-400 font-mono text-[11px]">
-                                      R{Math.max(1, m.round + 1)}
+                                      <div className="flex items-center gap-2">
+                                        <span>R{Math.max(1, m.round + 1)}</span>
+                                        {isLatestScored && (
+                                          <span className="rounded-full border border-zinc-700/60 bg-zinc-800/60 px-1.5 py-0.5 text-[9px] uppercase tracking-wider text-zinc-400">
+                                            latest
+                                          </span>
+                                        )}
+                                      </div>
                                     </td>
                                     <td className="py-2.5 pr-3">
                                       <div className="w-12 sm:w-20 bg-zinc-800/80 rounded-full h-1.5 overflow-hidden">

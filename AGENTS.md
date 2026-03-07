@@ -46,6 +46,8 @@ benchmarks/                ← prompt suites, configs, historical results
 - **Manifesto**: `.prscope/manifesto.md` defines hard/soft constraints for the Critic. Keep constraints concise and actionable.
 - **Memory layers** (injection order): Manifesto → Skills → Recall → Memory blocks. Historical precedent never overrides policy.
 - **Import boundaries**: see `ARCHITECTURE.md` — layers import downward only.
+- **Simplify first**: prefer the simplest solution that satisfies the requirement. Avoid speculative abstractions, extra indirection, and unnecessary moving parts.
+- **File size**: avoid creating or growing files past ~1000 lines. When a file gets too large, split responsibilities into smaller modules/components.
 
 ## Running
 

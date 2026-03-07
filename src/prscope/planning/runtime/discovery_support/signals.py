@@ -135,6 +135,25 @@ INTENT_STOP_WORDS = {"a", "an", "the", "new", "feature", "endpoint", "support", 
 VENDOR_DIRS = {"node_modules", "venv", ".env", "dist", "build", "__pycache__", ".git", ".tox", "egg-info"}
 BACKEND_DIR_NAMES = {"backend", "api", "server", "src", "services", "web", "app", "lib"}
 LOW_SIGNAL_DIRS = {"benchmarks", "coverage", "docs", "examples", "fixtures", "plans", "public", "static"}
+LOW_SIGNAL_FILE_NAMES = {"architecture.md", "changelog.md", "contributing.md", "readme", "readme.md"}
+LOW_SIGNAL_EXTENSIONS = {".cfg", ".ini", ".json", ".jsonl", ".md", ".mdx", ".rst", ".toml", ".txt", ".yaml", ".yml"}
+CODE_EXTENSIONS = {
+    ".c",
+    ".cc",
+    ".cpp",
+    ".cs",
+    ".go",
+    ".java",
+    ".js",
+    ".jsx",
+    ".kt",
+    ".php",
+    ".py",
+    ".rb",
+    ".rs",
+    ".ts",
+    ".tsx",
+}
 CODE_NOUNS = {
     "endpoint",
     "api",
@@ -151,6 +170,43 @@ CODE_NOUNS = {
 }
 MAX_INTENT_KEYWORDS = 3
 MAX_TRUSTWORTHY_LINES = 5000
+
+
+def _path_parts(path: str) -> list[str]:
+    return [part for part in str(path or "").replace("\\", "/").lower().split("/") if part]
+
+
+def is_low_signal_path(path: str) -> bool:
+    parts = _path_parts(path)
+    if not parts:
+        return False
+    if any(part in LOW_SIGNAL_DIRS for part in parts[:-1]):
+        return True
+    filename = parts[-1]
+    if filename in LOW_SIGNAL_FILE_NAMES:
+        return True
+    return len(parts) == 1 and any(filename.endswith(ext) for ext in LOW_SIGNAL_EXTENSIONS)
+
+
+def is_code_like_path(path: str) -> bool:
+    parts = _path_parts(path)
+    if not parts:
+        return False
+    filename = parts[-1]
+    return any(filename.endswith(ext) for ext in CODE_EXTENSIONS)
+
+
+def is_trustworthy_existing_feature_path(path: str) -> bool:
+    lowered = str(path or "").replace("\\", "/").lower()
+    if not lowered:
+        return False
+    if "test" in lowered or is_low_signal_path(lowered):
+        return False
+    if lowered.endswith((".tsx", ".jsx")):
+        return False
+    if route_file_score(lowered) > 0 or location_score(lowered) > 0:
+        return True
+    return False
 
 
 def pattern_for_word(word: str) -> str:
@@ -203,6 +259,7 @@ def parse_existing_endpoint_followup_choice(user_message: str) -> str | None:
     normalized = " ".join((user_message or "").strip().split()).lower()
     if not normalized:
         return None
+    normalized = re.sub(r"^\d+\.\s*", "", normalized)
     if re.fullmatch(r"(q1[:\-\s]*)?a", normalized):
         return "A"
     if re.fullmatch(r"(q1[:\-\s]*)?b", normalized):
@@ -214,6 +271,37 @@ def parse_existing_endpoint_followup_choice(user_message: str) -> str | None:
     if "propose targeted enhancements" in normalized or "without creating a new route" in normalized:
         return "B"
     if "leave it unchanged" in normalized or "no planning needed" in normalized:
+        return "C"
+    return None
+
+
+def parse_enhancement_proposal_followup_choice(user_message: str) -> str | None:
+    normalized = " ".join((user_message or "").strip().split()).lower()
+    if not normalized:
+        return None
+    normalized = re.sub(r"^\d+\.\s*", "", normalized)
+    if re.fullmatch(r"(q1[:\-\s]*)?(a|1)", normalized):
+        return "A"
+    if re.fullmatch(r"(q1[:\-\s]*)?(b|2)", normalized):
+        return "B"
+    if re.fullmatch(r"(q1[:\-\s]*)?(c|3)", normalized):
+        return "C"
+    if (
+        "proceed with this proposal" in normalized
+        or "proceed and draft the plan from this proposal" in normalized
+        or "proceed to draft" in normalized
+        or "go ahead and draft" in normalized
+        or "draft it now" in normalized
+    ):
+        return "A"
+    if (
+        "revise the proposal" in normalized
+        or "revise the proposal first" in normalized
+        or "edit the proposal" in normalized
+        or "change the proposal" in normalized
+    ):
+        return "B"
+    if "cancel" in normalized or "leave it unchanged" in normalized:
         return "C"
     return None
 
@@ -245,6 +333,8 @@ def route_file_score(path: str) -> int:
     path_lower = normalized_path.lower()
     filename = path_lower.rsplit("/", 1)[-1]
     score = 0
+    if is_low_signal_path(path_lower):
+        score -= 6
     if any(token in path_lower for token in ("/api/", "/routes/", "/controllers/", "/handlers/")):
         score += 4
     if re.search(r"(routes?|router|controller|handler)\.", filename):
@@ -261,6 +351,8 @@ def route_file_score(path: str) -> int:
 def location_score(path: str, file_line_count: int | None = None) -> int:
     score = 0
     lowered = str(path or "").replace("\\", "/").lower()
+    if is_low_signal_path(lowered):
+        score -= 5
     if "/middleware/" in lowered:
         score += 5
     if "/routes/" in lowered:

@@ -206,6 +206,8 @@ class PlanVersion:
     round: int
     plan_content: str
     plan_json: str | None
+    decision_graph_json: str | None
+    followups_json: str | None
     plan_sha: str
     created_at: str
     changed_sections: str | None = None

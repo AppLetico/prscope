@@ -18,6 +18,7 @@ IssueStatus = Literal["open", "resolved"]
 IssueSeverity = Literal["major", "minor", "info"]
 IssueSource = Literal["critic", "validation", "inference"]
 IssueRelation = Literal["causes", "depends_on", "duplicate"]
+IssueResolutionSource = Literal["review", "lightweight"]
 
 
 @dataclass
@@ -27,6 +28,7 @@ class Issue:
     status: str
     raised_in_round: int
     resolved_in_round: int | None = None
+    resolution_source: IssueResolutionSource | None = None
 
 
 @dataclass
@@ -36,6 +38,7 @@ class IssueNode:
     status: IssueStatus
     raised_round: int
     resolved_round: int | None = None
+    resolution_source: IssueResolutionSource | None = None
     severity: IssueSeverity = "major"
     source: IssueSource = "critic"
     embedding: list[float] | None = None
@@ -132,6 +135,7 @@ class IssueGraphTracker:
             if existing.status == "resolved":
                 existing.status = "open"
                 existing.resolved_round = None
+                existing.resolution_source = None
             return self._to_issue(existing)
 
         node = IssueNode(
@@ -170,11 +174,26 @@ class IssueGraphTracker:
         self._index_edge(edge)
         self._enforce_graph_caps()
 
-    def resolve_issue(self, issue_id: str, round_number: int) -> None:
+    def resolve_issue(
+        self,
+        issue_id: str,
+        round_number: int,
+        *,
+        propagate_causes: bool = True,
+        resolution_source: IssueResolutionSource = "review",
+    ) -> None:
         root_id = self.canonical_issue_id(issue_id)
         if root_id not in self._graph.nodes:
             return
         if self._has_unresolved_dependencies(root_id):
+            return
+        if not propagate_causes:
+            node = self._graph.nodes.get(root_id)
+            if node is None or node.status == "resolved":
+                return
+            node.status = "resolved"
+            node.resolved_round = int(round_number)
+            node.resolution_source = resolution_source
             return
         queue: deque[str] = deque([root_id])
         while queue:
@@ -187,6 +206,7 @@ class IssueGraphTracker:
             if node.status != "resolved":
                 node.status = "resolved"
                 node.resolved_round = int(round_number)
+                node.resolution_source = resolution_source
             for child_id in sorted(self._children_causes.get(current_id, set())):
                 child = self._graph.nodes.get(child_id)
                 if child is None or child.status == "resolved":
@@ -283,6 +303,7 @@ class IssueGraphTracker:
                 "status": node.status,
                 "raised_round": node.raised_round,
                 "resolved_round": node.resolved_round,
+                "resolution_source": node.resolution_source,
                 "severity": node.severity,
                 "source": node.source,
                 "embedding": node.embedding,
@@ -346,6 +367,13 @@ class IssueGraphTracker:
                 status=status,
                 raised_round=int(raw.get("raised_round", 0) or 0),
                 resolved_round=(int(raw["resolved_round"]) if raw.get("resolved_round") is not None else None),
+                resolution_source=(
+                    "lightweight"
+                    if str(raw.get("resolution_source", "")).strip().lower() == "lightweight"
+                    else "review"
+                    if str(raw.get("resolution_source", "")).strip().lower() == "review"
+                    else None
+                ),
                 severity=severity,
                 source=source,
                 embedding=raw.get("embedding") if isinstance(raw.get("embedding"), list) else None,
@@ -379,6 +407,7 @@ class IssueGraphTracker:
             status=node.status,
             raised_in_round=node.raised_round,
             resolved_in_round=node.resolved_round,
+            resolution_source=node.resolution_source,
         )
 
     @staticmethod

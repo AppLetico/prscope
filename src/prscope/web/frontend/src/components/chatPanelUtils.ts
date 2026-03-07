@@ -126,6 +126,63 @@ export function shouldShowActiveToolStream(
   return hasRunningToolCalls(toolCalls) || (isProcessing && toolCalls.length > 0);
 }
 
+export function shouldHideCompletedToolGroup(group: ToolCallGroup): boolean {
+  return group.tools.length > 0;
+}
+
+export function isCollapsedCriticTurn(turn: PlanningTurn): boolean {
+  return turn.role === "critic" && turn.content.trim().toLowerCase().startsWith("design review:");
+}
+
+export function isCollapsedRepairTurn(turn: PlanningTurn): boolean {
+  return turn.role === "author" && turn.content.trim().startsWith("Repair planning complete.");
+}
+
+export function extractCriticPrimaryIssue(content: string): string | null {
+  const match = content.match(/^Primary issue:\s*(.+)$/im);
+  return match?.[1]?.trim() || null;
+}
+
+export function buildRefinementRoundSummaries(
+  timeline: TimelineItem[],
+): Record<number, { primaryIssue: string | null }> {
+  const summaries: Record<number, { primaryIssue: string | null }> = {};
+  for (const item of timeline) {
+    if (item.kind !== "turn" || !isCollapsedCriticTurn(item.turn)) continue;
+    summaries[item.turn.round] = {
+      primaryIssue: extractCriticPrimaryIssue(item.turn.content),
+    };
+  }
+  return summaries;
+}
+
+export function collapseTimelineForDisplay(timeline: TimelineItem[]): TimelineItem[] {
+  return timeline.filter((item) => {
+    if (item.kind === "tool_group") {
+      return !shouldHideCompletedToolGroup(item.group);
+    }
+    return !isCollapsedCriticTurn(item.turn) && !isCollapsedRepairTurn(item.turn);
+  });
+}
+
+export function compactTimelineToRecentRounds(
+  timeline: TimelineItem[],
+  roundsToKeep = 2,
+): TimelineItem[] {
+  const turns = timeline.filter((item): item is Extract<TimelineItem, { kind: "turn" }> => item.kind === "turn");
+  if (turns.length === 0) return timeline;
+  const latestRound = Math.max(...turns.map((item) => item.turn.round ?? 0));
+  if (latestRound <= roundsToKeep - 1) return timeline;
+  const minRoundToKeep = Math.max(0, latestRound - roundsToKeep + 1);
+  const firstUserKey = turns.find((item) => item.turn.role === "user")?.key;
+
+  return timeline.filter((item) => {
+    if (item.kind !== "turn") return true;
+    if (item.turn.round >= minRoundToKeep) return true;
+    return item.key === firstUserKey;
+  });
+}
+
 export function extractFirstJsonObject(
   raw: string,
 ): { parsed: Record<string, unknown>; start: number; end: number } | null {

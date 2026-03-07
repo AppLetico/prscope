@@ -90,6 +90,9 @@ class CommandRequest(BaseModel):
     repo: Optional[str] = None
     user_input: Optional[str] = None
     message: Optional[str] = None
+    plan_version_id: Optional[int] = None
+    followup_id: Optional[str] = None
+    followup_answer: Optional[str] = None
     author_model: Optional[str] = None
     critic_model: Optional[str] = None
     unverified_references: list[str] = Field(default_factory=list)
@@ -624,7 +627,19 @@ def _turn_to_dict(turn: Any) -> dict[str, Any]:
 
 
 def _version_to_dict(version: Any) -> dict[str, Any]:
-    return asdict(version)
+    data = asdict(version)
+    for raw_key, parsed_key in (("decision_graph_json", "decision_graph"), ("followups_json", "followups")):
+        parsed: Any = None
+        raw = data.get(raw_key)
+        if raw:
+            try:
+                payload = json.loads(str(raw))
+                if isinstance(payload, dict):
+                    parsed = payload
+            except json.JSONDecodeError:
+                parsed = None
+        data[parsed_key] = parsed
+    return data
 
 
 def create_app() -> FastAPI:
@@ -685,8 +700,8 @@ def create_app() -> FastAPI:
 
     COMMAND_MATRIX: dict[str, set[str]] = {
         "draft": {"message", "reset", "export"},
-        "refining": {"run_round", "reset", "message", "export"},
-        "converged": {"run_round", "approve", "reset", "message", "export"},
+        "refining": {"run_round", "reset", "message", "followup_answer", "export"},
+        "converged": {"run_round", "approve", "reset", "message", "followup_answer", "export"},
         "approved": {"export", "reset"},
         "error": {"reset"},
     }
@@ -823,13 +838,14 @@ def create_app() -> FastAPI:
                 await _emit_session_event(ctx.session_id, enriched)
 
             if session.status in {"refining", "converged"}:
-                reply = await runtime.chat_with_author(
+                mode, reply = await runtime.handle_refinement_message(
                     session_id=ctx.session_id,
                     user_message=message,
                     author_model_override=author_model,
+                    critic_model_override=critic_model,
                     event_callback=callback,
                 )
-                return HandlerResult(metadata={"accepted": True, "mode": "author_chat", "reply": reply})
+                return HandlerResult(metadata={"accepted": True, "mode": mode, "reply": reply})
             if session.status not in {"draft", "refining", "converged"}:
                 raise CommandConflictError("invalid_status", "message is only allowed in draft/refining/converged")
 
@@ -848,6 +864,75 @@ def create_app() -> FastAPI:
                 unverified_references=set(payload.get("unverified_references") or []),
             )
             return HandlerResult(metadata={"approved": True})
+
+        async def _followup_answer(ctx: CommandContext) -> HandlerResult:
+            session = ctx.store.get_planning_session(ctx.session_id)
+            if session is None:
+                raise ValueError("session not found")
+            current_plan = ctx.store.get_plan_versions(ctx.session_id, limit=1)
+            current = current_plan[0] if current_plan else None
+            if current is None or current.id is None:
+                raise CommandConflictError("invalid_status", "No current plan version is available")
+            plan_version_id = payload.get("plan_version_id")
+            if int(plan_version_id or 0) != int(current.id):
+                raise HTTPException(
+                    status_code=409,
+                    detail={
+                        "reason": "stale_plan_version",
+                        "detail": "This follow-up belongs to an older plan version. Refresh and answer the latest question.",
+                    },
+                )
+            followup_id = str(payload.get("followup_id") or "").strip()
+            followup_answer = str(payload.get("followup_answer") or "").strip()
+            if not followup_id or not followup_answer:
+                raise CommandConflictError("invalid_status", "followup_id and followup_answer are required")
+            question_text = followup_id
+            target_sections: list[str] = []
+            if current.followups_json:
+                try:
+                    followups_payload = json.loads(current.followups_json)
+                except json.JSONDecodeError:
+                    followups_payload = {}
+                questions_payload = followups_payload.get("questions", [])
+                if isinstance(questions_payload, list):
+                    for item in questions_payload:
+                        if not isinstance(item, dict):
+                            continue
+                        if str(item.get("id", "")) == followup_id:
+                            question_text = str(item.get("question") or followup_id)
+                            raw_sections = item.get("target_sections")
+                            if isinstance(raw_sections, list):
+                                target_sections = [str(section) for section in raw_sections if str(section).strip()]
+                            break
+
+            author_model = _validated_model_or_400(
+                payload.get("author_model") or session.author_model,
+                "author",
+            )
+            critic_model = _validated_model_or_400(
+                payload.get("critic_model") or session.critic_model,
+                "critic",
+            )
+
+            async def callback(event: dict[str, Any]) -> None:
+                enriched = dict(event)
+                enriched.setdefault("command_id", command_id)
+                await _emit_session_event(ctx.session_id, enriched)
+
+            target_hint = f" Update these section(s): {', '.join(target_sections)}." if target_sections else ""
+            user_message = (
+                f"Follow-up answer for plan version {current.id}: "
+                f"'{question_text}' -> '{followup_answer}'."
+                f"{target_hint} Apply the decision and remove any now-resolved open question."
+            )
+            mode, reply = await runtime.handle_refinement_message(
+                session_id=ctx.session_id,
+                user_message=user_message,
+                author_model_override=author_model,
+                critic_model_override=critic_model,
+                event_callback=callback,
+            )
+            return HandlerResult(metadata={"accepted": True, "mode": mode, "reply": reply})
 
         async def _export(ctx: CommandContext) -> HandlerResult:
             paths = await asyncio.to_thread(runtime.export, ctx.session_id)
@@ -915,6 +1000,7 @@ def create_app() -> FastAPI:
         handlers: dict[str, Any] = {
             "run_round": _run_round,
             "message": _message,
+            "followup_answer": _followup_answer,
             "approve": _approve,
             "export": _export,
             "reset": _reset,
@@ -1360,6 +1446,9 @@ def create_app() -> FastAPI:
             payload={
                 "user_input": payload.user_input,
                 "message": payload.message,
+                "plan_version_id": payload.plan_version_id,
+                "followup_id": payload.followup_id,
+                "followup_answer": payload.followup_answer,
                 "author_model": payload.author_model,
                 "critic_model": payload.critic_model,
                 "unverified_references": payload.unverified_references,

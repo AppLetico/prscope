@@ -28,6 +28,7 @@ class PlanDocument:
     implementation_steps: str
     test_strategy: str
     rollback_plan: str
+    # Legacy/internal-only source field. New rendered plans should not emit this section.
     open_questions: str
 
 
@@ -103,7 +104,6 @@ PLAN_SECTION_ORDER: tuple[str, ...] = (
     "implementation_steps",
     "test_strategy",
     "rollback_plan",
-    "open_questions",
 )
 
 PLAN_SECTION_TITLES: dict[str, str] = {

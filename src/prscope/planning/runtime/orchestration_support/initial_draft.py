@@ -291,9 +291,15 @@ class RuntimeInitialDraftFlow:
                 }
             )
             core.add_turn("author", self._runtime._author_chat_summary(plan_content, 0), round_number=0)
-            core.save_plan_version(plan_content, round_number=0)
+            plan_document = self._runtime._plan_document_from_version(plan_content, None)
+            version = core.save_plan_version(plan_content, round_number=0, plan_document=plan_document)
+            self._runtime._attach_plan_version_artifacts(
+                version_id=version.id,
+                plan_document=plan_document,
+                plan_content=version.plan_content,
+            )
             state = self._runtime._state(session.id, session)
-            state.plan_markdown = plan_content
+            state.plan_markdown = version.plan_content
             self._runtime._persist_state_snapshot(session.id)
             logger.info(
                 "initial_draft result=success session_id=%s cache_hit=%s memory_elapsed_s=%.3f "

@@ -287,6 +287,8 @@ class StorePlanningHistoryMixin:
         plan_content: str,
         plan_sha: str,
         plan_json: str | None = None,
+        decision_graph_json: str | None = None,
+        followups_json: str | None = None,
         changed_sections: str | None = None,
         diff_from_previous: str | None = None,
         convergence_score: float | None = None,
@@ -301,19 +303,23 @@ class StorePlanningHistoryMixin:
                         round,
                         plan_content,
                         plan_json,
+                        decision_graph_json,
+                        followups_json,
                         plan_sha,
                         changed_sections,
                         diff_from_previous,
                         convergence_score,
                         created_at
                     )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     session_id,
                     round_number,
                     plan_content,
                     plan_json,
+                    decision_graph_json,
+                    followups_json,
                     plan_sha,
                     changed_sections,
                     diff_from_previous,
@@ -334,6 +340,23 @@ class StorePlanningHistoryMixin:
                 WHERE session_id = ? AND round = ?
                 """,
                 (convergence_score, session_id, round_number),
+            )
+
+    def update_plan_version_artifacts(
+        self,
+        *,
+        version_id: int,
+        decision_graph_json: str | None,
+        followups_json: str | None,
+    ) -> None:
+        with self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE plan_versions
+                SET decision_graph_json = ?, followups_json = ?
+                WHERE id = ?
+                """,
+                (decision_graph_json, followups_json, version_id),
             )
 
     def get_plan_versions(self, session_id: str, limit: int = 20) -> list[PlanVersion]:

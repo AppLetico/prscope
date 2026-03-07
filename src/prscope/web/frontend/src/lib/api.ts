@@ -213,6 +213,23 @@ export function submitClarification(sessionId: string, answers: string[]) {
   });
 }
 
+export function answerPlanFollowup(
+  sessionId: string,
+  payload: {
+    plan_version_id: number;
+    followup_id: string;
+    followup_answer: string;
+    author_model?: string;
+    critic_model?: string;
+  },
+) {
+  const command_id = crypto.randomUUID();
+  return request<{ accepted?: boolean; mode?: string; reply?: string }>(`/api/sessions/${sessionId}/command`, {
+    method: "POST",
+    body: JSON.stringify({ command: "followup_answer", command_id, ...payload }),
+  });
+}
+
 export function approveSession(sessionId: string) {
   const command_id = crypto.randomUUID();
   return request<{ approved?: boolean; status?: string }>(`/api/sessions/${sessionId}/command`, {

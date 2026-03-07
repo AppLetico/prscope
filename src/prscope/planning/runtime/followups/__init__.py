@@ -1,0 +1,35 @@
+from .decision_graph import (
+    DEFAULT_DECISION_CATALOG,
+    DecisionCatalogEntry,
+    DecisionGraph,
+    DecisionNode,
+    FollowupQuestionArtifact,
+    FollowupSuggestionArtifact,
+    PlanFollowupsArtifact,
+    apply_answer_to_graph,
+    decision_graph_from_json,
+    decision_graph_from_open_questions,
+    decision_graph_to_json,
+    followups_from_json,
+    followups_to_json,
+    graph_to_followup_questions,
+)
+from .engine import FollowupEngine
+
+__all__ = [
+    "DEFAULT_DECISION_CATALOG",
+    "DecisionCatalogEntry",
+    "DecisionGraph",
+    "DecisionNode",
+    "FollowupEngine",
+    "FollowupQuestionArtifact",
+    "FollowupSuggestionArtifact",
+    "PlanFollowupsArtifact",
+    "apply_answer_to_graph",
+    "decision_graph_from_json",
+    "decision_graph_from_open_questions",
+    "decision_graph_to_json",
+    "followups_from_json",
+    "followups_to_json",
+    "graph_to_followup_questions",
+]

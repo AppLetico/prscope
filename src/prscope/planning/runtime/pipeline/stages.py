@@ -16,11 +16,21 @@ from ..review import ManifestoCheckResult
 from .round_context import PlanningRoundContext
 
 
+def review_issue_severity(issue_kind: str) -> str:
+    normalized = str(issue_kind).strip().lower()
+    if normalized in {"architectural_concern", "validation_architectural_concern", "implementability_detail"}:
+        return "minor"
+    if normalized in {"recommended_change", "reviewer_question"}:
+        return "info"
+    return "major"
+
+
 class PlanningStages:
     def __init__(
         self,
         *,
         emit_event: Callable[[Any | None, dict[str, Any], str], Any],
+        attach_plan_artifacts: Callable[..., Any],
         repo_memory: Callable[[Any], dict[str, str]],
         critic: Any,
         author: Any,
@@ -31,6 +41,7 @@ class PlanningStages:
         causality_extractor: Any | None = None,
     ) -> None:
         self._emit_event = emit_event
+        self._attach_plan_artifacts = attach_plan_artifacts
         self._repo_memory = repo_memory
         self._critic = critic
         self._author = author
@@ -116,7 +127,13 @@ class PlanningStages:
         )
         for item in [*review_result.blocking_issues, *review_result.architectural_concerns]:
             if item.strip():
-                ctx.issue_tracker.add_issue(item, ctx.round_number)
+                kind = "blocking_issue" if item in review_result.blocking_issues else "architectural_concern"
+                ctx.issue_tracker.add_issue(
+                    item,
+                    ctx.round_number,
+                    severity=review_issue_severity(kind),  # type: ignore[arg-type]
+                    source="critic",
+                )
         primary_issue_id = ""
         if review_result.primary_issue and review_result.primary_issue.strip():
             primary_issue_id = ctx.issue_tracker.add_issue(
@@ -127,13 +144,20 @@ class PlanningStages:
             for derived_item in [*review_result.blocking_issues, *review_result.architectural_concerns]:
                 if not derived_item.strip():
                     continue
-                derived = ctx.issue_tracker.add_issue(derived_item, ctx.round_number, source="critic")
+                kind = "blocking_issue" if derived_item in review_result.blocking_issues else "architectural_concern"
+                derived = ctx.issue_tracker.add_issue(
+                    derived_item,
+                    ctx.round_number,
+                    severity=review_issue_severity(kind),  # type: ignore[arg-type]
+                    source="critic",
+                )
                 if primary_issue_id and derived.id:
                     ctx.issue_tracker.add_edge(primary_issue_id, derived.id, "causes")
         for constraint_id in review_result.constraint_violations:
             constraint_issue = ctx.issue_tracker.add_issue(
                 f"Constraint violation: {constraint_id}",
                 ctx.round_number,
+                severity=review_issue_severity("constraint_violation"),  # type: ignore[arg-type]
                 source="critic",
             )
             if primary_issue_id and constraint_issue.id:
@@ -147,6 +171,22 @@ class PlanningStages:
                 round_number=ctx.round_number,
             )
         return review_result
+
+    def _emit_plan_artifacts(
+        self,
+        *,
+        ctx: PlanningRoundContext,
+        version_id: int | None,
+        plan_document: PlanDocument,
+        plan_content: str,
+        previous_graph_json: str | None,
+    ) -> None:
+        self._attach_plan_artifacts(
+            version_id=version_id,
+            plan_document=plan_document,
+            plan_content=plan_content,
+            previous_graph_json=previous_graph_json,
+        )
 
     async def repair_plan(
         self,
@@ -213,7 +253,11 @@ class PlanningStages:
             rejected = {item.strip() for item in repair_plan.rejected_issues}
             unresolved_must_fix = [item for item in must_fix_issues if item not in accepted and item not in rejected]
             for unresolved in unresolved_must_fix:
-                ctx.issue_tracker.add_issue(f"Must-fix unresolved without rationale: {unresolved}", ctx.round_number)
+                ctx.issue_tracker.add_issue(
+                    f"Must-fix unresolved without rationale: {unresolved}",
+                    ctx.round_number,
+                    severity=review_issue_severity("must_fix"),  # type: ignore[arg-type]
+                )
                 await self._emit_event(
                     ctx.event_callback,
                     {
@@ -272,11 +316,19 @@ class PlanningStages:
         updated_plan = apply_section_updates(current_plan_doc, revision_result.updates)
         updated_markdown = render_markdown(updated_plan)
         changed_sections = sorted(list(revision_result.updates.keys()))
-        ctx.core.save_plan_version(
+        previous_version = ctx.core.get_current_plan()
+        version = ctx.core.save_plan_version(
             updated_markdown,
             round_number=ctx.round_number,
             plan_document=updated_plan,
             changed_sections=changed_sections,
+        )
+        self._emit_plan_artifacts(
+            ctx=ctx,
+            version_id=version.id,
+            plan_document=updated_plan,
+            plan_content=updated_markdown,
+            previous_graph_json=getattr(previous_version, "decision_graph_json", None),
         )
         ctx.state.plan_markdown = updated_markdown
         architecture_changed = any(section in {"architecture", "files_changed"} for section in changed_sections)
@@ -370,11 +422,22 @@ class PlanningStages:
             validation_primary_id = ctx.issue_tracker.add_issue(
                 validation_review.primary_issue,
                 ctx.round_number,
+                severity=review_issue_severity("validation_primary_issue"),  # type: ignore[arg-type]
                 source="validation",
             ).id
         for item in [*validation_review.blocking_issues, *validation_review.architectural_concerns]:
             if item.strip():
-                issue = ctx.issue_tracker.add_issue(item, ctx.round_number, source="validation")
+                kind = (
+                    "validation_blocking_issue"
+                    if item in validation_review.blocking_issues
+                    else "validation_architectural_concern"
+                )
+                issue = ctx.issue_tracker.add_issue(
+                    item,
+                    ctx.round_number,
+                    severity=review_issue_severity(kind),  # type: ignore[arg-type]
+                    source="validation",
+                )
                 if validation_primary_id and issue.id:
                     ctx.issue_tracker.add_edge(validation_primary_id, issue.id, "causes")
         if self._causality_extractor is not None:
@@ -451,7 +514,11 @@ class PlanningStages:
             )
             if not implementability.implementable:
                 for detail in implementability.missing_details:
-                    ctx.issue_tracker.add_issue(detail, ctx.round_number)
+                    ctx.issue_tracker.add_issue(
+                        detail,
+                        ctx.round_number,
+                        severity=review_issue_severity("implementability_detail"),  # type: ignore[arg-type]
+                    )
 
         open_issue_count = len(ctx.issue_tracker.open_issues())
         root_open_issue_count = len(ctx.issue_tracker.root_open_issues())

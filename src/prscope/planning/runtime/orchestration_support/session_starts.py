@@ -168,7 +168,13 @@ class RuntimeSessionStarts:
             author_result.design_record
         )
         core.add_turn("author", self._runtime._author_chat_summary(author_result.plan, 0), round_number=0)
-        core.save_plan_version(author_result.plan, round_number=0)
+        plan_document = self._runtime._plan_document_from_version(author_result.plan, None)
+        version = core.save_plan_version(author_result.plan, round_number=0, plan_document=plan_document)
+        self._runtime._attach_plan_version_artifacts(
+            version_id=version.id,
+            plan_document=plan_document,
+            plan_content=version.plan_content,
+        )
         core.transition("refining")
         return self._runtime.store.get_planning_session(session.id) or session
 

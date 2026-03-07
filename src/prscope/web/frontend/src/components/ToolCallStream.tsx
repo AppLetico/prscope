@@ -10,6 +10,7 @@ const PLAN_PHASE_NAMES: Record<string, { label: string; icon: "draft" | "critiqu
   apply_critique: { label: "Revising design", icon: "refine" },
   review_validation: { label: "Validating changes", icon: "critique" },
   implementability_check: { label: "Checking implementability", icon: "critique" },
+  lightweight_edit: { label: "Lightweight plan edit", icon: "refine" },
 };
 
 interface ToolCallStreamProps {
@@ -54,7 +55,7 @@ export function ToolCallStream({
     }
   }, [isEffectivelyRunning]);
   
-  const isOpen = stableRunningState ? true : (userOpen ?? defaultOpen);
+  const isOpen = userOpen ?? defaultOpen;
 
   if (toolCalls.length === 0) return null;
 

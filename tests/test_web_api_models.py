@@ -210,6 +210,103 @@ def test_session_diagnostics_uses_persisted_timing(tmp_path, monkeypatch):
     assert payload["draft_timing"]["author_call_timeouts"] == 2
 
 
+def test_get_session_parses_version_followups_payload(tmp_path, monkeypatch):
+    _write_minimal_config(tmp_path)
+    monkeypatch.setenv("PRSCOPE_CONFIG_ROOT", str(tmp_path))
+    store = Store()
+    session = store.create_planning_session(
+        repo_name=tmp_path.name,
+        title="followups",
+        requirements="r",
+        seed_type="requirements",
+        status="refining",
+    )
+    version = store.save_plan_version(
+        session.id,
+        round_number=1,
+        plan_content="# Plan\n\n## Summary\nready",
+        plan_sha="sha-followups",
+        followups_json=json.dumps(
+            {
+                "plan_version_id": 7,
+                "questions": [
+                    {
+                        "id": "response_schema",
+                        "question": "Which response shape should we use?",
+                        "options": ["preserve existing schema", "add response_time field"],
+                        "target_sections": ["architecture"],
+                        "concept": "response_schema",
+                        "resolved": False,
+                    }
+                ],
+                "suggestions": [{"id": "expand_observability", "suggestion": "Add rollout metrics."}],
+            }
+        ),
+    )
+    assert version.id is not None
+
+    app = create_app()
+    client = TestClient(app)
+    response = client.get(f"/api/sessions/{session.id}")
+    assert response.status_code == 200
+    payload = response.json()
+    current_plan = payload["current_plan"]
+    assert current_plan["followups"]["questions"][0]["id"] == "response_schema"
+    assert current_plan["followups"]["suggestions"][0]["id"] == "expand_observability"
+
+
+def test_followup_answer_rejects_stale_plan_version(tmp_path, monkeypatch):
+    _write_minimal_config(tmp_path)
+    monkeypatch.setenv("PRSCOPE_CONFIG_ROOT", str(tmp_path))
+    store = Store()
+    session = store.create_planning_session(
+        repo_name=tmp_path.name,
+        title="followups",
+        requirements="r",
+        seed_type="requirements",
+        status="refining",
+    )
+    version = store.save_plan_version(
+        session.id,
+        round_number=1,
+        plan_content="# Plan\n\n## Summary\nready",
+        plan_sha="sha-stale-followups",
+        followups_json=json.dumps(
+            {
+                "plan_version_id": 3,
+                "questions": [
+                    {
+                        "id": "response_schema",
+                        "question": "Which response shape should we use?",
+                        "options": ["preserve existing schema", "add response_time field"],
+                        "target_sections": ["architecture"],
+                        "concept": "response_schema",
+                        "resolved": False,
+                    }
+                ],
+                "suggestions": [],
+            }
+        ),
+    )
+    assert version.id is not None
+
+    app = create_app()
+    client = TestClient(app, raise_server_exceptions=False)
+    response = client.post(
+        f"/api/sessions/{session.id}/command",
+        json={
+            "command": "followup_answer",
+            "command_id": "followup-stale",
+            "plan_version_id": version.id - 1,
+            "followup_id": "response_schema",
+            "followup_answer": "preserve existing schema",
+        },
+    )
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["reason"] == "stale_plan_version"
+
+
 def test_runtime_registry_tracks_tool_update_and_initial_draft_phase() -> None:
     registry = RuntimeRegistry(emitter=None)  # type: ignore[arg-type]
 

@@ -7,6 +7,7 @@ import { PlanPanel } from "../components/PlanPanel";
 import { ResizableLayout } from "../components/ResizableLayout";
 import { useSessionEvents } from "../hooks/useSessionEvents";
 import {
+  answerPlanFollowup,
   approveSession,
   ConflictError,
   deleteSession,
@@ -60,6 +61,7 @@ export function PlanningViewPage() {
     is_processing: boolean;
   } | null>(null);
   const [chatInputAppendRequest, setChatInputAppendRequest] = useState<{ id: number; text: string } | null>(null);
+  const [latestResponseMode, setLatestResponseMode] = useState<"author_chat" | "refine_round" | null>(null);
   const lastEventAtMs = useRef<number>(0);
   const lastRefetchAtMs = useRef<number>(0);
   const lastContextNoticeAtMs = useRef<number>(0);
@@ -347,10 +349,22 @@ export function PlanningViewPage() {
       };
       if (status === "draft") {
         await sendDiscoveryMessage(id, text, models);
-        await sessionQuery.refetch();
+        setLatestResponseMode(null);
+        const refreshed = await sessionQuery.refetch();
+        if (!refreshed.data?.session.is_processing) {
+          setThinkingMessage(null);
+        }
       } else if (status === "refining" || status === "converged") {
-        await sendDiscoveryMessage(id, text, models);
-        await sessionQuery.refetch();
+        const response = await sendDiscoveryMessage(id, text, models);
+        if (response.mode === "author_chat" || response.mode === "refine_round") {
+          setLatestResponseMode(response.mode);
+        } else {
+          setLatestResponseMode(null);
+        }
+        const refreshed = await sessionQuery.refetch();
+        if (!refreshed.data?.session.is_processing) {
+          setThinkingMessage(null);
+        }
       } else {
         setError("Messages are only accepted during draft, refinement, or converged feedback.");
         return;
@@ -364,6 +378,36 @@ export function PlanningViewPage() {
         return;
       }
       setError(String(err));
+    }
+  };
+
+  const handleFollowupAnswer = async (followupId: string, answer: string) => {
+    const currentPlan = sessionQuery.data?.current_plan;
+    if (!currentPlan?.id) {
+      throw new Error("No current plan version available.");
+    }
+    try {
+      setError(null);
+      setThinkingMessage("Applying follow-up answer...");
+      await answerPlanFollowup(id, {
+        plan_version_id: currentPlan.id,
+        followup_id: followupId,
+        followup_answer: answer,
+        author_model: selectedAuthorModel || undefined,
+        critic_model: selectedCriticModel || undefined,
+      });
+      const refreshed = await sessionQuery.refetch();
+      if (!refreshed.data?.session.is_processing) {
+        setThinkingMessage(null);
+      }
+    } catch (err) {
+      if (err instanceof ConflictError) {
+        setError(err.message);
+      } else {
+        setError(String(err));
+      }
+      setThinkingMessage(null);
+      throw err;
     }
   };
 
@@ -439,6 +483,7 @@ export function PlanningViewPage() {
 
   const contextPercent = contextUsageRatio !== null ? contextUsageRatio * 100 : null;
   const planContent = sessionQuery.data?.current_plan?.plan_content ?? "";
+  const currentPlanFollowups = sessionQuery.data?.current_plan?.followups ?? null;
   const snapshot = snapshotQuery.data?.snapshot;
   const openIssuesCount = snapshot?.issue_graph?.summary?.open_total
     ?? (Array.isArray(snapshot?.open_issues) ? snapshot.open_issues.length : 0);
@@ -636,6 +681,7 @@ export function PlanningViewPage() {
                   phaseMessage={phaseMessage}
                   warnings={warnings}
                   pendingClarification={pendingClarification}
+                  planFollowups={currentPlanFollowups}
                   inputDisabled={isProcessing}
                   isProcessing={isProcessing}
                   authorModel={selectedAuthorModel}
@@ -668,8 +714,10 @@ export function PlanningViewPage() {
                   onApprove={() => void onApprove()}
                   onStop={() => void onStop()}
                   onSubmit={submitMessage}
+                  onSubmitFollowup={handleFollowupAnswer}
                   onSubmitClarification={handleClarificationSubmit}
                   externalInputAppend={chatInputAppendRequest}
+                  latestResponseMode={latestResponseMode}
                 />
               }
             />

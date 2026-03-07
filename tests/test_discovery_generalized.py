@@ -17,6 +17,8 @@ from prscope.planning.runtime.discovery import (
     FeatureIntent,
     parse_questions,
 )
+from prscope.planning.runtime.discovery_support.existing_feature import existing_feature_evidence_lines
+from prscope.planning.runtime.discovery_support.signals import route_file_score
 
 
 def test_parse_questions_handles_plain_q_format() -> None:
@@ -120,7 +122,7 @@ def test_concrete_enhancement_request_requires_specific_scope() -> None:
 
 
 @pytest.mark.asyncio
-async def test_existing_feature_enhancement_choice_requests_priority_clarification() -> None:
+async def test_existing_feature_enhancement_choice_enters_proposal_review() -> None:
     manager = DiscoveryManager.__new__(DiscoveryManager)
     manager.config = SimpleNamespace(discovery_max_turns=4)
     manager.turn_counts_by_session = {"s1": 1}
@@ -147,9 +149,62 @@ async def test_existing_feature_enhancement_choice_requests_priority_clarificati
     )
 
     assert result.complete is False
-    assert result.reply == "Tell me which area to prioritize first."
-    assert result.questions == []
+    assert "Suggested plan direction for improving the existing status endpoint" in result.reply
+    assert "Requested improvement:" not in result.reply
+    assert "Most relevant plan directions:" in result.reply
     assert result.summary is None
+    assert len(result.questions) == 1
+    assert [opt.letter for opt in result.questions[0].options][:3] == ["A", "B", "C"]
+
+
+def test_existing_feature_evidence_lines_skip_frontend_mentions_for_backend_route() -> None:
+    insights = {
+        "feature_label": "health endpoint",
+        "feature_keywords": ["health", "endpoint"],
+        "matched_evidence": [
+            '`src/prscope/web/frontend/src/components/PlanPanel.tsx:220` className="health-pill"',
+            '`src/prscope/web/api.py:1063` @app.get("/health")',
+        ],
+    }
+
+    lines = existing_feature_evidence_lines(insights, route_file_score)
+
+    assert lines == ['`src/prscope/web/api.py:1063` @app.get("/health")']
+
+
+@pytest.mark.asyncio
+async def test_existing_feature_proposal_review_proceed_completes_discovery() -> None:
+    manager = DiscoveryManager.__new__(DiscoveryManager)
+    manager.config = SimpleNamespace(discovery_max_turns=4)
+    manager.turn_counts_by_session = {"s1": 2}
+    manager.event_callback = None
+    manager.bootstrap_insights_by_session = {
+        "s1": {
+            "existing_feature": True,
+            "feature_label": "status endpoint",
+            "matched_paths": ["prscope/web/api.py"],
+            "matched_evidence": ["`prscope/web/api.py:111` @app.get('/status')"],
+            "enhance_existing": True,
+            "awaiting_enhancement_proposal_review": True,
+            "enhancement_proposal_summary": "Enhance status endpoint with metrics and response contract notes.",
+        }
+    }
+
+    sys.modules.setdefault("litellm", SimpleNamespace())
+
+    result = await manager.handle_turn(
+        [
+            {"role": "user", "content": "Propose targeted enhancements without creating a duplicate implementation."},
+            {"role": "author", "content": "Proposal shown."},
+            {"role": "user", "content": "A"},
+        ],
+        session_id="s1",
+    )
+
+    assert result.complete is True
+    assert result.reply == "Discovery complete — drafting enhancement plan now."
+    assert result.summary == "Enhance status endpoint with metrics and response contract notes."
+    assert result.questions == []
 
 
 def test_bootstrap_seed_paths_collects_paths_from_evidence_lines() -> None:
@@ -234,9 +289,11 @@ def test_location_score_prioritizes_runtime_code() -> None:
     middleware = manager._location_score("src/middleware/auth.py")
     helper = manager._location_score("src/utils/auth_helpers.py")
     tests = manager._location_score("tests/test_auth.py")
+    benchmark = manager._location_score("benchmarks/prompts.json")
     huge = manager._location_score("src/middleware/auth.py", file_line_count=10000)
     assert middleware > helper
     assert tests < middleware
+    assert benchmark < 0
     assert huge < middleware
 
 
@@ -282,6 +339,41 @@ async def test_ingest_feature_evidence_marks_existing_feature() -> None:
     insight = manager.bootstrap_insights_by_session["s1"]
     assert insight["existing_feature"] is True
     assert insight["feature_label"] == "rate limiting"
+
+
+@pytest.mark.asyncio
+async def test_ingest_feature_evidence_ignores_low_signal_benchmark_matches() -> None:
+    manager = DiscoveryManager.__new__(DiscoveryManager)
+    manager.bootstrap_insights_by_session = {}
+
+    intent = FeatureIntent(
+        label="health endpoint",
+        keywords=["health", "endpoint"],
+        patterns=[r"\bhealth\b", r"\bendpoint\b"],
+    )
+    payload = {
+        "result": {
+            "results": [
+                {
+                    "path": "benchmarks/prompts.json",
+                    "line": 2,
+                    "text": "Add a lightweight /health endpoint and tests for it.",
+                },
+                {"path": "README.md", "line": 552, "text": "- Use --health-check-only before larger suites"},
+            ]
+        }
+    }
+
+    output = await manager._ingest_feature_evidence_from_tool(
+        session_id="s1",
+        feature=intent,
+        tool_name="grep_code",
+        parsed_args={"pattern": "health"},
+        tool_result_payload=payload,
+    )
+
+    assert output == []
+    assert manager.bootstrap_insights_by_session == {}
 
 
 @pytest.mark.asyncio

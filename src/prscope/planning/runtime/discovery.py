@@ -45,6 +45,7 @@ from .discovery_support import (
     is_concrete_enhancement_request,
     location_score,
     merge_feature_evidence,
+    parse_enhancement_proposal_followup_choice,
     parse_evidence_reference,
     parse_existing_endpoint_followup_choice,
     parse_questions,
@@ -303,6 +304,7 @@ class DiscoveryManager:
             insights=insights,
             feature_label=feature_label,
             requested_improvement=requested_improvement,
+            original_request=str(insights.get("original_request", "")).strip() or None,
             route_file_score=self._route_file_score,
             deep_summary_loader=lambda: self._build_existing_endpoint_deep_summary(session_id),
         )
@@ -442,6 +444,105 @@ class DiscoveryManager:
         prior_insights: dict[str, Any],
         feature_label: str,
     ) -> DiscoveryTurnResult | None:
+        async def proposal_review_result(summary_text: str) -> DiscoveryTurnResult:
+            return DiscoveryTurnResult(
+                reply=(
+                    f"Suggested plan direction for improving the existing {feature_label}:\n\n"
+                    f"{summary_text}\n\n"
+                    "If this direction looks right, I can draft the plan next.\n"
+                    "Do you want to proceed, revise it, or cancel?"
+                ),
+                complete=False,
+                summary=None,
+                questions=[
+                    DiscoveryQuestion(
+                        index=1,
+                        text="How should we proceed with this enhancement proposal?",
+                        options=[
+                            QuestionOption("A", "Proceed and draft the plan from this proposal."),
+                            QuestionOption("B", "Revise the proposal first (I will provide edits)."),
+                            QuestionOption("C", "Cancel; leave the existing implementation unchanged."),
+                            QuestionOption("D", "Other — describe your preference", is_other=True),
+                        ],
+                    )
+                ],
+            )
+
+        if bool(prior_insights.get("awaiting_enhancement_proposal_review")):
+            decision = parse_enhancement_proposal_followup_choice(latest_user_message)
+            proposal_summary = str(prior_insights.get("enhancement_proposal_summary", "")).strip()
+            if decision == "A":
+                prior_insights["awaiting_enhancement_proposal_review"] = False
+                prior_insights["awaiting_enhancement_revision_input"] = False
+                return DiscoveryTurnResult(
+                    reply="Discovery complete — drafting enhancement plan now.",
+                    complete=True,
+                    summary=proposal_summary
+                    or await self._build_existing_feature_enhancement_summary(
+                        session_id,
+                        feature_label,
+                        requested_improvement=latest_user_message,
+                    ),
+                    questions=[],
+                )
+            if decision == "B":
+                prior_insights["awaiting_enhancement_proposal_review"] = False
+                prior_insights["awaiting_enhancement_revision_input"] = True
+                return DiscoveryTurnResult(
+                    reply="Got it — tell me what to change in the proposal, and I will update it before drafting.",
+                    complete=False,
+                    summary=None,
+                    questions=[],
+                )
+            if decision == "C":
+                prior_insights["awaiting_enhancement_proposal_review"] = False
+                prior_insights["awaiting_enhancement_revision_input"] = False
+                prior_insights["enhance_existing"] = False
+                return DiscoveryTurnResult(
+                    reply=(
+                        f"Understood — we'll leave the existing {feature_label} unchanged. "
+                        "No planning draft will be generated."
+                    ),
+                    complete=False,
+                    summary=None,
+                    questions=[],
+                )
+            if self._is_concrete_enhancement_request(latest_user_message):
+                revised_summary = await self._build_existing_feature_enhancement_summary(
+                    session_id,
+                    feature_label,
+                    requested_improvement=latest_user_message,
+                )
+                prior_insights["enhancement_proposal_summary"] = revised_summary
+                return await proposal_review_result(revised_summary)
+            if proposal_summary:
+                return await proposal_review_result(proposal_summary)
+            fallback_summary = await self._build_existing_feature_enhancement_summary(
+                session_id,
+                feature_label,
+                requested_improvement=latest_user_message,
+            )
+            prior_insights["enhancement_proposal_summary"] = fallback_summary
+            return await proposal_review_result(fallback_summary)
+
+        if bool(prior_insights.get("awaiting_enhancement_revision_input")):
+            if self._is_concrete_enhancement_request(latest_user_message):
+                revised_summary = await self._build_existing_feature_enhancement_summary(
+                    session_id,
+                    feature_label,
+                    requested_improvement=latest_user_message,
+                )
+                prior_insights["enhancement_proposal_summary"] = revised_summary
+                prior_insights["awaiting_enhancement_revision_input"] = False
+                prior_insights["awaiting_enhancement_proposal_review"] = True
+                return await proposal_review_result(revised_summary)
+            return DiscoveryTurnResult(
+                reply="Share the specific changes you want in the proposal (scope, files, or constraints), and I will revise it.",
+                complete=False,
+                summary=None,
+                questions=[],
+            )
+
         if bool(prior_insights.get("enhance_existing")) and self._is_concrete_enhancement_request(latest_user_message):
             return DiscoveryTurnResult(
                 reply="Discovery complete — drafting plan now.",
@@ -501,12 +602,15 @@ class DiscoveryManager:
             )
         if choice == "B":
             prior_insights["enhance_existing"] = True
-            return DiscoveryTurnResult(
-                reply="Tell me which area to prioritize first.",
-                complete=False,
-                summary=None,
-                questions=[],
+            proposal_summary = await self._build_existing_feature_enhancement_summary(
+                session_id,
+                feature_label,
+                requested_improvement=latest_user_message,
             )
+            prior_insights["enhancement_proposal_summary"] = proposal_summary
+            prior_insights["awaiting_enhancement_proposal_review"] = True
+            prior_insights["awaiting_enhancement_revision_input"] = False
+            return await proposal_review_result(proposal_summary)
         if choice == "C":
             prior_insights["enhance_existing"] = False
             return DiscoveryTurnResult(
@@ -534,6 +638,7 @@ class DiscoveryManager:
             return None
         if self._extract_feature_intent(latest_user_message) is None:
             return None
+        insights["original_request"] = latest_user_message
         current_feature_label = str(insights.get("feature_label", "feature")).strip() or "feature"
         evidence_lines = self._existing_feature_evidence_lines(session_id)
         evidence_block = (

@@ -55,13 +55,13 @@ class IssueCausalityExtractor:
             cause_issue = graph.add_issue(
                 cause_text,
                 round_number,
-                severity="major",
+                severity="minor",
                 source="inference",
             )
             effect_issue = graph.add_issue(
                 effect_text,
                 round_number,
-                severity="major",
+                severity="minor",
                 source="inference",
             )
             if not cause_issue.id or not effect_issue.id:

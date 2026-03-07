@@ -5,6 +5,8 @@ import type { IssueGraphNode } from "../types";
 
 interface IssuePanelProps {
   openIssues: IssueGraphNode[];
+  rootIssues: IssueGraphNode[];
+  resolvedIssues: IssueGraphNode[];
   constraintViolations: string[];
   rootCausesCount: number;
   onAppendIssue: (issue: IssueGraphNode) => void;
@@ -14,24 +16,22 @@ interface IssuePanelProps {
   initialTab?: Tab;
 }
 
-type Tab = "issues" | "violations" | "root-causes";
+type Tab = "issues" | "violations" | "root-causes" | "resolved";
 
 export function IssuePanel({
   openIssues,
+  rootIssues,
+  resolvedIssues,
   constraintViolations,
   rootCausesCount,
   onAppendIssue,
   onAppendAllIssues,
   onClose,
   className,
-  initialTab = "issues",
+  initialTab = "root-causes",
 }: IssuePanelProps) {
   const [activeTab, setActiveTab] = useState<Tab>(initialTab);
   const panelRef = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    setActiveTab(initialTab);
-  }, [initialTab]);
 
   useEffect(() => {
     setActiveTab(initialTab);
@@ -52,7 +52,7 @@ export function IssuePanel({
       <div className="flex items-center justify-between px-5 py-4 border-b border-zinc-800/50">
         <h3 className="text-sm font-semibold text-zinc-100 flex items-center gap-2">
           <div className="w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]" />
-          System Health
+          Review Notes
         </h3>
         <button 
           onClick={onClose}
@@ -63,7 +63,15 @@ export function IssuePanel({
       </div>
 
       {/* Tabs */}
-      <div className="flex items-center px-2 pt-2 border-b border-zinc-800/50 bg-zinc-900/50">
+      <div className="flex flex-wrap items-stretch gap-1 px-2 pt-2 border-b border-zinc-800/50 bg-zinc-900/50">
+        <TabButton 
+          active={activeTab === "root-causes"} 
+          onClick={() => setActiveTab("root-causes")}
+          icon={Target}
+          label="Start Here"
+          count={rootCausesCount}
+          color="blue"
+        />
         <TabButton 
           active={activeTab === "issues"} 
           onClick={() => setActiveTab("issues")}
@@ -80,13 +88,13 @@ export function IssuePanel({
           count={constraintViolations.length}
           color="red"
         />
-        <TabButton 
-          active={activeTab === "root-causes"} 
-          onClick={() => setActiveTab("root-causes")}
-          icon={Target}
-          label="Root Causes"
-          count={rootCausesCount}
-          color="blue"
+        <TabButton
+          active={activeTab === "resolved"}
+          onClick={() => setActiveTab("resolved")}
+          icon={CheckCircle2}
+          label="Resolved"
+          count={resolvedIssues.length}
+          color="emerald"
         />
       </div>
 
@@ -98,7 +106,7 @@ export function IssuePanel({
               <>
                 <div className="flex items-center justify-between mb-2">
                   <span className="text-xs text-zinc-500 font-medium uppercase tracking-wider">
-                    {openIssues.length} Active Issues
+                    {openIssues.length} Open issues
                   </span>
                   <button
                     onClick={onAppendAllIssues}
@@ -121,7 +129,7 @@ export function IssuePanel({
             ) : (
               <EmptyState 
                 icon={CheckCircle2} 
-                title="All Clear" 
+                title="All clear" 
                 description="No open issues found in the current plan." 
               />
             )}
@@ -134,7 +142,7 @@ export function IssuePanel({
               <>
                  <div className="flex items-center justify-between mb-2">
                   <span className="text-xs text-zinc-500 font-medium uppercase tracking-wider">
-                    {constraintViolations.length} Active Violations
+                    {constraintViolations.length} Constraint violations
                   </span>
                 </div>
                 <div className="space-y-3">
@@ -151,7 +159,7 @@ export function IssuePanel({
             ) : (
               <EmptyState 
                 icon={CheckCircle2} 
-                title="No Violations" 
+                title="No violations" 
                 description="The plan adheres to all defined constraints." 
               />
             )}
@@ -166,32 +174,63 @@ export function IssuePanel({
                   <div className="flex gap-3">
                     <Info className="w-5 h-5 text-blue-400 shrink-0 mt-0.5" />
                     <div>
-                      <h4 className="text-sm font-medium text-blue-400 mb-1">Root Cause Analysis</h4>
+                      <h4 className="text-sm font-medium text-blue-400 mb-1">Best place to start</h4>
                       <p className="text-xs text-blue-300/80 leading-relaxed">
-                        Focusing on these issues often resolves downstream dependencies automatically.
+                        These are the issues that do not appear to be caused by another issue in the current graph.
+                        Fixing one of these often clears several related follow-on issues.
                       </p>
                     </div>
                   </div>
                 </div>
-                {/* 
-                  Since we don't have the graph structure passed down to filter exactly which are root causes,
-                  we'll show a helpful message. In a real implementation, we'd filter `openIssues` by `causesParents.length === 0`.
-                */}
-                <div className="text-center py-8">
-                  <Target className="w-12 h-12 text-zinc-700 mx-auto mb-3" />
-                  <p className="text-sm text-zinc-400">
-                    {rootCausesCount} root cause{rootCausesCount !== 1 ? 's' : ''} identified.
-                  </p>
-                  <p className="text-xs text-zinc-600 mt-1 max-w-[200px] mx-auto">
-                    Check the Issue Graph visualization to identify and target these specific nodes.
-                  </p>
+                <div className="space-y-3">
+                  {rootIssues.map((issue) => (
+                    <IssueCard
+                      key={issue.id}
+                      issue={issue}
+                      onAdd={() => onAppendIssue(issue)}
+                    />
+                  ))}
                 </div>
               </>
             ) : (
               <EmptyState 
                 icon={CheckCircle2} 
-                title="No Root Causes" 
-                description="No isolated root causes found." 
+                title="No starting issues" 
+                description="No standalone starting issues were found in the current graph." 
+              />
+            )}
+          </div>
+        )}
+
+        {activeTab === "resolved" && (
+          <div className="space-y-4">
+            {resolvedIssues.length > 0 ? (
+              <>
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-xs text-zinc-500 font-medium uppercase tracking-wider">
+                    {resolvedIssues.length} Resolved issues
+                  </span>
+                </div>
+                <div className="space-y-3">
+                  {resolvedIssues.map((issue) => (
+                    <IssueCard
+                      key={issue.id}
+                      issue={issue}
+                      onAdd={() => onAppendIssue(issue)}
+                      canAdd={false}
+                      statusLabel={`Resolved${issue.resolved_round ? ` in round ${issue.resolved_round}` : ""}`}
+                      statusTone="resolved"
+                      provenanceLabel={getResolvedProvenanceLabel(issue)}
+                      provenanceTone={issue.resolution_source === "lightweight" ? "lightweight" : "review"}
+                    />
+                  ))}
+                </div>
+              </>
+            ) : (
+              <EmptyState
+                icon={CheckCircle2}
+                title="No resolved issues"
+                description="Resolved review notes will appear here when issues are closed."
               />
             )}
           </div>
@@ -214,19 +253,20 @@ function TabButton({
   icon: ComponentType<{ className?: string }>; 
   label: string; 
   count: number;
-  color: "amber" | "red" | "blue";
+  color: "amber" | "red" | "blue" | "emerald";
 }) {
   const colorStyles = {
     amber: active ? "text-amber-400 border-amber-500/50 bg-amber-500/10" : "text-zinc-400 hover:text-amber-300 hover:bg-zinc-800/50",
     red: active ? "text-red-400 border-red-500/50 bg-red-500/10" : "text-zinc-400 hover:text-red-300 hover:bg-zinc-800/50",
     blue: active ? "text-blue-400 border-blue-500/50 bg-blue-500/10" : "text-zinc-400 hover:text-blue-300 hover:bg-zinc-800/50",
+    emerald: active ? "text-emerald-400 border-emerald-500/50 bg-emerald-500/10" : "text-zinc-400 hover:text-emerald-300 hover:bg-zinc-800/50",
   };
 
   return (
     <button
       onClick={onClick}
       className={clsx(
-        "flex items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 transition-all flex-1 justify-center",
+        "flex h-11 shrink-0 items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 transition-all justify-center whitespace-nowrap",
         active ? "border-b-2" : "border-transparent",
         colorStyles[color]
       )}
@@ -245,15 +285,37 @@ function TabButton({
   );
 }
 
-function IssueCard({ issue, onAdd }: { issue: IssueGraphNode; onAdd: () => void }) {
+function IssueCard({
+  issue,
+  onAdd,
+  canAdd = true,
+  statusLabel,
+  statusTone = "default",
+  provenanceLabel,
+  provenanceTone = "review",
+}: {
+  issue: IssueGraphNode;
+  onAdd: () => void;
+  canAdd?: boolean;
+  statusLabel?: string;
+  statusTone?: "default" | "resolved";
+  provenanceLabel?: string;
+  provenanceTone?: "review" | "lightweight";
+}) {
+  const displaySeverity = getDisplaySeverity(issue);
   const severityColors = {
-    major: "bg-red-500/10 text-red-400 border-red-500/20",
-    minor: "bg-amber-500/10 text-amber-400 border-amber-500/20",
-    info: "bg-blue-500/10 text-blue-400 border-blue-500/20",
+    must_fix: "bg-red-500/10 text-red-400 border-red-500/20",
+    needs_attention: "bg-amber-500/10 text-amber-400 border-amber-500/20",
+    note: "bg-blue-500/10 text-blue-400 border-blue-500/20",
     unspecified: "bg-zinc-800 text-zinc-400 border-zinc-700",
   };
-
-  const severity = (issue.severity || "unspecified").toLowerCase() as keyof typeof severityColors;
+  const severityLabel = {
+    must_fix: "Must fix",
+    needs_attention: "Needs attention",
+    note: "Note",
+    unspecified: "Unspecified",
+  } as const;
+  const severity = displaySeverity as keyof typeof severityColors;
 
   return (
     <div className="group relative p-4 rounded-lg bg-zinc-900 border border-zinc-800 hover:border-zinc-700 hover:bg-zinc-800/30 transition-all duration-200">
@@ -266,8 +328,32 @@ function IssueCard({ issue, onAdd }: { issue: IssueGraphNode; onAdd: () => void 
             "text-[10px] px-2 py-0.5 rounded-full uppercase tracking-wider font-semibold border",
             severityColors[severity]
           )}>
-            {issue.severity || "Unspecified"}
+            {severityLabel[severity]}
           </span>
+          {statusLabel ? (
+            <span
+              className={clsx(
+                "text-[10px] px-2 py-0.5 rounded-full uppercase tracking-wider font-semibold border",
+                statusTone === "resolved"
+                  ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+                  : "bg-zinc-800 text-zinc-400 border-zinc-700",
+              )}
+            >
+              {statusLabel}
+            </span>
+          ) : null}
+          {provenanceLabel ? (
+            <span
+              className={clsx(
+                "text-[10px] px-2 py-0.5 rounded-full uppercase tracking-wider font-semibold border",
+                provenanceTone === "lightweight"
+                  ? "bg-amber-500/10 text-amber-400 border-amber-500/20"
+                  : "bg-emerald-500/10 text-emerald-400 border-emerald-500/20",
+              )}
+            >
+              {provenanceLabel}
+            </span>
+          ) : null}
         </div>
       </div>
       
@@ -275,20 +361,42 @@ function IssueCard({ issue, onAdd }: { issue: IssueGraphNode; onAdd: () => void 
         {issue.description}
       </p>
 
-      <div className="flex items-center justify-end pt-2 border-t border-zinc-800/50 mt-2">
-        <button
-          onClick={(e) => {
-            e.stopPropagation();
-            onAdd();
-          }}
-          className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium text-zinc-400 hover:text-indigo-300 hover:bg-indigo-500/10 transition-colors"
-        >
-          <MessageSquarePlus className="w-3.5 h-3.5" />
-          Add to chat
-        </button>
-      </div>
+      {canAdd ? (
+        <div className="flex items-center justify-end pt-2 border-t border-zinc-800/50 mt-2">
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              onAdd();
+            }}
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium text-zinc-400 hover:text-indigo-300 hover:bg-indigo-500/10 transition-colors"
+          >
+            <MessageSquarePlus className="w-3.5 h-3.5" />
+            Add to chat
+          </button>
+        </div>
+      ) : null}
     </div>
   );
+}
+
+function getDisplaySeverity(issue: IssueGraphNode): "must_fix" | "needs_attention" | "note" | "unspecified" {
+  const raw = (issue.severity || "").toLowerCase();
+  const description = issue.description.toLowerCase();
+  if (raw === "info") return "note";
+  if (raw === "minor") return "needs_attention";
+  if (
+    raw === "major"
+    && /(potential|may lead|may hinder|could make|harder to maintain|consider)/.test(description)
+  ) {
+    return "needs_attention";
+  }
+  if (raw === "major") return "must_fix";
+  return "unspecified";
+}
+
+function getResolvedProvenanceLabel(issue: IssueGraphNode): string | undefined {
+  if (issue.status !== "resolved") return undefined;
+  return issue.resolution_source === "lightweight" ? "Lightweight edit" : "Review flow";
 }
 
 function EmptyState({ icon: Icon, title, description }: { icon: ComponentType<{ className?: string }>; title: string; description: string }) {

@@ -8,8 +8,9 @@ import pytest
 
 from prscope.config import PlanningConfig
 from prscope.planning.runtime.author import AuthorAgent, RepoUnderstanding
-from prscope.planning.runtime.authoring.models import RepoCandidates
+from prscope.planning.runtime.authoring.models import PlanDocument, RepairPlan, RepoCandidates
 from prscope.planning.runtime.authoring.pipeline import AuthorPlannerPipeline
+from prscope.planning.runtime.authoring.repair import AuthorRepairService
 from prscope.planning.runtime.tools import ToolExecutor
 
 
@@ -106,6 +107,60 @@ def test_parse_plan_document_accepts_new_markdown_native_fields(tmp_path: Path) 
     parsed = AuthorAgent._parse_plan_document(raw)
     assert parsed.non_goals == "Non-Goals"
     assert "a.py" in parsed.files_changed
+
+
+@pytest.mark.asyncio
+async def test_revise_plan_recovers_from_trailing_commas_in_json() -> None:
+    async def _fake_llm_call(*args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        del args, kwargs
+        raw = """{
+  "problem_understanding": "Need to clarify logging behavior.",
+  "updates": {
+    "open_questions": "- None.",
+  },
+  "justification": {
+    "open_questions": "Feedback answered the remaining ambiguity.",
+  },
+  "review_prediction": "Reviewer should accept.",
+}"""
+        return (
+            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=raw))]),
+            "gpt-4o-mini",
+        )
+
+    service = AuthorRepairService(_fake_llm_call)
+    current_plan = PlanDocument(
+        title="Plan",
+        summary="Summary",
+        goals="Goals",
+        non_goals="Non-goals",
+        files_changed="- `a.py`",
+        architecture="Architecture",
+        implementation_steps="1. Step",
+        test_strategy="Tests",
+        rollback_plan="Rollback",
+        open_questions="- TBD",
+    )
+    repair_plan = RepairPlan(
+        problem_understanding="Need to resolve question.",
+        accepted_issues=["open questions unresolved"],
+        rejected_issues=[],
+        root_causes=["missing decision"],
+        repair_strategy="Update open questions section",
+        target_sections=["open_questions"],
+        revision_plan="Set to none",
+    )
+
+    result = await service.revise_plan(
+        repair_plan=repair_plan,
+        current_plan=current_plan,
+        requirements="Keep behavior stable.",
+        revision_budget=2,
+    )
+
+    assert result.problem_understanding
+    assert result.updates.get("open_questions") == "- None."
+    assert "open_questions" in result.justification
 
 
 @pytest.mark.asyncio

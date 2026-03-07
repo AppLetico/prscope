@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 
-CURRENT_SCHEMA_VERSION = 18
+CURRENT_SCHEMA_VERSION = 19
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -156,6 +156,8 @@ CREATE TABLE IF NOT EXISTS plan_versions (
     round INTEGER NOT NULL,
     plan_content TEXT NOT NULL,
     plan_json TEXT,
+    decision_graph_json TEXT,
+    followups_json TEXT,
     plan_sha TEXT NOT NULL,
     changed_sections TEXT,
     diff_from_previous TEXT,
@@ -511,5 +513,13 @@ class StoreSchemaMixin:
                 """
             )
             current = 18
+
+        # v18 -> v19: versioned decision graph and follow-up artifacts on plan versions
+        if current < 19:
+            if not self._column_exists(conn, "plan_versions", "decision_graph_json"):
+                conn.execute("ALTER TABLE plan_versions ADD COLUMN decision_graph_json TEXT")
+            if not self._column_exists(conn, "plan_versions", "followups_json"):
+                conn.execute("ALTER TABLE plan_versions ADD COLUMN followups_json TEXT")
+            current = 19
 
         self._set_schema_version(conn, current)

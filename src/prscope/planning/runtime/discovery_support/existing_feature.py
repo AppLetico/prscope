@@ -6,7 +6,7 @@ from collections.abc import Awaitable
 from typing import Any, Callable
 
 from .models import Evidence, FeatureIntent
-from .signals import INTENT_STOP_WORDS
+from .signals import INTENT_STOP_WORDS, is_trustworthy_existing_feature_path
 
 
 def parse_evidence_reference(line: str) -> tuple[str, int] | None:
@@ -69,6 +69,66 @@ def functional_summary_from_snippet(snippet: str) -> str | None:
     return None
 
 
+def normalize_requested_improvement(requested_improvement: str | None) -> str | None:
+    raw = str(requested_improvement or "").strip()
+    if not raw:
+        return None
+    normalized = " ".join(raw.split()).lower()
+    generic_requests = {
+        "1. propose targeted enhancements without creating a duplicate implementation.",
+        "propose targeted enhancements without creating a duplicate implementation.",
+        "review current behavior and summarize it only.",
+        "leave it unchanged; no planning needed.",
+    }
+    if normalized in generic_requests:
+        return None
+    if re.match(r"^\d+\.\s*", normalized):
+        normalized = re.sub(r"^\d+\.\s*", "", normalized)
+        raw = re.sub(r"^\d+\.\s*", "", raw).strip()
+    if re.match(r"^(create|add|build|implement|make|introduce|set up|setup)\b", normalized):
+        return None
+    return raw
+
+
+def suggest_enhancement_directions(
+    *,
+    feature_label: str,
+    original_request: str | None,
+    functional_summary: str | None,
+    deep_summary: str | None,
+) -> list[str]:
+    combined = " ".join(
+        part.strip().lower()
+        for part in (feature_label, original_request or "", functional_summary or "", deep_summary or "")
+        if str(part).strip()
+    )
+    directions = [
+        f"Extend the existing {feature_label} instead of adding a second implementation.",
+    ]
+    if "returns" in combined:
+        directions.append("Decide whether the current response should stay minimal or include more useful signals.")
+    if "health" in combined or "readiness" in combined or "liveness" in combined:
+        directions.append(
+            "Consider whether this should remain a simple heartbeat or also cover readiness and dependency checks."
+        )
+    if any(token in combined for token in ("log", "metric", "monitor", "observab")):
+        directions.append("Call out the monitoring or visibility improvements that belong in the plan.")
+    if any(token in combined for token in ("auth", "security", "harden", "permission")):
+        directions.append(
+            "Include any hardening or access-control changes that are needed around the existing behavior."
+        )
+    directions.append(
+        "Add any hardening, failure handling, or verification steps needed without breaking current behavior."
+    )
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in directions:
+        if item not in seen:
+            deduped.append(item)
+            seen.add(item)
+    return deduped[:4]
+
+
 def existing_feature_evidence_lines(
     insights: dict[str, Any],
     route_file_score: Callable[[str], int],
@@ -98,6 +158,7 @@ def existing_feature_evidence_lines(
         for line in lines:
             lowered = line.lower()
             parsed = parse_evidence_reference(line)
+            trusted_path = bool(parsed and is_trustworthy_existing_feature_path(parsed[0]))
             path_score = route_file_score(parsed[0]) if parsed else 0
             keyword_hits = sum(1 for kw in ranked_keywords if kw in lowered)
             has_route_shape = bool(
@@ -106,12 +167,12 @@ def existing_feature_evidence_lines(
                     lowered,
                 )
             )
-            if parsed and path_score <= 0 and keyword_hits == 0 and not has_route_shape:
+            if parsed and not trusted_path and not has_route_shape:
                 continue
-            score = max(path_score, 0) + keyword_hits * 3 + (2 if parsed else 0) + (2 if has_route_shape else 0)
+            score = max(path_score, 0) + keyword_hits * 3 + (2 if trusted_path else 0) + (2 if has_route_shape else 0)
             if score <= 0 and parsed is None:
                 continue
-            is_runtime_evidence = bool(parsed and path_score > 0) or has_route_shape
+            is_runtime_evidence = trusted_path or has_route_shape
             scored_lines.append((score, line, is_runtime_evidence))
 
         if scored_lines:
@@ -123,7 +184,12 @@ def existing_feature_evidence_lines(
     paths = [str(path).strip() for path in insights.get("matched_paths", []) if str(path).strip()]
     feature_label = str(insights.get("feature_label", "feature")).strip() or "feature"
     if paths:
-        ranked_paths = sorted(paths, key=lambda path: (-route_file_score(path), path))
+        ranked_paths = sorted(
+            (path for path in paths if is_trustworthy_existing_feature_path(path)),
+            key=lambda path: (-route_file_score(path), path),
+        )
+        if not ranked_paths:
+            return [f"Found existing {feature_label} in the codebase"]
         top_path = ranked_paths[0]
         return [f"Found existing {feature_label} in `{top_path}`"]
     return [f"Found existing {feature_label} in the codebase"]
@@ -214,6 +280,7 @@ async def build_existing_feature_enhancement_summary(
     insights: dict[str, Any],
     feature_label: str,
     requested_improvement: str | None,
+    original_request: str | None,
     route_file_score: Callable[[str], int],
     deep_summary_loader: Callable[[], Awaitable[tuple[str | None, str | None]]],
 ) -> str:
@@ -223,25 +290,28 @@ async def build_existing_feature_enhancement_summary(
         (path for path in sorted(matched_paths, key=lambda p: (-route_file_score(p), p)) if path),
         None,
     )
-    evidence_block = "\n".join(f"- {line}" for line in evidence_lines[:5]) or (
-        f"- Found existing {feature_label} implementation in the codebase"
-    )
     deep_summary, functional_summary = await deep_summary_loader()
-    summary_lines = [
-        f"Enhance the existing {feature_label} implementation instead of creating a duplicate.",
-        (
-            f"Requested improvement: {requested_improvement.strip()}"
-            if requested_improvement and requested_improvement.strip()
-            else "Requested improvement: Propose targeted enhancements grounded in the current implementation."
-        ),
-    ]
+    specific_improvement = normalize_requested_improvement(requested_improvement)
+    original_intent = normalize_requested_improvement(original_request)
+    directions = suggest_enhancement_directions(
+        feature_label=feature_label,
+        original_request=original_request,
+        functional_summary=functional_summary,
+        deep_summary=deep_summary,
+    )
+    summary_lines = [f"Enhance the existing {feature_label} instead of creating a duplicate."]
+    if specific_improvement:
+        summary_lines.append(f"Requested change: {specific_improvement}")
+    elif original_intent:
+        summary_lines.append(f"Original ask: {original_intent}")
     if primary_impl:
-        summary_lines.append(f"Primary implementation file: `{primary_impl}`")
+        summary_lines.append(f"Start from the current implementation in `{primary_impl}`.")
     if functional_summary:
-        summary_lines.append(f"Functional overview: {functional_summary}")
-    if deep_summary:
-        summary_lines.append("Implementation notes:")
-        summary_lines.append(deep_summary)
-    summary_lines.append("Grounding evidence:")
-    summary_lines.append(evidence_block)
+        summary_lines.append(f"Current behavior: {functional_summary}")
+    summary_lines.append("Most relevant plan directions:")
+    summary_lines.extend(f"- {direction}" for direction in directions)
+    if evidence_lines:
+        summary_lines.append(f"Grounded in: {evidence_lines[0]}")
+    elif deep_summary:
+        summary_lines.append("Grounded in the current implementation already found in the codebase.")
     return "\n".join(summary_lines)

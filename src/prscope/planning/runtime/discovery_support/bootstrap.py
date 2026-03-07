@@ -5,7 +5,7 @@ from typing import Any
 
 from .existing_feature import format_evidence_line
 from .models import Evidence, FeatureIntent
-from .signals import BOOTSTRAP_ROUTE_REGEX
+from .signals import BOOTSTRAP_ROUTE_REGEX, is_trustworthy_existing_feature_path
 
 
 class DiscoveryBootstrapService:
@@ -108,6 +108,8 @@ class DiscoveryBootstrapService:
                     line_num = int(item.get("line", 0) or 0)
                     if not path:
                         continue
+                    if not is_trustworthy_existing_feature_path(path):
+                        continue
                     matched = any(pattern.search(text) for pattern in patterns)
                     snippet = text
                     if not matched and snippet.count("\n") < 2:
@@ -130,7 +132,8 @@ class DiscoveryBootstrapService:
         else:
             path = str(parsed_args.get("path") or payload.get("path") or "").strip()
             content = str(payload.get("content", "")).strip()
-            if path and any(pattern.search(content) for pattern in patterns):
+            path_ok = path and is_trustworthy_existing_feature_path(path)
+            if path_ok and any(pattern.search(content) for pattern in patterns):
                 confidence = self._manager._location_score(path, file_line_count=len(content.splitlines()))
                 evidence_list.append(Evidence(path=path, snippet=content[:240], confidence=confidence, line=0))
                 candidate_paths.add(path)
@@ -177,7 +180,7 @@ class DiscoveryBootstrapService:
         evidence_list: list[Evidence] = []
         for path in candidate_paths:
             normalized = str(path or "").strip()
-            if not normalized or self._manager._route_file_score(normalized) <= 0:
+            if not normalized or not is_trustworthy_existing_feature_path(normalized):
                 continue
             payload = await self._manager._run_bootstrap_tool(
                 tool_name="grep_code",
@@ -292,7 +295,11 @@ class DiscoveryBootstrapService:
                     path = str(item.get("path", "")).strip()
                     line = int(item.get("line", 0) or 0)
                     text = str(item.get("text", "")).strip()
-                    if not path or not any(pattern.search(text) for pattern in feature_patterns):
+                    if (
+                        not path
+                        or not is_trustworthy_existing_feature_path(path)
+                        or not any(pattern.search(text) for pattern in feature_patterns)
+                    ):
                         continue
                     evidence_list.append(
                         Evidence(

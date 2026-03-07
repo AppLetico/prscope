@@ -46,10 +46,50 @@ export interface PlanVersion {
   session_id: string;
   round: number;
   plan_content: string;
+  plan_json?: string | null;
+  decision_graph_json?: string | null;
+  followups_json?: string | null;
+  decision_graph?: DecisionGraph | null;
+  followups?: PlanFollowups | null;
   plan_sha: string;
   created_at: string;
+  changed_sections?: string | null;
   diff_from_previous?: string | null;
   convergence_score?: number | null;
+}
+
+export interface DecisionNode {
+  id: string;
+  description: string;
+  options?: string[] | null;
+  value?: string | null;
+  section: string;
+  required?: boolean;
+  concept?: string | null;
+}
+
+export interface DecisionGraph {
+  nodes: Record<string, DecisionNode>;
+}
+
+export interface FollowupQuestion {
+  id: string;
+  question: string;
+  options?: string[] | null;
+  target_sections: string[];
+  concept: string;
+  resolved?: boolean;
+}
+
+export interface FollowupSuggestion {
+  id: string;
+  suggestion: string;
+}
+
+export interface PlanFollowups {
+  plan_version_id?: number | null;
+  questions: FollowupQuestion[];
+  suggestions: FollowupSuggestion[];
 }
 
 export interface QuestionOption {
@@ -123,6 +163,7 @@ export interface IssueGraphNode {
   status: "open" | "resolved";
   raised_round: number;
   resolved_round?: number | null;
+  resolution_source?: "review" | "lightweight" | null;
   severity?: "major" | "minor" | "info";
   source?: "critic" | "validation" | "inference";
 }

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from types import SimpleNamespace
 
 import pytest
 
 from prscope.config import PlanningConfig, PrscopeConfig, RepoProfile
 from prscope.planning.runtime.author import RepairPlan, RevisionResult
+from prscope.planning.runtime.authoring.models import PlanDocument, render_markdown
 from prscope.planning.runtime.critic import CriticResult
 from prscope.planning.runtime.discovery import DiscoveryQuestion, DiscoveryTurnResult, QuestionOption
 from prscope.planning.runtime.orchestration import PlanningRuntime
@@ -90,8 +92,10 @@ async def test_round_returns_quickly_when_clarification_requested(tmp_path):
     )
 
     assert critic_result.reviewer_questions == ["Which environment should rollout target first?"]
-    # In web/API mode, clarification is surfaced but the round continues best-effort.
-    assert "Which environment should rollout target first?" in author_result.plan
+    latest_plan = store.get_plan_versions(session.id, limit=1)[0]
+    assert "Which environment should rollout target first?" not in latest_plan.plan_content
+    followups = json.loads(latest_plan.followups_json or "{}")
+    assert followups["questions"][0]["question"] == "Which environment should rollout target first?"
     assert any(event.get("type") == "plan_ready" for event in events)
     assert any(event.get("type") == "complete" for event in events)
 
@@ -148,6 +152,477 @@ async def test_chat_with_author_in_refining_does_not_run_critique(tmp_path):
     assert turns[-1].role == "author"
     assert "simplify rollout" in turns[-1].content.lower()
     assert core.get_session().status == "refining"
+
+
+@pytest.mark.asyncio
+async def test_refinement_message_routes_question_to_chat(tmp_path):
+    store = Store(tmp_path / "test.db")
+    config = PrscopeConfig(
+        local_repo=str(tmp_path),
+        planning=PlanningConfig(author_model="gpt-4o-mini", critic_model="gpt-4o-mini"),
+    )
+    repo = RepoProfile(name="repo", path=str(tmp_path))
+    runtime = PlanningRuntime(store=store, config=config, repo=repo)
+
+    session = store.create_planning_session(
+        repo_name=repo.name,
+        title="chat-intent",
+        requirements="r",
+        seed_type="chat",
+        status="refining",
+    )
+    runtime._core(session.id).save_plan_version("# Plan\n\nInitial draft", round_number=1)
+
+    round_calls = 0
+
+    async def fake_round(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal round_calls
+        del args, kwargs
+        round_calls += 1
+        return None
+
+    async def fake_chat(*args, **kwargs):  # type: ignore[no-untyped-def]
+        del args, kwargs
+        return "Here's the rationale."
+
+    runtime.run_adversarial_round = fake_round  # type: ignore[method-assign]
+    runtime._chat_flow.chat_with_author = fake_chat  # type: ignore[method-assign]  # noqa: SLF001
+
+    mode, reply = await runtime.handle_refinement_message(
+        session_id=session.id,
+        user_message="What is the rationale for this section?",
+    )
+
+    assert mode == "author_chat"
+    assert "rationale" in (reply or "").lower()
+    assert round_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_refinement_message_routes_edit_request_to_round(tmp_path):
+    store = Store(tmp_path / "test.db")
+    config = PrscopeConfig(
+        local_repo=str(tmp_path),
+        planning=PlanningConfig(author_model="gpt-4o-mini", critic_model="gpt-4o-mini"),
+    )
+    repo = RepoProfile(name="repo", path=str(tmp_path))
+    runtime = PlanningRuntime(store=store, config=config, repo=repo)
+
+    session = store.create_planning_session(
+        repo_name=repo.name,
+        title="refine-intent",
+        requirements="r",
+        seed_type="chat",
+        status="refining",
+    )
+    runtime._core(session.id).save_plan_version("# Plan\n\nInitial draft", round_number=1)
+
+    round_calls = 0
+    lightweight_calls = 0
+    chat_calls = 0
+
+    async def fake_round(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal round_calls
+        del args, kwargs
+        round_calls += 1
+        return None
+
+    async def fake_chat(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal chat_calls
+        del args, kwargs
+        chat_calls += 1
+        return "chat fallback"
+
+    async def fake_lightweight(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal lightweight_calls
+        del args, kwargs
+        lightweight_calls += 1
+        return None
+
+    runtime.run_adversarial_round = fake_round  # type: ignore[method-assign]
+    runtime._chat_flow.chat_with_author = fake_chat  # type: ignore[method-assign]  # noqa: SLF001
+    runtime._chat_flow._apply_lightweight_plan_edit = fake_lightweight  # type: ignore[method-assign]  # noqa: SLF001
+
+    mode, reply = await runtime.handle_refinement_message(
+        session_id=session.id,
+        user_message="Please update the plan to remove per-call health logging.",
+    )
+
+    assert mode == "refine_round"
+    assert reply is None
+    assert round_calls == 0
+    assert lightweight_calls == 1
+    assert chat_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_refinement_message_routes_should_statement_to_round(tmp_path):
+    store = Store(tmp_path / "test.db")
+    config = PrscopeConfig(
+        local_repo=str(tmp_path),
+        planning=PlanningConfig(author_model="gpt-4o-mini", critic_model="gpt-4o-mini"),
+    )
+    repo = RepoProfile(name="repo", path=str(tmp_path))
+    runtime = PlanningRuntime(store=store, config=config, repo=repo)
+
+    session = store.create_planning_session(
+        repo_name=repo.name,
+        title="should-intent",
+        requirements="r",
+        seed_type="chat",
+        status="refining",
+    )
+    runtime._core(session.id).save_plan_version("# Plan\n\nInitial draft", round_number=1)
+
+    round_calls = 0
+    lightweight_calls = 0
+    chat_calls = 0
+
+    async def fake_round(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal round_calls
+        del args, kwargs
+        round_calls += 1
+        return None
+
+    async def fake_chat(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal chat_calls
+        del args, kwargs
+        chat_calls += 1
+        return "chat fallback"
+
+    async def fake_lightweight(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal lightweight_calls
+        del args, kwargs
+        lightweight_calls += 1
+        return None
+
+    runtime.run_adversarial_round = fake_round  # type: ignore[method-assign]
+    runtime._chat_flow.chat_with_author = fake_chat  # type: ignore[method-assign]  # noqa: SLF001
+    runtime._chat_flow._apply_lightweight_plan_edit = fake_lightweight  # type: ignore[method-assign]  # noqa: SLF001
+
+    mode, reply = await runtime.handle_refinement_message(
+        session_id=session.id,
+        user_message="You should log response every time the endpoint is called",
+    )
+
+    assert mode == "refine_round"
+    assert reply is None
+    assert round_calls == 0
+    assert lightweight_calls == 1
+    assert chat_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_refinement_message_routes_followup_suggestion_to_lightweight_edit(tmp_path):
+    store = Store(tmp_path / "test.db")
+    config = PrscopeConfig(
+        local_repo=str(tmp_path),
+        planning=PlanningConfig(author_model="gpt-4o-mini", critic_model="gpt-4o-mini"),
+    )
+    repo = RepoProfile(name="repo", path=str(tmp_path))
+    runtime = PlanningRuntime(store=store, config=config, repo=repo)
+
+    session = store.create_planning_session(
+        repo_name=repo.name,
+        title="followup-suggestion-intent",
+        requirements="r",
+        seed_type="chat",
+        status="refining",
+    )
+    runtime._core(session.id).save_plan_version("# Plan\n\nInitial draft", round_number=1)
+
+    round_calls = 0
+    lightweight_calls = 0
+    chat_calls = 0
+
+    async def fake_round(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal round_calls
+        del args, kwargs
+        round_calls += 1
+        return None
+
+    async def fake_chat(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal chat_calls
+        del args, kwargs
+        chat_calls += 1
+        return "chat fallback"
+
+    async def fake_lightweight(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal lightweight_calls
+        del args, kwargs
+        lightweight_calls += 1
+        return None
+
+    runtime.run_adversarial_round = fake_round  # type: ignore[method-assign]
+    runtime._chat_flow.chat_with_author = fake_chat  # type: ignore[method-assign]  # noqa: SLF001
+    runtime._chat_flow._apply_lightweight_plan_edit = fake_lightweight  # type: ignore[method-assign]  # noqa: SLF001
+
+    mode, reply = await runtime.handle_refinement_message(
+        session_id=session.id,
+        user_message="Add how we'll verify the new behavior works.",
+    )
+
+    assert mode == "refine_round"
+    assert reply is None
+    assert round_calls == 0
+    assert lightweight_calls == 1
+    assert chat_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_refinement_message_yes_answer_routes_to_lightweight_edit(tmp_path):
+    store = Store(tmp_path / "test.db")
+    config = PrscopeConfig(
+        local_repo=str(tmp_path),
+        planning=PlanningConfig(author_model="gpt-4o-mini", critic_model="gpt-4o-mini"),
+    )
+    repo = RepoProfile(name="repo", path=str(tmp_path))
+    runtime = PlanningRuntime(store=store, config=config, repo=repo)
+
+    session = store.create_planning_session(
+        repo_name=repo.name,
+        title="yes-answer-intent",
+        requirements="r",
+        seed_type="chat",
+        status="refining",
+    )
+    runtime._core(session.id).save_plan_version("# Plan\n\nInitial draft", round_number=1)
+
+    round_calls = 0
+    lightweight_calls = 0
+
+    async def fake_round(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal round_calls
+        del args, kwargs
+        round_calls += 1
+        return None
+
+    async def fake_lightweight(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal lightweight_calls
+        del args, kwargs
+        lightweight_calls += 1
+        return None
+
+    runtime.run_adversarial_round = fake_round  # type: ignore[method-assign]
+    runtime._chat_flow._apply_lightweight_plan_edit = fake_lightweight  # type: ignore[method-assign]  # noqa: SLF001
+
+    mode, reply = await runtime.handle_refinement_message(
+        session_id=session.id,
+        user_message="yes response time should be logged",
+    )
+
+    assert mode == "refine_round"
+    assert reply is None
+    assert lightweight_calls == 1
+    assert round_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_lightweight_edit_resolves_single_targeted_issue_in_snapshot(tmp_path):
+    store = Store(tmp_path / "test.db")
+    config = PrscopeConfig(
+        local_repo=str(tmp_path),
+        planning=PlanningConfig(author_model="gpt-4o-mini", critic_model="gpt-4o-mini"),
+    )
+    repo = RepoProfile(name="repo", path=str(tmp_path))
+    runtime = PlanningRuntime(store=store, config=config, repo=repo)
+
+    session = store.create_planning_session(
+        repo_name=repo.name,
+        title="targeted-issue",
+        requirements="r",
+        seed_type="chat",
+        status="refining",
+    )
+    plan = PlanDocument(
+        title="Health endpoint improvements",
+        summary="Improve the existing health endpoint.",
+        goals="- Add clearer health reporting.",
+        non_goals="- Do not add a new endpoint.",
+        files_changed="- `src/prscope/web/api.py`",
+        architecture="Keep the existing FastAPI route and extend its response carefully.",
+        implementation_steps="1. Update the existing handler.\n2. Return clearer health information.",
+        test_strategy="Add tests for healthy and unhealthy responses.",
+        rollback_plan="Revert the handler to the previous response shape if needed.",
+        open_questions="",
+    )
+    runtime._core(session.id).save_plan_version(
+        render_markdown(plan),
+        round_number=1,
+        plan_document=plan,
+    )
+    runtime.store.update_planning_session(session.id, current_round=1)
+
+    state = runtime._state(session.id, session)  # noqa: SLF001
+    tracker = state.issue_tracker
+    assert tracker is not None
+    tracker.add_issue(
+        "Lack of a clear strategy for error handling in the new health checks.",
+        1,
+        preferred_id="issue_2",
+    )
+    tracker.add_issue(
+        "Lack of clear error handling for failed health checks could lead to misleading health statuses.",
+        1,
+        preferred_id="issue_5",
+    )
+    tracker.add_issue(
+        "Error handling strategy needs to be clearly defined to avoid misleading health statuses.",
+        1,
+        preferred_id="issue_8",
+    )
+    tracker.add_edge("issue_5", "issue_2", "causes")
+    tracker.add_edge("issue_5", "issue_8", "causes")
+
+    async def fake_llm_call(messages, **kwargs):  # type: ignore[no-untyped-def]
+        del messages, kwargs
+        payload = {
+            "problem_understanding": "Clarify failure handling for health checks.",
+            "updates": {
+                "implementation_steps": (
+                    "1. Update the existing handler.\n"
+                    "2. Return clear failure details when a health check fails.\n"
+                    "3. Avoid reporting a healthy status when any required check fails."
+                ),
+                "test_strategy": (
+                    "Add tests for healthy and unhealthy responses, including failed dependency checks "
+                    "that must surface a non-healthy status."
+                ),
+            },
+            "assistant_reply": "Updated the plan to clarify failed health check error handling.",
+        }
+        return (
+            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload)))]),
+            "gpt-4o-mini",
+        )
+
+    runtime.author._llm_call = fake_llm_call  # type: ignore[method-assign]  # noqa: SLF001
+    runtime._attach_plan_version_artifacts = lambda **kwargs: None  # type: ignore[method-assign]  # noqa: SLF001
+    snapshot_seen_at_plan_ready: dict[str, object] = {}
+
+    async def capture_event(event: dict[str, object]) -> None:
+        if event.get("type") != "plan_ready":
+            return
+        snapshot = runtime.read_state_snapshot(session.id)
+        assert snapshot is not None
+        graph = snapshot.get("issue_graph")
+        assert isinstance(graph, dict)
+        snapshot_seen_at_plan_ready["open_total"] = graph["summary"]["open_total"]
+        snapshot_seen_at_plan_ready["issue_5"] = {node["id"]: node["status"] for node in graph["nodes"]}["issue_5"]
+        snapshot_seen_at_plan_ready["issue_5_resolution_source"] = {
+            node["id"]: node.get("resolution_source") for node in graph["nodes"]
+        }["issue_5"]
+
+    await runtime._chat_flow._apply_lightweight_plan_edit(  # noqa: SLF001
+        session_id=session.id,
+        user_message=(
+            "Please update the plan to address Lack of clear error handling for failed health checks "
+            "could lead to misleading health statuses. Adjust the approach, tasks, dependencies, "
+            "and success checks if needed."
+        ),
+        event_callback=capture_event,
+    )
+
+    snapshot = runtime.read_state_snapshot(session.id)
+    assert snapshot is not None
+    graph = snapshot.get("issue_graph")
+    assert isinstance(graph, dict)
+    assert snapshot_seen_at_plan_ready["open_total"] == 2
+    assert snapshot_seen_at_plan_ready["issue_5"] == "resolved"
+    assert snapshot_seen_at_plan_ready["issue_5_resolution_source"] == "lightweight"
+    assert graph["summary"]["open_total"] == 2
+    resolved = {node["id"]: node["status"] for node in graph["nodes"]}
+    resolution_sources = {node["id"]: node.get("resolution_source") for node in graph["nodes"]}
+    assert resolved["issue_2"] == "open"
+    assert resolved["issue_5"] == "resolved"
+    assert resolved["issue_8"] == "open"
+    assert resolution_sources["issue_2"] is None
+    assert resolution_sources["issue_5"] == "lightweight"
+    assert resolution_sources["issue_8"] is None
+
+
+def test_open_question_guard_keeps_unanswered_items(tmp_path) -> None:
+    runtime = PlanningRuntime(
+        store=Store(tmp_path / "test.db"),
+        config=PrscopeConfig(
+            local_repo=str(tmp_path),
+            planning=PlanningConfig(author_model="gpt-4o-mini", critic_model="gpt-4o-mini"),
+        ),
+        repo=RepoProfile(name="repo", path=str(tmp_path)),
+    )
+    current = "- Should response time be logged every call?\n- What response field format should be used?"
+    guarded = runtime._chat_flow._guard_open_question_resolution(  # type: ignore[attr-defined]  # noqa: SLF001
+        user_message="yes response time should be logged",
+        current_open_questions=current,
+        proposed_open_questions="- None.",
+    )
+    assert guarded == "- What response field format should be used?"
+
+
+def test_open_question_guard_allows_clear_when_user_says_all(tmp_path) -> None:
+    runtime = PlanningRuntime(
+        store=Store(tmp_path / "test.db"),
+        config=PrscopeConfig(
+            local_repo=str(tmp_path),
+            planning=PlanningConfig(author_model="gpt-4o-mini", critic_model="gpt-4o-mini"),
+        ),
+        repo=RepoProfile(name="repo", path=str(tmp_path)),
+    )
+    current = "- Should response time be logged every call?\n- What response field format should be used?"
+    guarded = runtime._chat_flow._guard_open_question_resolution(  # type: ignore[attr-defined]  # noqa: SLF001
+        user_message="resolve all questions: yes and keep existing schema",
+        current_open_questions=current,
+        proposed_open_questions="- None.",
+    )
+    assert guarded == "- None."
+
+
+@pytest.mark.asyncio
+async def test_refinement_message_falls_back_to_full_round_when_lightweight_fails(tmp_path):
+    store = Store(tmp_path / "test.db")
+    config = PrscopeConfig(
+        local_repo=str(tmp_path),
+        planning=PlanningConfig(author_model="gpt-4o-mini", critic_model="gpt-4o-mini"),
+    )
+    repo = RepoProfile(name="repo", path=str(tmp_path))
+    runtime = PlanningRuntime(store=store, config=config, repo=repo)
+
+    session = store.create_planning_session(
+        repo_name=repo.name,
+        title="lightweight-fallback",
+        requirements="r",
+        seed_type="chat",
+        status="refining",
+    )
+    runtime._core(session.id).save_plan_version("# Plan\n\nInitial draft", round_number=1)
+
+    round_calls = 0
+    lightweight_calls = 0
+
+    async def fake_round(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal round_calls
+        del args, kwargs
+        round_calls += 1
+        return None
+
+    async def fake_lightweight(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal lightweight_calls
+        del args, kwargs
+        lightweight_calls += 1
+        raise ValueError("bad lightweight payload")
+
+    runtime.run_adversarial_round = fake_round  # type: ignore[method-assign]
+    runtime._chat_flow._apply_lightweight_plan_edit = fake_lightweight  # type: ignore[method-assign]  # noqa: SLF001
+
+    mode, reply = await runtime.handle_refinement_message(
+        session_id=session.id,
+        user_message="Please update the plan wording in summary.",
+    )
+
+    assert mode == "refine_round"
+    assert reply is None
+    assert lightweight_calls == 1
+    assert round_calls == 1
 
 
 @pytest.mark.asyncio

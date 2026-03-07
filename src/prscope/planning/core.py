@@ -64,7 +64,6 @@ class PlanningCore:
             ("implementation_steps", "Implementation Steps"),
             ("test_strategy", "Test Strategy"),
             ("rollback_plan", "Rollback Plan"),
-            ("open_questions", "Open Questions"),
         )
         for key, label in sections:
             content = str(payload.get(key, "") or "").strip()
@@ -86,8 +85,8 @@ class PlanningCore:
     }
     VALID_COMMANDS: dict[str, set[str]] = {
         "draft": {"message", "export"},
-        "refining": {"message", "run_round", "export"},
-        "converged": {"run_round", "approve", "export"},
+        "refining": {"message", "followup_answer", "run_round", "export"},
+        "converged": {"message", "followup_answer", "run_round", "approve", "export"},
         "approved": {"export"},
         "error": {"reset"},
     }
@@ -136,6 +135,8 @@ class PlanningCore:
         round_number: int,
         *,
         plan_document: Any | None = None,
+        decision_graph_json: str | None = None,
+        followups_json: str | None = None,
         changed_sections: list[str] | None = None,
     ) -> PlanVersion:
         if plan_document is not None:
@@ -162,6 +163,8 @@ class PlanningCore:
             round_number=round_number,
             plan_content=content,
             plan_json=plan_json,
+            decision_graph_json=decision_graph_json,
+            followups_json=followups_json,
             plan_sha=plan_sha,
             changed_sections=json.dumps(changed_sections or []),
             diff_from_previous=diff_from_previous,

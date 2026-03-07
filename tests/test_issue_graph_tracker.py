@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from prscope.config import IssueDedupeConfig, IssueGraphConfig
 from prscope.planning.runtime.critic import ReviewResult
+from prscope.planning.runtime.pipeline.stages import review_issue_severity
 from prscope.planning.runtime.review import IssueCausalityExtractor, IssueGraphTracker, IssueSimilarityService
 
 
@@ -76,6 +77,36 @@ def test_resolution_propagation_uses_causes_and_dependency_gate():
     assert all(issue.id != c.id for issue in tracker.open_issues())
 
 
+def test_shallow_resolution_does_not_propagate_to_causal_children():
+    tracker = _tracker()
+    root = tracker.add_issue("Root issue", 1, preferred_id="issue_1")
+    child = tracker.add_issue("Child issue", 1, preferred_id="issue_2")
+    tracker.add_edge(root.id, child.id, "causes")
+
+    tracker.resolve_issue(root.id, 2, propagate_causes=False, resolution_source="lightweight")
+
+    snapshot = tracker.graph_snapshot()
+    statuses = {node["id"]: node["status"] for node in snapshot["nodes"]}
+    resolution_sources = {node["id"]: node.get("resolution_source") for node in snapshot["nodes"]}
+    assert statuses["issue_1"] == "resolved"
+    assert statuses["issue_2"] == "open"
+    assert resolution_sources["issue_1"] == "lightweight"
+    assert resolution_sources["issue_2"] is None
+
+
+def test_propagating_resolution_marks_review_flow_source():
+    tracker = _tracker()
+    root = tracker.add_issue("Root issue", 1, preferred_id="issue_1")
+    child = tracker.add_issue("Child issue", 1, preferred_id="issue_2")
+    tracker.add_edge(root.id, child.id, "causes")
+
+    tracker.resolve_issue(root.id, 2)
+
+    resolution_sources = {node["id"]: node.get("resolution_source") for node in tracker.graph_snapshot()["nodes"]}
+    assert resolution_sources["issue_1"] == "review"
+    assert resolution_sources["issue_2"] == "review"
+
+
 def test_root_open_excludes_dependency_edges():
     tracker = _tracker()
     a = tracker.add_issue("Architecture issue", 1, preferred_id="issue_1")
@@ -118,3 +149,13 @@ def test_causality_extractor_adds_causal_edges_with_guardrails():
     assert result.accepted_edges == 1
     assert len(snapshot["edges"]) == 1
     assert snapshot["edges"][0]["relation"] == "causes"
+    node_severities = {node["severity"] for node in snapshot["nodes"]}
+    assert node_severities == {"minor"}
+
+
+def test_review_issue_severity_demotes_architectural_and_implementability_items():
+    assert review_issue_severity("blocking_issue") == "major"
+    assert review_issue_severity("constraint_violation") == "major"
+    assert review_issue_severity("architectural_concern") == "minor"
+    assert review_issue_severity("validation_architectural_concern") == "minor"
+    assert review_issue_severity("implementability_detail") == "minor"

@@ -155,6 +155,7 @@ src/prscope/
 │       │   └── llm_client.py  [Intelligence] responses/chat compatibility layer
 │       ├── context/           [Intelligence] budget, context assembly, clarification, compression
 │       ├── events/            [Intelligence] runtime analytics/tool/token event state
+│       ├── followups/         [Intelligence] decision graph + post-plan follow-up artifacts
 │       ├── pipeline/          [Intelligence] adversarial stage loop and stage orchestration
 │       ├── review/            [Intelligence] issue graph, similarity, causality, manifesto checks
 │       ├── round_controller.py[Intelligence] round progression logic
