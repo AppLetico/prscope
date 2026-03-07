@@ -9,9 +9,10 @@ import pytest
 from prscope.config import PlanningConfig, PrscopeConfig, RepoProfile
 from prscope.planning.runtime.author import RepairPlan, RevisionResult
 from prscope.planning.runtime.authoring.models import PlanDocument, render_markdown
-from prscope.planning.runtime.critic import CriticResult
+from prscope.planning.runtime.critic import CriticResult, ReviewResult
 from prscope.planning.runtime.discovery import DiscoveryQuestion, DiscoveryTurnResult, QuestionOption
 from prscope.planning.runtime.orchestration import PlanningRuntime
+from prscope.planning.runtime.pipeline.round_context import PlanningRoundContext
 from prscope.store import Store
 
 
@@ -418,6 +419,59 @@ async def test_refinement_message_yes_answer_routes_to_lightweight_edit(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_refinement_message_ambiguous_statement_defaults_to_full_round(tmp_path):
+    store = Store(tmp_path / "test.db")
+    config = PrscopeConfig(
+        local_repo=str(tmp_path),
+        planning=PlanningConfig(author_model="gpt-4o-mini", critic_model="gpt-4o-mini"),
+    )
+    repo = RepoProfile(name="repo", path=str(tmp_path))
+    runtime = PlanningRuntime(store=store, config=config, repo=repo)
+
+    session = store.create_planning_session(
+        repo_name=repo.name,
+        title="ambiguous-intent",
+        requirements="r",
+        seed_type="chat",
+        status="refining",
+    )
+    runtime._core(session.id).save_plan_version("# Plan\n\nInitial draft", round_number=1)
+
+    round_calls = 0
+    chat_calls = 0
+
+    async def fake_round(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal round_calls
+        del args, kwargs
+        round_calls += 1
+        return None
+
+    async def fake_chat(*args, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal chat_calls
+        del args, kwargs
+        chat_calls += 1
+        return "chat fallback"
+
+    async def fake_classifier(**kwargs):  # type: ignore[no-untyped-def]
+        del kwargs
+        return None
+
+    runtime.run_adversarial_round = fake_round  # type: ignore[method-assign]
+    runtime._chat_flow.chat_with_author = fake_chat  # type: ignore[method-assign]  # noqa: SLF001
+    runtime._chat_flow._classify_ambiguous_refinement_message = fake_classifier  # type: ignore[method-assign]  # noqa: SLF001
+
+    mode, reply = await runtime.handle_refinement_message(
+        session_id=session.id,
+        user_message="Actually this should be async.",
+    )
+
+    assert mode == "refine_round"
+    assert reply is None
+    assert round_calls == 1
+    assert chat_calls == 0
+
+
+@pytest.mark.asyncio
 async def test_lightweight_edit_resolves_single_targeted_issue_in_snapshot(tmp_path):
     store = Store(tmp_path / "test.db")
     config = PrscopeConfig(
@@ -539,6 +593,207 @@ async def test_lightweight_edit_resolves_single_targeted_issue_in_snapshot(tmp_p
     assert resolution_sources["issue_2"] is None
     assert resolution_sources["issue_5"] == "lightweight"
     assert resolution_sources["issue_8"] is None
+
+
+@pytest.mark.asyncio
+async def test_followup_answer_updates_decision_graph_before_refreshing_sections(tmp_path):
+    store = Store(tmp_path / "test.db")
+    config = PrscopeConfig(
+        local_repo=str(tmp_path),
+        planning=PlanningConfig(author_model="gpt-4o-mini", critic_model="gpt-4o-mini"),
+    )
+    repo = RepoProfile(name="repo", path=str(tmp_path))
+    runtime = PlanningRuntime(store=store, config=config, repo=repo)
+
+    session = store.create_planning_session(
+        repo_name=repo.name,
+        title="followup-decision",
+        requirements="r",
+        seed_type="chat",
+        status="refining",
+    )
+    plan = PlanDocument(
+        title="Plan",
+        summary="Add persistence.",
+        goals="Support durable state.",
+        non_goals="Do not change the external API.",
+        files_changed="`src/app.py` - wire persistence.",
+        architecture="Keep the storage layer abstract until the database decision is confirmed.",
+        implementation_steps="1. Add the storage abstraction.",
+        test_strategy="Add integration tests for persistence.",
+        rollback_plan="Revert the storage integration if rollout fails.",
+        open_questions="- Which database should store the primary application data?",
+    )
+    version = runtime._core(session.id).save_plan_version(
+        render_markdown(plan),
+        round_number=1,
+        plan_document=plan,
+    )
+    runtime._attach_plan_version_artifacts(
+        version_id=version.id,
+        plan_document=plan,
+        plan_content=version.plan_content,
+    )
+    runtime.store.update_planning_session(session.id, current_round=1)
+
+    async def fake_llm_call(messages, **kwargs):  # type: ignore[no-untyped-def]
+        del messages, kwargs
+        payload = {
+            "problem_understanding": "Apply the chosen database to the architecture section.",
+            "updates": {
+                "architecture": (
+                    "Use PostgreSQL for the primary application database while keeping the storage "
+                    "layer abstraction stable for the rest of the system."
+                )
+            },
+            "assistant_reply": "Updated the architecture to reflect the PostgreSQL decision.",
+        }
+        return (
+            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps(payload)))]),
+            "gpt-4o-mini",
+        )
+
+    runtime.author._llm_call = fake_llm_call  # type: ignore[method-assign]  # noqa: SLF001
+
+    mode, reply = await runtime.apply_followup_answer(
+        session_id=session.id,
+        followup_id="architecture.database",
+        followup_answer="PostgreSQL",
+        target_sections=["architecture"],
+    )
+
+    latest = store.get_plan_versions(session.id, limit=1)[0]
+    plan_payload = json.loads(latest.plan_json or "{}")
+    graph_payload = json.loads(latest.decision_graph_json or "{}")
+    followups_payload = json.loads(latest.followups_json or "{}")
+
+    assert mode == "decision_refine"
+    assert "PostgreSQL" in (reply or "")
+    assert "PostgreSQL" in latest.plan_content
+    assert plan_payload["open_questions"] == "- None."
+    assert graph_payload["nodes"]["architecture.database"]["value"] == "PostgreSQL"
+    assert followups_payload["questions"] == []
+
+
+@pytest.mark.asyncio
+async def test_full_revision_reconciles_decision_graph_before_persisting(tmp_path):
+    store = Store(tmp_path / "test.db")
+    config = PrscopeConfig(
+        local_repo=str(tmp_path),
+        planning=PlanningConfig(author_model="gpt-4o-mini", critic_model="gpt-4o-mini"),
+    )
+    repo = RepoProfile(name="repo", path=str(tmp_path))
+    runtime = PlanningRuntime(store=store, config=config, repo=repo)
+
+    session = store.create_planning_session(
+        repo_name=repo.name,
+        title="revision-decision",
+        requirements="r",
+        seed_type="chat",
+        status="refining",
+    )
+    plan = PlanDocument(
+        title="Plan",
+        summary="Add persistence.",
+        goals="Support durable state.",
+        non_goals="Do not change the external API.",
+        files_changed="`src/app.py` - wire persistence.",
+        architecture="Keep the storage layer abstract until the database decision is confirmed.",
+        implementation_steps="1. Add the storage abstraction.",
+        test_strategy="Add integration tests for persistence.",
+        rollback_plan="Revert the storage integration if rollout fails.",
+        open_questions="- Which database should store the primary application data?",
+    )
+    version = runtime._core(session.id).save_plan_version(
+        render_markdown(plan),
+        round_number=1,
+        plan_document=plan,
+    )
+    runtime._attach_plan_version_artifacts(
+        version_id=version.id,
+        plan_document=plan,
+        plan_content=version.plan_content,
+    )
+    runtime.store.update_planning_session(session.id, current_round=1)
+
+    state = runtime._state(session.id)
+    ctx = PlanningRoundContext(
+        core=runtime._core(session.id),
+        session_id=session.id,
+        round_number=2,
+        requirements="r",
+        state=state,
+        issue_tracker=state.issue_tracker,
+        selected_author_model="gpt-4o-mini",
+        selected_critic_model="gpt-4o-mini",
+        event_callback=None,
+    )
+    review_result = ReviewResult(
+        strengths=[],
+        architectural_concerns=["Database choice remains underspecified for persistence rollout."],
+        risks=[],
+        simplification_opportunities=[],
+        blocking_issues=[],
+        reviewer_questions=[],
+        recommended_changes=[],
+        design_quality_score=6.0,
+        confidence="medium",
+        review_complete=False,
+        simplest_possible_design=None,
+        primary_issue="Database choice remains underspecified for persistence rollout.",
+        resolved_issues=[],
+        constraint_violations=[],
+        issue_priority=[],
+        prose="Database choice remains underspecified for persistence rollout.",
+        parse_error=None,
+    )
+    repair_plan = RepairPlan(
+        problem_understanding="Resolve the database decision.",
+        accepted_issues=["Database choice remains underspecified for persistence rollout."],
+        rejected_issues=[],
+        root_causes=["Missing persistence decision"],
+        repair_strategy="Choose the database and update the architecture narrative.",
+        target_sections=["architecture", "open_questions"],
+        revision_plan="Resolve the database decision in the architecture section.",
+    )
+
+    async def fake_revise_plan(**kwargs):  # type: ignore[no-untyped-def]
+        del kwargs
+        return RevisionResult(
+            problem_understanding="Choose PostgreSQL for persistence.",
+            updates={
+                "architecture": (
+                    "Use PostgreSQL for the primary application database while keeping the storage "
+                    "layer abstraction stable for the rest of the system."
+                )
+            },
+            justification={"architecture": "Resolves the missing persistence decision."},
+            review_prediction="Reviewer should accept the clarified persistence choice.",
+        )
+
+    runtime.author.revise_plan = fake_revise_plan  # type: ignore[method-assign]
+
+    async def emit_tool(*args, **kwargs):  # type: ignore[no-untyped-def]
+        del args, kwargs
+
+    updated_markdown, changed_sections, _ = await runtime._stages.revise_plan(  # noqa: SLF001
+        ctx=ctx,
+        current_plan_doc=plan,
+        repair_plan=repair_plan,
+        review_result=review_result,
+        emit_tool=emit_tool,
+    )
+
+    latest = store.get_plan_versions(session.id, limit=1)[0]
+    plan_payload = json.loads(latest.plan_json or "{}")
+    graph_payload = json.loads(latest.decision_graph_json or "{}")
+
+    assert "PostgreSQL" in updated_markdown
+    assert "PostgreSQL" in latest.plan_content
+    assert "architecture" in changed_sections
+    assert "open_questions" in changed_sections
+    assert plan_payload["open_questions"] == "- None."
+    assert graph_payload["nodes"]["architecture.database"]["value"] == "PostgreSQL"
 
 
 def test_open_question_guard_keeps_unanswered_items(tmp_path) -> None:

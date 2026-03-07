@@ -17,7 +17,10 @@ from prscope.planning.runtime.discovery import (
     FeatureIntent,
     parse_questions,
 )
-from prscope.planning.runtime.discovery_support.existing_feature import existing_feature_evidence_lines
+from prscope.planning.runtime.discovery_support.existing_feature import (
+    build_existing_feature_enhancement_summary,
+    existing_feature_evidence_lines,
+)
 from prscope.planning.runtime.discovery_support.signals import route_file_score
 
 
@@ -205,6 +208,53 @@ async def test_existing_feature_proposal_review_proceed_completes_discovery() ->
     assert result.reply == "Discovery complete — drafting enhancement plan now."
     assert result.summary == "Enhance status endpoint with metrics and response contract notes."
     assert result.questions == []
+
+
+@pytest.mark.asyncio
+async def test_existing_feature_first_turn_requires_strong_evidence() -> None:
+    manager = DiscoveryManager.__new__(DiscoveryManager)
+    manager.bootstrap_insights_by_session = {
+        "s1": {
+            "existing_feature": True,
+            "feature_label": "billing webhook",
+            "matched_paths": ["docs/README.md"],
+            "matched_evidence": [],
+        }
+    }
+
+    result = await manager._maybe_existing_feature_first_turn_result(
+        turn_count=1,
+        latest_user_message="create billing webhook",
+        session_id="s1",
+    )
+
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_existing_feature_enhancement_summary_keeps_revision_input() -> None:
+    async def _deep_summary_loader() -> tuple[str | None, str | None]:
+        return (
+            '- Detected endpoint shape: `GET "/health"`\n- Handler function: `health`',
+            'This route already exists: `GET /health` currently returns `{"status": "healthy"}`.',
+        )
+
+    summary = await build_existing_feature_enhancement_summary(
+        insights={
+            "matched_paths": ["src/prscope/web/api.py"],
+            "matched_evidence": ['`src/prscope/web/api.py:1063` @app.get("/health")'],
+            "feature_keywords": ["health", "endpoint"],
+        },
+        feature_label="health",
+        requested_improvement="add security",
+        original_request="create health api endpoint",
+        route_file_score=route_file_score,
+        deep_summary_loader=_deep_summary_loader,
+    )
+
+    assert "Requested change: add security" in summary
+    assert "Original ask:" not in summary
+    assert "access-control" in summary
 
 
 def test_bootstrap_seed_paths_collects_paths_from_evidence_lines() -> None:

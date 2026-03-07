@@ -333,6 +333,7 @@ class DiscoveryBootstrapService:
                 insights = self._manager.bootstrap_insights_by_session.setdefault(session_id, {})
                 insights["architecture"] = architecture
                 insights["signal_scores"] = signal_scores
+                insights["inferred_framework"] = inferred_framework
                 insights["best_path"] = evidence_list[0].path if evidence_list else None
             context_lines.append("Endpoint/API-related code matches:")
             context_lines.append(self._manager._format_grep_matches(matches, limit=16))

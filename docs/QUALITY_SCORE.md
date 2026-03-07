@@ -11,7 +11,7 @@ Grading: **A** = solid, well-tested, documented | **B** = functional, minor gaps
 | **Foundation** (`config`, `pricing`, `model_catalog`, `profile`, `semantic`) | B | Well-tested. `config.py` is stable. `semantic.py` could use more edge-case coverage. |
 | **Storage** (`store.py`) | A | Thorough test coverage. Protected field guards. Schema is stable. |
 | **Planning Core** (`planning/core.py`, `planning/executor.py`) | A | State machine is well-specified with invariant enforcement. Executor has durable command log. |
-| **Planning Runtime** (`planning/runtime/*`) | A- | Runtime is now split into `pipeline/`, `context/`, `review/`, and `events/` subpackages with explicit stage dependency injection and author-owned initial draft flow. `orchestration.py` remains large but risk is reduced. |
+| **Planning Runtime** (`planning/runtime/*`) | A | Runtime now has an explicit `signals -> reasoners -> orchestration` split, graph-backed follow-up state, and targeted unit coverage for discovery/refinement/review/convergence reasoners. `orchestration.py` remains large but semantic policy is no longer distributed through helper modules. |
 | **Planning Scanners** (`planning/scanners/*`) | B | grep backend is reliable. repomap/repomix backends are less exercised. |
 | **Memory** (`memory.py`) | B | Rebuild logic and skill loading are tested. Manifesto parsing is solid. Memory block summarization depends on LLM availability. |
 | **Scoring** (`scoring.py`) | B | Rule-based scoring with good unit tests. Feature config is stable. |
@@ -19,7 +19,7 @@ Grading: **A** = solid, well-tested, documented | **B** = functional, minor gaps
 | **Web API** (`web/api.py`) | B | Command model is well-tested. SSE contract is documented. Some wrapper endpoints have lighter coverage. |
 | **Web Frontend** (`web/frontend/`) | B | 2 test files with 12 tests covering timeline reducer, buildTimeline, upsertToolCall, and hasRunningToolCalls. No integration or e2e tests. Timeline architecture is well-structured with reducer-based state management. |
 | **Benchmark** (`benchmark.py`) | B | HTTP-based, repeatable. Historical tracking works. No automated regression gate in CI yet. |
-| **Documentation** | B | Runtime docs are strong (`agent-harness.md`, `planning-state-machine.md`). Architecture and design docs are new. |
+| **Documentation** | A- | Runtime docs now cover the reasoning layer, decision-graph-backed plan artifacts, and frontend graph rendering. Remaining gap: no automated stale-doc detection. |
 | **CI / Linting** | B | Standard ruff + eslint. Structural import lints are new (`test_architecture.py`). No custom lint rules with agent-friendly remediation messages yet. |
 
 ## Known Gaps
@@ -28,7 +28,7 @@ Grading: **A** = solid, well-tested, documented | **B** = functional, minor gaps
 
 - [ ] Frontend test coverage: `PlanningView.test.ts` (10 tests: reducer, buildTimeline, upsertToolCall) and `ChatPanel.test.ts` (2 tests: hasRunningToolCalls) exist. No component unit tests for `ActionBar`, `PlanPanel`, `ToolCallStream`.
 - [ ] No e2e test harness for the web UI (no Playwright/Cypress).
-- [ ] `orchestration.py` is still the largest runtime module. Continue migrating formatting/prompt helper logic into specialized modules to reduce coordinator size further.
+- [ ] `orchestration.py` is still the largest runtime module. Continue shrinking coordinator size as helper seams become clearer.
 
 ### Medium Priority
 
@@ -41,6 +41,7 @@ Grading: **A** = solid, well-tested, documented | **B** = functional, minor gaps
 - [ ] `semantic.py` edge cases (empty repos, binary files).
 - [ ] Memory block summarization fallback paths are tested but the happy path depends on live LLM calls.
 - [ ] Stale doc detection is manual — no automated doc-gardening process yet.
+- [ ] Frontend decision-graph UX is projection-only; there is no direct decision-node editing surface yet.
 
 ## Updating This Document
 

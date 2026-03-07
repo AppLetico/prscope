@@ -210,6 +210,45 @@ def test_session_diagnostics_uses_persisted_timing(tmp_path, monkeypatch):
     assert payload["draft_timing"]["author_call_timeouts"] == 2
 
 
+def test_runtime_registry_tracks_routing_decisions(tmp_path):
+    store = Store(tmp_path / "test.db")
+    session = store.create_planning_session(
+        repo_name=tmp_path.name,
+        title="routing",
+        requirements="r",
+        seed_type="requirements",
+        status="draft",
+    )
+    registry = RuntimeRegistry(emitter=SimpleNamespace())
+
+    registry.note_event(
+        session.id,
+        {
+            "type": "routing_decision",
+            "source": "model",
+            "route": "full_refine",
+        },
+        store=store,
+    )
+    registry.note_event(
+        session.id,
+        {
+            "type": "routing_decision",
+            "source": "heuristic",
+            "route": "existing_feature_enhancement_proposal",
+        },
+        store=store,
+    )
+
+    timing = registry.get_session_timing(session.id, store=store)
+    assert timing is not None
+    assert timing["routing_decisions_total"] == 2
+    assert timing["routing_model_decisions"] == 1
+    assert timing["routing_heuristic_decisions"] == 1
+    assert timing["route_full_refine_total"] == 1
+    assert timing["route_existing_feature_total"] == 1
+
+
 def test_get_session_parses_version_followups_payload(tmp_path, monkeypatch):
     _write_minimal_config(tmp_path)
     monkeypatch.setenv("PRSCOPE_CONFIG_ROOT", str(tmp_path))

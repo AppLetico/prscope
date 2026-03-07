@@ -56,7 +56,14 @@ Core components:
   - Discovery turn orchestrator and compatibility façade
   - Delegates helper logic to `src/prscope/planning/runtime/discovery_support/*`
     (`models`, `signals`, `existing_feature`, `bootstrap`, `llm`)
+  - Delegates semantic routing policy to `src/prscope/planning/runtime/reasoning/discovery_reasoner.py`
   - Keeps session-scoped bootstrap insights (`existing_feature`, `feature_label`, evidence paths)
+- `src/prscope/planning/runtime/reasoning/*`
+  - Shared Layer 3 policy package: `base`, `models`, `discovery_reasoner`, `refinement_reasoner`, `review_reasoner`, `convergence_reasoner`
+  - Consumes `ReasoningContext` and returns provenance-carrying decisions (`confidence`, `evidence`, `decision_source`, `reasoner_version`)
+- `src/prscope/planning/runtime/followups/*`
+  - Decision graph extraction, merge, and follow-up generation
+  - Persisted plan artifacts include `decision_graph_json` and `followups_json`
 - `src/prscope/planning/runtime/authoring/*`
   - Author subsystem: `models`, `discovery`, `validation`, `repair`, `pipeline`
 - `src/prscope/store.py`
@@ -110,14 +117,31 @@ Discovery operates in this order:
 1. extract feature intent from the latest user request
 2. bootstrap-scan repository evidence (tools + grep/read snapshots)
 3. infer framework/signals from shared scan results
-4. decide whether feature likely exists
-5. ask only unresolved decision questions
+4. build signal payloads (`FrameworkSignals`, `ExistingFeatureSignals`, follow-up choice signals)
+5. call `DiscoveryReasoner`
+6. ask only unresolved decision questions or execute the chosen discovery mode
 
 Expected behavior:
 
 - If evidence indicates a feature already exists, discovery should avoid "create new X" planning.
 - If framework evidence is present, discovery should avoid asking "which backend/framework?".
 - Clarifying questions should be batched and non-duplicative in UI rendering.
+- `discovery_support/*` may collect and score evidence, but should not directly choose discovery routes.
+
+## Refinement Behavior Contract
+
+Refinement now follows the same layered pattern:
+
+1. extract `RefinementMessageSignals` from the latest message + recent context
+2. optionally classify ambiguous routing with the author model
+3. call `RefinementReasoner`
+4. execute the chosen path (`author_chat`, `lightweight_refine`, `full_refine`, or follow-up/issue resolution)
+
+Expected behavior:
+
+- `chat_flow.py` should remain execution-oriented: invoke the reasoner, run the selected path, persist, and emit SSE events.
+- lightweight issue resolution and open-question handling should be explainable through reasoner provenance, not hidden heuristics.
+- routing telemetry should carry provenance fields so ambiguous paths can be debugged without re-reading orchestration code.
 
 ## Command Model
 
@@ -174,6 +198,7 @@ Issue snapshot expectation:
 - session snapshots include a backward-compatible flat issue view (`open_issues`) and an additive graph payload (`issue_graph`)
 - `issue_graph` includes deterministic replay fields: `nodes`, `edges`, `duplicate_alias`, and `summary`
 - adjacency indexes are runtime-derived and should not be persisted
+- plan version payloads also carry `decision_graph` and `followups`; the decision graph is the primary planning-state artifact and markdown extraction is compatibility/backfill only
 
 ## Runtime Invariants Enforced by Core
 

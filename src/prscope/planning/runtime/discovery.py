@@ -8,7 +8,10 @@ then asks only questions that cannot be answered from code.
 from __future__ import annotations
 
 import asyncio
+from dataclasses import asdict
+import json
 import logging
+import re
 from collections.abc import Awaitable
 from typing import Any, Callable
 
@@ -30,6 +33,8 @@ from .discovery_support import (
     QuestionOption,
     SignalIndex,
     aggregate_evidence,
+    build_existing_feature_signals,
+    build_framework_signals,
     build_existing_endpoint_deep_summary,
     build_existing_feature_enhancement_summary,
     build_signal_index,
@@ -54,6 +59,13 @@ from .discovery_support import (
     should_bootstrap_scan,
     summarize_endpoint_snippet,
     try_extract_completion,
+)
+from .reasoning import (
+    DiscoveryChoiceSignals,
+    DiscoveryFollowupSignals,
+    DiscoveryReasoner,
+    FrameworkSignals,
+    ReasoningContext,
 )
 from .tools import ToolExecutor
 
@@ -130,6 +142,7 @@ class DiscoveryManager:
         self.event_callback = event_callback
         self._bootstrap_service = DiscoveryBootstrapService(self)
         self._llm_client = DiscoveryLLMClient(self)
+        self._discovery_reasoner = DiscoveryReasoner()
 
     def reset_session(self, session_id: str) -> None:
         self.turn_counts_by_session[session_id] = 0
@@ -163,6 +176,13 @@ class DiscoveryManager:
             client = DiscoveryLLMClient(self)
             self._llm_client = client
         return client
+
+    def _reasoner(self) -> DiscoveryReasoner:
+        reasoner = getattr(self, "_discovery_reasoner", None)
+        if reasoner is None:
+            reasoner = DiscoveryReasoner()
+            self._discovery_reasoner = reasoner
+        return reasoner
 
     def _next_turn_count(self, session_id: str) -> int:
         current = int(self.turn_counts_by_session.get(session_id, 0))
@@ -436,6 +456,106 @@ class DiscoveryManager:
     def _try_extract_completion(self, text: str) -> DiscoveryTurnResult:
         return try_extract_completion(text)
 
+    @staticmethod
+    def _parse_json_dict(raw: str) -> dict[str, Any] | None:
+        text = str(raw or "").strip()
+        if not text:
+            return None
+        candidates = [text]
+        code_blocks = re.findall(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", text, flags=re.IGNORECASE)
+        candidates.extend(candidate.strip() for candidate in code_blocks if candidate.strip())
+        if "{" in text and "}" in text:
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end > start:
+                candidates.append(text[start : end + 1].strip())
+        for candidate in candidates:
+            try:
+                parsed = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(parsed, dict):
+                return parsed
+        return None
+
+    async def _emit_routing_decision(
+        self,
+        *,
+        session_id: str,
+        stage: str,
+        route: str,
+        source: str,
+        confidence: str,
+        message: str,
+        signal_summary: dict[str, Any] | None = None,
+        evidence: list[str] | None = None,
+        decision_source: str | None = None,
+        reasoner_version: str | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "type": "routing_decision",
+            "session_stage": stage,
+            "route": route,
+            "source": source,
+            "confidence": confidence,
+            "message": message[:240],
+        }
+        if signal_summary:
+            payload["signals"] = signal_summary
+        if evidence:
+            payload["evidence"] = evidence[:6]
+        if decision_source:
+            payload["decision_source"] = decision_source
+        if reasoner_version:
+            payload["reasoner_version"] = reasoner_version
+        await self._emit(payload)
+
+    def _existing_feature_signals(self, session_id: str):
+        insights = getattr(self, "bootstrap_insights_by_session", {}).get(session_id, {})
+        evidence_lines = self._existing_feature_evidence_lines(session_id)
+        return build_existing_feature_signals(insights, self._route_file_score, evidence_lines)
+
+    def _existing_feature_signal_summary(self, session_id: str) -> dict[str, Any]:
+        return asdict(self._existing_feature_signals(session_id))
+
+    async def _classify_existing_feature_choice(
+        self,
+        *,
+        question_text: str,
+        options: dict[str, str],
+        latest_user_message: str,
+        feature_label: str,
+        session_id: str,
+        model_override: str | None = None,
+        extra_context: str = "",
+    ) -> dict[str, Any] | None:
+        signal_summary = self._existing_feature_signal_summary(session_id)
+        prompt = self._reasoner().build_choice_prompt(
+            DiscoveryChoiceSignals(
+                question_text=question_text,
+                options=options,
+                latest_user_message=latest_user_message,
+                feature_label=feature_label,
+                signal_summary=signal_summary,
+                evidence_lines=self._existing_feature_evidence_lines(session_id)[:4],
+                extra_context=extra_context,
+            )
+        )
+        try:
+            response = await self._llm_call(
+                [
+                    {
+                        "role": "system",
+                        "content": "You classify user intent for planning flow. Return strict JSON only.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                model_override=model_override,
+            )
+        except Exception:
+            return None
+        return self._reasoner().parse_choice_payload(self._parse_json_dict(response))
+
     async def _handle_existing_feature_followup(
         self,
         *,
@@ -443,6 +563,7 @@ class DiscoveryManager:
         latest_user_message: str,
         prior_insights: dict[str, Any],
         feature_label: str,
+        model_override: str | None = None,
     ) -> DiscoveryTurnResult | None:
         async def proposal_review_result(summary_text: str) -> DiscoveryTurnResult:
             return DiscoveryTurnResult(
@@ -469,11 +590,52 @@ class DiscoveryManager:
             )
 
         if bool(prior_insights.get("awaiting_enhancement_proposal_review")):
-            decision = parse_enhancement_proposal_followup_choice(latest_user_message)
+            heuristic_choice = parse_enhancement_proposal_followup_choice(latest_user_message)
             proposal_summary = str(prior_insights.get("enhancement_proposal_summary", "")).strip()
-            if decision == "A":
+            model_choice: dict[str, Any] | None = None
+            if heuristic_choice is None:
+                model_choice = await self._classify_existing_feature_choice(
+                    question_text="How should we proceed with this enhancement proposal?",
+                    options={
+                        "A": "Proceed and draft the plan from this proposal.",
+                        "B": "Revise the proposal first (I will provide edits).",
+                        "C": "Cancel; leave the existing implementation unchanged.",
+                        "D": "Other — describe your preference",
+                    },
+                    latest_user_message=latest_user_message,
+                    feature_label=feature_label,
+                    session_id=session_id,
+                    model_override=model_override,
+                    extra_context=proposal_summary,
+                )
+            decision = await self._reasoner().decide(
+                ReasoningContext(
+                    signals=DiscoveryFollowupSignals(
+                        heuristic_choice=heuristic_choice,
+                        model_choice=str((model_choice or {}).get("choice", "")).strip() or None,
+                        model_confidence=str((model_choice or {}).get("confidence", "low")),
+                        rephrased_request=str((model_choice or {}).get("rephrased_request", "")).strip() or None,
+                        concrete_enhancement_request=self._is_concrete_enhancement_request(
+                            str((model_choice or {}).get("rephrased_request", "")).strip() or latest_user_message
+                        ),
+                        awaiting_proposal_review=True,
+                        proposal_summary=proposal_summary or None,
+                    ),
+                    session_metadata={"scenario": "existing_feature_followup"},
+                )
+            )
+            if decision.mode == "proposal_review_proceed":
                 prior_insights["awaiting_enhancement_proposal_review"] = False
                 prior_insights["awaiting_enhancement_revision_input"] = False
+                await self._emit_routing_decision(
+                    session_id=session_id,
+                    stage="discovery",
+                    route="proposal_review_proceed",
+                    source=decision.routing_source,
+                    confidence="high" if decision.confidence >= 0.8 else "medium",
+                    message=latest_user_message,
+                    signal_summary=self._existing_feature_signal_summary(session_id),
+                )
                 return DiscoveryTurnResult(
                     reply="Discovery complete — drafting enhancement plan now.",
                     complete=True,
@@ -481,23 +643,41 @@ class DiscoveryManager:
                     or await self._build_existing_feature_enhancement_summary(
                         session_id,
                         feature_label,
-                        requested_improvement=latest_user_message,
+                        requested_improvement=decision.rephrased_request or latest_user_message,
                     ),
                     questions=[],
                 )
-            if decision == "B":
+            if decision.mode == "proposal_review_revise":
                 prior_insights["awaiting_enhancement_proposal_review"] = False
                 prior_insights["awaiting_enhancement_revision_input"] = True
+                await self._emit_routing_decision(
+                    session_id=session_id,
+                    stage="discovery",
+                    route="proposal_review_revise",
+                    source=decision.routing_source,
+                    confidence="high" if decision.confidence >= 0.8 else "medium",
+                    message=latest_user_message,
+                    signal_summary=self._existing_feature_signal_summary(session_id),
+                )
                 return DiscoveryTurnResult(
                     reply="Got it — tell me what to change in the proposal, and I will update it before drafting.",
                     complete=False,
                     summary=None,
                     questions=[],
                 )
-            if decision == "C":
+            if decision.mode == "proposal_review_cancel":
                 prior_insights["awaiting_enhancement_proposal_review"] = False
                 prior_insights["awaiting_enhancement_revision_input"] = False
                 prior_insights["enhance_existing"] = False
+                await self._emit_routing_decision(
+                    session_id=session_id,
+                    stage="discovery",
+                    route="proposal_review_cancel",
+                    source=decision.routing_source,
+                    confidence="high" if decision.confidence >= 0.8 else "medium",
+                    message=latest_user_message,
+                    signal_summary=self._existing_feature_signal_summary(session_id),
+                )
                 return DiscoveryTurnResult(
                     reply=(
                         f"Understood — we'll leave the existing {feature_label} unchanged. "
@@ -507,15 +687,34 @@ class DiscoveryManager:
                     summary=None,
                     questions=[],
                 )
-            if self._is_concrete_enhancement_request(latest_user_message):
+            requested_improvement = decision.rephrased_request or latest_user_message
+            if decision.mode == "proposal_review_revision_input":
                 revised_summary = await self._build_existing_feature_enhancement_summary(
                     session_id,
                     feature_label,
-                    requested_improvement=latest_user_message,
+                    requested_improvement=requested_improvement,
                 )
                 prior_insights["enhancement_proposal_summary"] = revised_summary
+                await self._emit_routing_decision(
+                    session_id=session_id,
+                    stage="discovery",
+                    route="proposal_review_revision_input",
+                    source=decision.routing_source,
+                    confidence="high" if decision.confidence >= 0.8 else "medium",
+                    message=latest_user_message,
+                    signal_summary=self._existing_feature_signal_summary(session_id),
+                )
                 return await proposal_review_result(revised_summary)
-            if proposal_summary:
+            if decision.mode == "proposal_review_reprompt" and proposal_summary:
+                await self._emit_routing_decision(
+                    session_id=session_id,
+                    stage="discovery",
+                    route="proposal_review_reprompt",
+                    source="fallback",
+                    confidence="low",
+                    message=latest_user_message,
+                    signal_summary=self._existing_feature_signal_summary(session_id),
+                )
                 return await proposal_review_result(proposal_summary)
             fallback_summary = await self._build_existing_feature_enhancement_summary(
                 session_id,
@@ -526,15 +725,101 @@ class DiscoveryManager:
             return await proposal_review_result(fallback_summary)
 
         if bool(prior_insights.get("awaiting_enhancement_revision_input")):
-            if self._is_concrete_enhancement_request(latest_user_message):
+            requested_improvement = latest_user_message
+            model_choice: dict[str, Any] | None = None
+            if not self._is_concrete_enhancement_request(latest_user_message):
+                model_choice = await self._classify_existing_feature_choice(
+                    question_text="What should change in the proposal before drafting?",
+                    options={
+                        "A": "Proceed and draft from the current proposal.",
+                        "B": "Revise the proposal using the user's new requested changes.",
+                        "C": "Cancel; leave the existing implementation unchanged.",
+                        "D": "Other — ask for clearer direction",
+                    },
+                    latest_user_message=latest_user_message,
+                    feature_label=feature_label,
+                    session_id=session_id,
+                    model_override=model_override,
+                    extra_context=str(prior_insights.get("enhancement_proposal_summary", "")).strip(),
+                )
+                if model_choice and str(model_choice.get("rephrased_request", "")).strip():
+                    requested_improvement = str(model_choice.get("rephrased_request", "")).strip()
+            decision = await self._reasoner().decide(
+                ReasoningContext(
+                    signals=DiscoveryFollowupSignals(
+                        model_choice=str((model_choice or {}).get("choice", "")).strip() or None,
+                        model_confidence=str((model_choice or {}).get("confidence", "low")),
+                        rephrased_request=requested_improvement or None,
+                        concrete_enhancement_request=self._is_concrete_enhancement_request(requested_improvement),
+                        awaiting_revision_input=True,
+                        proposal_summary=str(prior_insights.get("enhancement_proposal_summary", "")).strip() or None,
+                    ),
+                    session_metadata={"scenario": "existing_feature_followup"},
+                )
+            )
+            if decision.mode == "revision_input_proceed":
+                prior_insights["awaiting_enhancement_revision_input"] = False
+                prior_insights["awaiting_enhancement_proposal_review"] = False
+                await self._emit_routing_decision(
+                    session_id=session_id,
+                    stage="discovery",
+                    route="revision_input_proceed",
+                    source=decision.routing_source,
+                    confidence="high" if decision.confidence >= 0.8 else "medium",
+                    message=latest_user_message,
+                    signal_summary=self._existing_feature_signal_summary(session_id),
+                )
+                return DiscoveryTurnResult(
+                    reply="Discovery complete — drafting enhancement plan now.",
+                    complete=True,
+                    summary=str(prior_insights.get("enhancement_proposal_summary", "")).strip()
+                    or await self._build_existing_feature_enhancement_summary(
+                        session_id,
+                        feature_label,
+                        requested_improvement=decision.rephrased_request or requested_improvement,
+                    ),
+                    questions=[],
+                )
+            if decision.mode == "revision_input_cancel":
+                prior_insights["awaiting_enhancement_revision_input"] = False
+                prior_insights["awaiting_enhancement_proposal_review"] = False
+                prior_insights["enhance_existing"] = False
+                await self._emit_routing_decision(
+                    session_id=session_id,
+                    stage="discovery",
+                    route="revision_input_cancel",
+                    source=decision.routing_source,
+                    confidence="high" if decision.confidence >= 0.8 else "medium",
+                    message=latest_user_message,
+                    signal_summary=self._existing_feature_signal_summary(session_id),
+                )
+                return DiscoveryTurnResult(
+                    reply=(
+                        f"Understood — we'll leave the existing {feature_label} unchanged. "
+                        "No planning draft will be generated."
+                    ),
+                    complete=False,
+                    summary=None,
+                    questions=[],
+                )
+            if decision.mode == "revision_input_update_proposal":
                 revised_summary = await self._build_existing_feature_enhancement_summary(
                     session_id,
                     feature_label,
-                    requested_improvement=latest_user_message,
+                    requested_improvement=decision.rephrased_request or requested_improvement,
                 )
                 prior_insights["enhancement_proposal_summary"] = revised_summary
                 prior_insights["awaiting_enhancement_revision_input"] = False
                 prior_insights["awaiting_enhancement_proposal_review"] = True
+                await self._emit_routing_decision(
+                    session_id=session_id,
+                    stage="discovery",
+                    route="revision_input_update_proposal",
+                    source=decision.routing_source,
+                    confidence="high" if decision.confidence >= 0.8 else "medium",
+                    message=latest_user_message,
+                    signal_summary=self._existing_feature_signal_summary(session_id),
+                )
                 return await proposal_review_result(revised_summary)
             return DiscoveryTurnResult(
                 reply="Share the specific changes you want in the proposal (scope, files, or constraints), and I will revise it.",
@@ -554,8 +839,45 @@ class DiscoveryManager:
                 ),
                 questions=[],
             )
-        choice = self._parse_existing_endpoint_followup_choice(latest_user_message)
-        if choice == "A":
+        heuristic_choice = self._parse_existing_endpoint_followup_choice(latest_user_message)
+        model_choice: dict[str, Any] | None = None
+        if heuristic_choice is None:
+            model_choice = await self._classify_existing_feature_choice(
+                question_text=f"What should we do with the existing {feature_label}?",
+                options={
+                    "A": "Review current behavior and summarize it only.",
+                    "B": "Propose targeted enhancements without creating a duplicate implementation.",
+                    "C": "Leave it unchanged; no planning needed.",
+                    "D": "Other — describe your preference",
+                },
+                latest_user_message=latest_user_message,
+                feature_label=feature_label,
+                session_id=session_id,
+                model_override=model_override,
+            )
+        decision = await self._reasoner().decide(
+            ReasoningContext(
+                signals=DiscoveryFollowupSignals(
+                    heuristic_choice=heuristic_choice,
+                    model_choice=str((model_choice or {}).get("choice", "")).strip() or None,
+                    model_confidence=str((model_choice or {}).get("confidence", "low")),
+                    rephrased_request=str((model_choice or {}).get("rephrased_request", "")).strip() or None,
+                    concrete_enhancement_request=self._is_concrete_enhancement_request(latest_user_message),
+                    enhance_existing=bool(prior_insights.get("enhance_existing")),
+                ),
+                session_metadata={"scenario": "existing_feature_followup"},
+            )
+        )
+        if decision.mode == "existing_feature_review_only":
+            await self._emit_routing_decision(
+                session_id=session_id,
+                stage="discovery",
+                route="existing_feature_review_current",
+                source=decision.routing_source,
+                confidence="high" if decision.confidence >= 0.8 else "medium",
+                message=latest_user_message,
+                signal_summary=self._existing_feature_signal_summary(session_id),
+            )
             evidence_lines = self._existing_feature_evidence_lines(session_id)
             evidence = "\n".join(f"- {line}" for line in evidence_lines)
             deep_summary, functional_summary = await self._build_existing_endpoint_deep_summary(session_id)
@@ -600,19 +922,37 @@ class DiscoveryManager:
                 summary=None,
                 questions=[],
             )
-        if choice == "B":
+        if decision.mode == "existing_feature_enhancement_proposal":
             prior_insights["enhance_existing"] = True
             proposal_summary = await self._build_existing_feature_enhancement_summary(
                 session_id,
                 feature_label,
-                requested_improvement=latest_user_message,
+                requested_improvement=decision.rephrased_request or latest_user_message,
             )
             prior_insights["enhancement_proposal_summary"] = proposal_summary
             prior_insights["awaiting_enhancement_proposal_review"] = True
             prior_insights["awaiting_enhancement_revision_input"] = False
+            await self._emit_routing_decision(
+                session_id=session_id,
+                stage="discovery",
+                route="existing_feature_enhancement_proposal",
+                source=decision.routing_source,
+                confidence="high" if decision.confidence >= 0.8 else "medium",
+                message=latest_user_message,
+                signal_summary=self._existing_feature_signal_summary(session_id),
+            )
             return await proposal_review_result(proposal_summary)
-        if choice == "C":
+        if decision.mode == "existing_feature_cancel":
             prior_insights["enhance_existing"] = False
+            await self._emit_routing_decision(
+                session_id=session_id,
+                stage="discovery",
+                route="existing_feature_leave_unchanged",
+                source=decision.routing_source,
+                confidence="high" if decision.confidence >= 0.8 else "medium",
+                message=latest_user_message,
+                signal_summary=self._existing_feature_signal_summary(session_id),
+            )
             return DiscoveryTurnResult(
                 reply=(
                     f"Understood — we'll leave the existing {feature_label} unchanged. "
@@ -633,10 +973,17 @@ class DiscoveryManager:
     ) -> DiscoveryTurnResult | None:
         if turn_count != 1:
             return None
+        signals = self._existing_feature_signals(session_id)
         insights = getattr(self, "bootstrap_insights_by_session", {}).get(session_id, {})
-        if not bool(insights.get("existing_feature")):
-            return None
         if self._extract_feature_intent(latest_user_message) is None:
+            return None
+        decision = await self._reasoner().decide(
+            ReasoningContext(
+                signals=signals,
+                session_metadata={"scenario": "first_turn_existing_feature"},
+            )
+        )
+        if decision.mode != "existing_feature_first_turn":
             return None
         insights["original_request"] = latest_user_message
         current_feature_label = str(insights.get("feature_label", "feature")).strip() or "feature"
@@ -708,6 +1055,7 @@ class DiscoveryManager:
                 latest_user_message=latest_user_message,
                 prior_insights=prior_insights,
                 feature_label=feature_label,
+                model_override=model_override,
             )
             if followup is not None:
                 return followup
@@ -745,17 +1093,45 @@ class DiscoveryManager:
             )
         finally:
             self._active_discovery_session_id = None
-        parsed = self._drop_redundant_framework_questions(
-            self._try_extract_completion(response),
-            inferred_framework,
+        parsed = self._try_extract_completion(response)
+        framework_decision = await self._reasoner().decide(
+            ReasoningContext(
+                signals=FrameworkSignals(
+                    candidates={inferred_framework: 1} if inferred_framework else {},
+                    inferred_framework=inferred_framework,
+                    evidence=[f"inferred_framework:{inferred_framework}"] if inferred_framework else [],
+                ),
+                session_metadata={"scenario": "question_filter"},
+            )
         )
+        if "framework_identification" in framework_decision.question_suppression:
+            parsed = self._drop_redundant_framework_questions(parsed, inferred_framework)
         existing_first_turn = await self._maybe_existing_feature_first_turn_result(
             turn_count=turn_count,
             latest_user_message=latest_user_message,
             session_id=session_id,
         )
         if existing_first_turn is not None:
+            await self._emit_routing_decision(
+                session_id=session_id,
+                stage="discovery",
+                route="existing_feature_first_turn_override",
+                source="heuristic",
+                confidence="high",
+                message=latest_user_message,
+                signal_summary=self._existing_feature_signal_summary(session_id),
+            )
             return existing_first_turn
+        if turn_count == 1 and bool(prior_insights.get("existing_feature")):
+            await self._emit_routing_decision(
+                session_id=session_id,
+                stage="discovery",
+                route="general_discovery_due_to_weak_existing_feature_signal",
+                source="heuristic",
+                confidence="medium",
+                message=latest_user_message,
+                signal_summary=self._existing_feature_signal_summary(session_id),
+            )
         if not parsed.complete and len(parsed.questions) == 0:
             # If discovery returns prose without questions, treat it as implicit
             # completion rather than paying extra LLM calls just to restate shape.

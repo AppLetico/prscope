@@ -8,10 +8,12 @@ import { Tooltip } from "./ui/Tooltip";
 import { IssuePanel } from "./IssuePanel";
 import { preprocessPlanMarkdown } from "../lib/markdown";
 import { planMarkdownComponents } from "../lib/markdownComponents";
-import type { IssueGraphNode, IssueGraphSnapshot, SessionStatus } from "../types";
+import { augmentPlanMarkdownWithDecisionGraph } from "../lib/decisionGraphRender";
+import type { DecisionGraph, IssueGraphNode, IssueGraphSnapshot, SessionStatus } from "../types";
 
 interface PlanPanelProps {
   content: string;
+  decisionGraph?: DecisionGraph | null;
   status?: SessionStatus;
   isProcessing?: boolean;
   canExport?: boolean;
@@ -28,6 +30,7 @@ interface PlanPanelProps {
 
 export function PlanPanel({
   content,
+  decisionGraph = null,
   status,
   isProcessing = false,
   canExport: _canExport,
@@ -128,6 +131,7 @@ export function PlanPanel({
   const reviewLabel = reviewItemsCount > 0 ? `${reviewItemsCount} review notes` : "Review notes";
   const planCharacterCount = content.trim().length;
   const planWordCount = content.trim() ? content.trim().split(/\s+/).length : 0;
+  const renderedContent = preprocessPlanMarkdown(augmentPlanMarkdownWithDecisionGraph(content, decisionGraph));
   const planSizeLabel =
     planCharacterCount >= 1000
       ? `${(planCharacterCount / 1000).toFixed(planCharacterCount >= 10000 ? 0 : 1)}k chars`
@@ -249,7 +253,7 @@ export function PlanPanel({
                 remarkPlugins={[remarkGfm]}
                 components={planMarkdownComponents}
               >
-                {preprocessPlanMarkdown(content)}
+                {renderedContent}
               </ReactMarkdown>
             </article>
           </div>

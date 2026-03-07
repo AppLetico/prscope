@@ -19,6 +19,13 @@ Technical documentation for architecture, design, runtime behavior, and quality 
 - [Memory, Context, and Manifesto](./memory-context-manifesto.md) — memory layers, context budgets
 - [Skills and Session Recall](./skills-and-recall.md) — skills and episodic recall
 
+### Current Runtime Shape
+
+- Signal extraction and evidence helpers live under `planning/runtime/discovery_support/*`.
+- Semantic policy lives under `planning/runtime/reasoning/*`.
+- Persisted plan artifacts now include `plan_json`, `decision_graph_json`, and `followups_json`.
+- The rendered markdown plan is a projection over persisted planning state, not the only durable representation.
+
 ## Notes
 
 - Architecture and layer rules live in the root `ARCHITECTURE.md`.

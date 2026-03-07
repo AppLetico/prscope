@@ -11,11 +11,25 @@ from ..authoring.models import PLAN_SECTION_ORDER, apply_section_updates, render
 from ..authoring.repair import extract_first_json_object, load_json_object
 from ..context import ClarificationGate
 from ..discovery import DiscoveryTurnResult
+from ..followups import (
+    apply_answer_to_graph,
+    decision_graph_from_json,
+    decision_graph_from_plan,
+    decision_graph_to_json,
+)
+from ..reasoning import (
+    IssueReferenceSignals,
+    OpenQuestionResolutionSignals,
+    ReasoningContext,
+    RefinementMessageSignals,
+    RefinementReasoner,
+)
 
 
 class RuntimeChatFlow:
     def __init__(self, runtime: Any):
         self._runtime = runtime
+        self._reasoner = RefinementReasoner()
 
     def clarification_gate(self, session_id: str) -> ClarificationGate:
         gate = self._runtime._clarification_gates.get(session_id)
@@ -44,225 +58,136 @@ class RuntimeChatFlow:
             gate.abort()
 
     @staticmethod
-    def _classify_refinement_message_intent(user_message: str) -> str:
-        """Return 'refine' for plan-change instructions, otherwise 'chat'."""
-        text = user_message.strip()
-        if not text:
-            return "chat"
-        normalized = " ".join(text.lower().split())
-
-        starts_like_question = bool(
-            re.match(
-                r"^(what|why|how|when|where|who|which|is|are|can|could|would|should|do|does|did)\b",
-                normalized,
-            )
-        )
-        has_question_mark = "?" in normalized
-        if starts_like_question and has_question_mark:
-            return "chat"
-
-        explicit_refine_patterns = [
-            r"\b(update|change|revise|modify|rewrite|adjust|fix|improve)\b.{0,40}\b(plan|draft|section|content)\b",
-            r"\b(add|remove|replace|include|exclude)\b.{0,60}\b(plan|draft|section|"
-            r"open questions?|architecture|requirements)\b",
-            r"\b(we|you)\s+should\b",
-            r"\bshould be\b",
-            r"\bmake sure\b",
-            r"\bdo not\b",
-            r"\bdon't\b",
-            r"\bplease\b.{0,40}\b(add|change|update|remove|replace|revise|modify|fix)\b",
-            r"\blet'?s\b.{0,40}\b(add|change|update|remove|replace|revise|modify|fix)\b",
-            r"^(yes|no)\b",
+    def _open_questions_from_graph(graph: Any) -> str:
+        unresolved = [
+            node.description.strip() for node in graph.unresolved_nodes() if str(node.description or "").strip()
         ]
-        if any(re.search(pattern, normalized) for pattern in explicit_refine_patterns):
-            return "refine"
+        if not unresolved:
+            return "- None."
+        return "\n".join(f"- {item}" for item in unresolved)
 
-        # Imperative-style statements are usually intended as plan edits.
-        if re.search(r"^(add|remove|replace|update|change|revise|modify|rewrite|fix|include|exclude)\b", normalized):
-            return "refine"
+    @staticmethod
+    def _classify_refinement_message_intent(user_message: str) -> str:
+        return RefinementReasoner.classify_message_intent(user_message)
 
-        return "chat"
+    @staticmethod
+    def _heuristic_refinement_route(user_message: str) -> tuple[str | None, str, bool]:
+        return RefinementReasoner.heuristic_route(user_message)
 
     @staticmethod
     def _is_small_refinement_request(user_message: str) -> bool:
-        normalized = " ".join(user_message.lower().split())
-        if not normalized:
-            return False
-        if len(normalized) > 280:
-            return False
-        broad_change_signals = [
-            "architecture",
-            "system design",
-            "refactor",
-            "migration",
-            "database",
-            "auth",
-            "authentication",
-            "authorization",
-            "security",
-            "new service",
-            "new module",
-            "across all endpoints",
-            "across the codebase",
-            "multiple files",
-            "end-to-end",
-            "rewrite the plan",
-            "overhaul",
-        ]
-        if any(signal in normalized for signal in broad_change_signals):
-            return False
-        small_change_signals = [
-            "you should",
-            "we should",
-            "should be",
-            "log",
-            "verify",
-            "validation",
-            "test strategy",
-            "test coverage",
-            "monitor",
-            "monitoring",
-            "observability",
-            "rollback",
-            "roll back",
-            "error handling",
-            "guardrail",
-            "guardrails",
-            "wording",
-            "clarify",
-            "open question",
-            "summary",
-            "non-goal",
-            "non goal",
-            "files changed",
-            "section",
-            "rename",
-            "typo",
-            "small change",
-        ]
-        return any(signal in normalized for signal in small_change_signals)
+        return RefinementReasoner.is_small_request(user_message)
+
+    @classmethod
+    def _extract_refinement_message_signals(
+        cls,
+        user_message: str,
+        *,
+        model_route: dict[str, str] | None = None,
+    ) -> RefinementMessageSignals:
+        return RefinementReasoner.extract_message_signals(user_message, model_route=model_route)
+
+    async def _emit_routing_decision(
+        self,
+        *,
+        event_callback: Any | None,
+        session_id: str,
+        route: str,
+        source: str,
+        confidence: str,
+        message: str,
+        evidence: list[str] | None = None,
+        decision_source: str | None = None,
+        reasoner_version: str | None = None,
+    ) -> None:
+        await self._runtime._emit_event(
+            event_callback,
+            {
+                "type": "routing_decision",
+                "session_stage": "refinement",
+                "route": route,
+                "source": source,
+                "confidence": confidence,
+                "message": message[:240],
+                "evidence": list(evidence or [])[:6],
+                "decision_source": decision_source,
+                "reasoner_version": reasoner_version,
+            },
+            session_id,
+        )
+
+    async def _classify_ambiguous_refinement_message(
+        self,
+        *,
+        session_id: str,
+        user_message: str,
+        current_plan_content: str,
+        recent_turns: list[Any],
+        author_model_override: str | None = None,
+    ) -> dict[str, str] | None:
+        prompt = self._reasoner.build_routing_prompt(current_plan_content, recent_turns, user_message)
+        try:
+            response, _ = await self._runtime.author._llm_call(  # noqa: SLF001
+                [
+                    {
+                        "role": "system",
+                        "content": "You classify refinement routing decisions. Return strict JSON only.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                allow_tools=False,
+                max_output_tokens=400,
+                model_override=author_model_override,
+            )
+        except Exception:
+            return None
+        raw = str(getattr(response.choices[0].message, "content", None) or "")
+        try:
+            json_text, _ = extract_first_json_object(raw)
+            payload = load_json_object(json_text)
+        except Exception:
+            return None
+        return self._reasoner.parse_routing_payload(payload)
 
     @staticmethod
     def _issue_match_tokens(text: str) -> set[str]:
-        stopwords = {
-            "please",
-            "update",
-            "plan",
-            "address",
-            "these",
-            "review",
-            "notes",
-            "note",
-            "start",
-            "here",
-            "with",
-            "without",
-            "should",
-            "would",
-            "could",
-            "need",
-            "needed",
-            "include",
-            "adjust",
-            "approach",
-            "task",
-            "tasks",
-            "success",
-            "where",
-            "when",
-            "into",
-            "from",
-        }
-        tokens: set[str] = set()
-        for raw in re.findall(r"[a-z0-9_]+", text.lower()):
-            token = raw
-            if token.startswith("issue_"):
-                tokens.add(token)
-                continue
-            if token.endswith("ies") and len(token) > 4:
-                token = f"{token[:-3]}y"
-            elif token.endswith("es") and len(token) > 4:
-                token = token[:-2]
-            elif token.endswith("s") and len(token) > 4:
-                token = token[:-1]
-            if len(token) < 4 or token in stopwords:
-                continue
-            tokens.add(token)
-        return tokens
+        return RefinementReasoner.issue_match_tokens(text)
 
     def _resolve_targeted_lightweight_issue(
         self, *, user_message: str, round_number: int, tracker: Any | None
     ) -> str | None:
         if tracker is None or not hasattr(tracker, "open_issues") or not hasattr(tracker, "resolve_issue"):
             return None
-        open_issues = list(tracker.open_issues())
+        open_issues = [
+            {"id": str(issue.id or "").strip(), "description": str(issue.description or "").strip()}
+            for issue in list(tracker.open_issues())
+        ]
         if not open_issues:
             return None
-
-        normalized_message = " ".join(user_message.lower().split())
-        explicit_matches = [issue.id for issue in open_issues if issue.id and issue.id.lower() in normalized_message]
-        if len(explicit_matches) == 1:
-            tracker.resolve_issue(
-                explicit_matches[0],
-                round_number,
-                propagate_causes=False,
-                resolution_source="lightweight",
+        decision = self._reasoner.resolve_issue_references(
+            ReasoningContext(
+                signals=IssueReferenceSignals(user_message=user_message, issues=open_issues),
+                session_metadata={"scenario": "issue_resolution"},
             )
-            return explicit_matches[0]
-
-        exact_description_matches = [
-            issue.id
-            for issue in open_issues
-            if issue.description and " ".join(issue.description.lower().split()) in normalized_message
-        ]
-        if len(exact_description_matches) == 1:
-            tracker.resolve_issue(
-                exact_description_matches[0],
-                round_number,
-                propagate_causes=False,
-                resolution_source="lightweight",
-            )
-            return exact_description_matches[0]
-
-        message_tokens = self._issue_match_tokens(user_message)
-        if not message_tokens:
+        )
+        resolved_ids = list(decision.issue_resolution)
+        if len(resolved_ids) != 1:
             return None
-
-        scored: list[tuple[float, str]] = []
-        for issue in open_issues:
-            issue_tokens = self._issue_match_tokens(issue.description)
-            if not issue_tokens:
-                continue
-            overlap = len(issue_tokens & message_tokens) / len(issue_tokens)
-            if overlap > 0:
-                scored.append((overlap, issue.id))
-        if not scored:
-            return None
-
-        scored.sort(key=lambda item: item[0], reverse=True)
-        best_score, best_issue_id = scored[0]
-        second_score = scored[1][0] if len(scored) > 1 else 0.0
-        if best_score >= 0.45 and (len(scored) == 1 or (best_score - second_score) >= 0.15):
-            tracker.resolve_issue(
-                best_issue_id,
-                round_number,
-                propagate_causes=False,
-                resolution_source="lightweight",
-            )
-            return best_issue_id
-        return None
+        tracker.resolve_issue(
+            resolved_ids[0],
+            round_number,
+            propagate_causes=False,
+            resolution_source="lightweight",
+        )
+        return resolved_ids[0]
 
     @staticmethod
     def _looks_like_open_question_answer(user_message: str) -> bool:
-        normalized = " ".join(user_message.lower().split())
-        if not normalized:
-            return False
-        if "?" in normalized:
-            return False
-        answer_like_starts = ("yes", "no", "it should", "we should", "should be", "prefer", "i prefer")
-        if normalized.startswith(answer_like_starts):
-            return True
-        return any(token in normalized for token in ["should", "must", "prefer", "we'll", "we will"])
+        return RefinementReasoner.looks_like_open_question_answer(user_message)
+
+    @staticmethod
+    def _looks_like_open_question_reopen(user_message: str) -> bool:
+        return RefinementReasoner.looks_like_open_question_reopen(user_message)
 
     @staticmethod
     def _open_question_lines(raw: str) -> list[str]:
@@ -285,22 +210,23 @@ class RuntimeChatFlow:
         current_open_questions: str,
         proposed_open_questions: str | None,
     ) -> str | None:
-        """Avoid over-clearing open questions for single-answer messages."""
         if proposed_open_questions is None:
             return None
         current_items = self._open_question_lines(current_open_questions)
-        if len(current_items) <= 1:
+        if len(current_items) <= 1 or self._message_explicitly_resolves_all_questions(user_message):
             return proposed_open_questions
-        if self._message_explicitly_resolves_all_questions(user_message):
-            return proposed_open_questions
-
         proposed_items = self._open_question_lines(proposed_open_questions)
-        proposed_is_none = not proposed_items or proposed_open_questions.strip().lower() in {"none", "- none.", "none."}
-        removed_too_many = proposed_is_none or len(proposed_items) < (len(current_items) - 1)
-        if removed_too_many and self._looks_like_open_question_answer(user_message):
-            # Conservatively resolve only the first outstanding item unless user said all.
-            return "\n".join(current_items[1:])
-        return proposed_open_questions
+        decision = self._reasoner.resolve_open_questions(
+            ReasoningContext(
+                signals=OpenQuestionResolutionSignals(
+                    user_message=user_message,
+                    current_items=current_items,
+                    proposed_items=proposed_items,
+                ),
+                session_metadata={"scenario": "open_question_resolution"},
+            )
+        )
+        return decision.resulting_open_questions or proposed_open_questions
 
     async def _apply_lightweight_plan_edit(
         self,
@@ -359,12 +285,19 @@ class RuntimeChatFlow:
                 getattr(current_plan, "plan_json", None),
             )
             answering_open_question = self._looks_like_open_question_answer(user_message)
+            reopening_open_question = self._looks_like_open_question_reopen(user_message)
             open_question_guidance = (
                 "If the user message answers one or more items in open_questions, "
                 "you MUST update `open_questions` to remove resolved questions "
                 "(or replace with `- None.` when fully resolved), "
                 "and reflect the decision in the relevant section(s)."
                 if answering_open_question
+                else (
+                    "If the user is reopening or deferring a prior decision, update "
+                    "`open_questions` to add or restore the unresolved question and "
+                    "reflect the uncertainty in the relevant sections."
+                )
+                if reopening_open_question
                 else "If the request affects open_questions, keep that section consistent with the new decisions."
             )
             prompt = (
@@ -505,6 +438,196 @@ class RuntimeChatFlow:
             )
             await self._runtime._emit_event(event_callback, final_sync, session_id)
             self._runtime._persist_state_snapshot(session_id)  # noqa: SLF001
+
+    async def apply_followup_answer(
+        self,
+        *,
+        session_id: str,
+        followup_id: str,
+        followup_answer: str,
+        target_sections: list[str] | None = None,
+        author_model_override: str | None = None,
+        event_callback: Any | None = None,
+    ) -> tuple[str, str | None]:
+        async with self._runtime._session_lock(session_id):
+            core = self._runtime._core(session_id)
+            self._runtime.tools.set_session(session_id)
+            session = core.get_session()
+            if session.status not in {"refining", "converged"}:
+                raise ValueError(f"Session is not in chat-refinement state: {session.status}")
+            core.validate_command("followup_answer", session)
+            if session.status == "converged":
+                snapshot = core.transition_and_snapshot("refining", phase_message=None)
+                await self._runtime._emit_event(event_callback, snapshot, session_id)
+                session = core.get_session()
+
+            current_plan = core.get_current_plan()
+            if current_plan is None:
+                raise ValueError("Cannot answer follow-up before an initial draft exists")
+
+            round_number = session.current_round + 1
+            state = self._runtime._state(session_id, session)
+            selected_author_model = self._runtime._resolve_author_model(session, author_model_override)
+            started = time.perf_counter()
+            processing = core.transition_and_snapshot(
+                "refining",
+                phase_message="Applying follow-up decision",
+                allow_round_stability=True,
+            )
+            await self._runtime._emit_event(event_callback, processing, session_id)
+            await self._runtime._emit_event(
+                event_callback,
+                {
+                    "type": "tool_update",
+                    "tool": {
+                        "name": "apply_followup_answer",
+                        "status": "running",
+                        "session_stage": "author",
+                        "query": f"{followup_id} -> {followup_answer}"[:180],
+                    },
+                },
+                session_id,
+            )
+
+            current_plan_doc = self._runtime._plan_document_from_version(
+                current_plan.plan_content,
+                getattr(current_plan, "plan_json", None),
+            )
+            current_graph = decision_graph_from_json(getattr(current_plan, "decision_graph_json", None))
+            if not current_graph.nodes:
+                current_graph = decision_graph_from_plan(
+                    open_questions=current_plan_doc.open_questions,
+                    plan_content=current_plan.plan_content,
+                )
+            updated_graph = apply_answer_to_graph(current_graph, followup_id, followup_answer)
+            answered_node = updated_graph.nodes.get(followup_id)
+            effective_sections = [
+                section
+                for section in (target_sections or [str(getattr(answered_node, "section", "") or "architecture")])
+                if section in (*PLAN_SECTION_ORDER, "open_questions")
+            ]
+            if not effective_sections:
+                effective_sections = ["architecture"]
+
+            prompt = (
+                "Apply a resolved follow-up decision to the current plan.\n"
+                "The decision graph is already updated. Regenerate only the sections needed so the prose matches.\n"
+                "Keep structure stable and return strict JSON only with fields:\n"
+                "- problem_understanding: str\n"
+                "- updates: object {section_id: new_content}\n"
+                "- assistant_reply: str\n"
+                f"Allowed section_id values: {', '.join(PLAN_SECTION_ORDER)}.\n"
+                "At minimum, update the target sections listed by the user. Do not touch unrelated sections."
+            )
+            graph_payload = decision_graph_to_json(updated_graph)
+            response, _ = await self._runtime.author._llm_call(  # noqa: SLF001
+                [
+                    {"role": "system", "content": prompt},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"## Follow-up answer\n{followup_id}: {followup_answer}\n\n"
+                            f"## Target sections\n{json.dumps(effective_sections)}\n\n"
+                            f"## Updated decision graph JSON\n{graph_payload}\n\n"
+                            f"## Current plan JSON\n{json.dumps(current_plan_doc.__dict__, indent=2)}"
+                        ),
+                    },
+                ],
+                allow_tools=False,
+                max_output_tokens=1400,
+                model_override=selected_author_model,
+            )
+            raw = str(getattr(response.choices[0].message, "content", None) or "")
+            json_text, _ = extract_first_json_object(raw)
+            payload = load_json_object(json_text)
+            updates_raw = payload.get("updates", {})
+            if not isinstance(updates_raw, dict):
+                raise ValueError("Follow-up answer output did not provide updates object")
+            updates: dict[str, str] = {}
+            for key, value in updates_raw.items():
+                key_str = str(key).strip()
+                if key_str in PLAN_SECTION_ORDER:
+                    updates[key_str] = str(value)
+            updates["open_questions"] = self._open_questions_from_graph(updated_graph)
+
+            updated_plan = apply_section_updates(current_plan_doc, updates)
+            changed_sections = sorted(
+                section
+                for section in updates
+                if str(getattr(current_plan_doc, section, "")) != str(getattr(updated_plan, section, ""))
+            )
+            if not changed_sections:
+                raise ValueError("Follow-up answer produced no material section changes")
+
+            updated_markdown = render_markdown(updated_plan)
+            core.add_turn("user", f"Follow-up answer: {followup_id} -> {followup_answer}", round_number=round_number)
+            version = core.save_plan_version(
+                updated_markdown,
+                round_number=round_number,
+                plan_document=updated_plan,
+                changed_sections=changed_sections,
+            )
+            self._runtime._attach_plan_version_artifacts(
+                version_id=version.id,
+                plan_document=updated_plan,
+                plan_content=updated_markdown,
+                previous_graph_json=graph_payload,
+            )
+            state.revision_round = round_number
+            state.plan_markdown = updated_markdown
+            architecture_changed = any(section in {"architecture", "files_changed"} for section in changed_sections)
+            state.architecture_change_count = int(state.architecture_change_count) + int(architecture_changed)
+            state.architecture_change_rounds.append(architecture_changed)
+            if len(state.architecture_change_rounds) > 8:
+                state.architecture_change_rounds = state.architecture_change_rounds[-8:]
+            reply = str(payload.get("assistant_reply", "")).strip() or (
+                f"Applied follow-up answer and refreshed: {', '.join(changed_sections)}."
+            )
+            core.add_turn("author", reply, round_number=round_number)
+
+            await self._runtime._emit_event(
+                event_callback,
+                {
+                    "type": "tool_update",
+                    "tool": {
+                        "name": "apply_followup_answer",
+                        "status": "done",
+                        "session_stage": "author",
+                        "duration_ms": round((time.perf_counter() - started) * 1000),
+                        "query": f"Updated: {', '.join(changed_sections)}",
+                    },
+                },
+                session_id,
+            )
+            finalized = core.transition_and_snapshot(
+                "refining",
+                phase_message=None,
+                current_round=round_number,
+            )
+            await self._runtime._emit_event(event_callback, finalized, session_id)
+            self._runtime._persist_state_snapshot(session_id)  # noqa: SLF001
+            await self._runtime._emit_event(
+                event_callback,
+                {
+                    "type": "plan_ready",
+                    "round": round_number,
+                    "saved_at_unix_s": time.time(),
+                },
+                session_id,
+            )
+            await self._runtime._emit_event(
+                event_callback,
+                {"type": "complete", "message": "Follow-up decision applied"},
+                session_id,
+            )
+            final_sync = core.transition_and_snapshot(
+                "refining",
+                phase_message=None,
+                allow_round_stability=True,
+            )
+            await self._runtime._emit_event(event_callback, final_sync, session_id)
+            self._runtime._persist_state_snapshot(session_id)  # noqa: SLF001
+            return ("decision_refine", reply)
 
     async def handle_discovery_turn(
         self,
@@ -744,25 +867,62 @@ class RuntimeChatFlow:
         event_callback: Any | None = None,
     ) -> tuple[str, str | None]:
         """Route refinement chat to either conversational reply or plan update round."""
-        intent = self._classify_refinement_message_intent(user_message)
-        if intent == "refine":
-            if self._is_small_refinement_request(user_message):
-                try:
-                    await self._apply_lightweight_plan_edit(
-                        session_id=session_id,
-                        user_message=user_message,
-                        author_model_override=author_model_override,
-                        event_callback=event_callback,
-                    )
-                except Exception:
-                    await self._runtime.run_adversarial_round(
-                        session_id=session_id,
-                        user_input=user_message,
-                        author_model_override=author_model_override,
-                        critic_model_override=critic_model_override,
-                        event_callback=event_callback,
-                    )
-            else:
+        core = self._runtime._core(session_id)
+        current_plan = core.get_current_plan()
+        recent_turns = core.get_conversation()[-8:]
+        model_route: dict[str, str] | None = None
+        base_signals = self._extract_refinement_message_signals(user_message)
+        if base_signals.heuristic_route is None and current_plan is not None:
+            model_route = await self._classify_ambiguous_refinement_message(
+                session_id=session_id,
+                user_message=user_message,
+                current_plan_content=current_plan.plan_content,
+                recent_turns=recent_turns,
+                author_model_override=author_model_override,
+            )
+        decision = await self._reasoner.decide(
+            ReasoningContext(
+                signals=self._extract_refinement_message_signals(user_message, model_route=model_route),
+                plan_state=current_plan,
+                session_metadata={"scenario": "route_message"},
+            )
+        )
+        chosen_route = decision.route
+        chosen_confidence = "high" if decision.confidence >= 0.8 else "medium" if decision.confidence >= 0.55 else "low"
+        routing_source = "model" if any(item.startswith("model_route:") for item in decision.evidence) else (
+            "heuristic" if base_signals.heuristic_route else "fallback"
+        )
+        if chosen_route == "lightweight_refine":
+            await self._emit_routing_decision(
+                event_callback=event_callback,
+                session_id=session_id,
+                route="lightweight_refine",
+                source=routing_source,
+                confidence=chosen_confidence,
+                message=user_message,
+                evidence=decision.evidence,
+                decision_source=decision.decision_source,
+                reasoner_version=decision.reasoner_version,
+            )
+            try:
+                await self._apply_lightweight_plan_edit(
+                    session_id=session_id,
+                    user_message=user_message,
+                    author_model_override=author_model_override,
+                    event_callback=event_callback,
+                )
+            except Exception:
+                await self._emit_routing_decision(
+                    event_callback=event_callback,
+                    session_id=session_id,
+                    route="full_refine_after_lightweight_failure",
+                    source="fallback",
+                    confidence="medium",
+                    message=user_message,
+                    evidence=decision.evidence,
+                    decision_source=decision.decision_source,
+                    reasoner_version=decision.reasoner_version,
+                )
                 await self._runtime.run_adversarial_round(
                     session_id=session_id,
                     user_input=user_message,
@@ -771,6 +931,37 @@ class RuntimeChatFlow:
                     event_callback=event_callback,
                 )
             return ("refine_round", None)
+        if chosen_route == "full_refine":
+            await self._emit_routing_decision(
+                event_callback=event_callback,
+                session_id=session_id,
+                route="full_refine",
+                source=routing_source,
+                confidence=chosen_confidence,
+                message=user_message,
+                evidence=decision.evidence,
+                decision_source=decision.decision_source,
+                reasoner_version=decision.reasoner_version,
+            )
+            await self._runtime.run_adversarial_round(
+                session_id=session_id,
+                user_input=user_message,
+                author_model_override=author_model_override,
+                critic_model_override=critic_model_override,
+                event_callback=event_callback,
+            )
+            return ("refine_round", None)
+        await self._emit_routing_decision(
+            event_callback=event_callback,
+            session_id=session_id,
+            route="author_chat",
+            source=routing_source,
+            confidence=chosen_confidence,
+            message=user_message,
+            evidence=decision.evidence,
+            decision_source=decision.decision_source,
+            reasoner_version=decision.reasoner_version,
+        )
         reply = await self.chat_with_author(
             session_id=session_id,
             user_message=user_message,

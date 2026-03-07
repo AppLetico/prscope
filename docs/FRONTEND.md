@@ -50,6 +50,7 @@ src/
     ├── api.ts                 ← HTTP client (fetch wrappers for all endpoints)
     ├── markdown.ts            ← markdown rendering utilities
     ├── markdownComponents.tsx ← custom markdown component overrides
+    ├── decisionGraphRender.ts ← graph-backed plan augmentation helpers
     └── planTitle.ts           ← plan title extraction/cleaning
 ```
 
@@ -123,6 +124,13 @@ The frontend handles `409` responses gracefully — they indicate the session is
 - `depends_on` and duplicate aliases are rendered as annotations, not as tree edges.
 - When `issue_graph` is absent, UI falls back to legacy flat issue counters from `open_issues`.
 - Round tables remain backward-compatible (`major_issues`, `minor_issues`) with optional graph summaries.
+
+### Decision Graph Rendering
+
+- `PlanPanel` receives `current_plan.decision_graph` from the backend and augments markdown before rendering.
+- `decisionGraphRender.ts` injects graph-backed architecture decisions and unresolved questions that may not yet be reflected in prose.
+- Follow-up prompts rendered in `ChatPanel` come from persisted follow-up artifacts derived from the same decision graph.
+- The frontend never infers or mutates decision state locally; graph state is server-authoritative just like session state.
 
 ### Styling
 

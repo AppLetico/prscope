@@ -5,6 +5,7 @@ import re
 from collections.abc import Awaitable
 from typing import Any, Callable
 
+from ..reasoning import ExistingFeatureSignals
 from .models import Evidence, FeatureIntent
 from .signals import INTENT_STOP_WORDS, is_trustworthy_existing_feature_path
 
@@ -69,7 +70,11 @@ def functional_summary_from_snippet(snippet: str) -> str | None:
     return None
 
 
-def normalize_requested_improvement(requested_improvement: str | None) -> str | None:
+def normalize_requested_improvement(
+    requested_improvement: str | None,
+    *,
+    drop_creation_style: bool = False,
+) -> str | None:
     raw = str(requested_improvement or "").strip()
     if not raw:
         return None
@@ -85,7 +90,7 @@ def normalize_requested_improvement(requested_improvement: str | None) -> str | 
     if re.match(r"^\d+\.\s*", normalized):
         normalized = re.sub(r"^\d+\.\s*", "", normalized)
         raw = re.sub(r"^\d+\.\s*", "", raw).strip()
-    if re.match(r"^(create|add|build|implement|make|introduce|set up|setup)\b", normalized):
+    if drop_creation_style and re.match(r"^(create|add|build|implement|make|introduce|set up|setup)\b", normalized):
         return None
     return raw
 
@@ -93,13 +98,20 @@ def normalize_requested_improvement(requested_improvement: str | None) -> str | 
 def suggest_enhancement_directions(
     *,
     feature_label: str,
+    requested_improvement: str | None,
     original_request: str | None,
     functional_summary: str | None,
     deep_summary: str | None,
 ) -> list[str]:
     combined = " ".join(
         part.strip().lower()
-        for part in (feature_label, original_request or "", functional_summary or "", deep_summary or "")
+        for part in (
+            feature_label,
+            requested_improvement or "",
+            original_request or "",
+            functional_summary or "",
+            deep_summary or "",
+        )
         if str(part).strip()
     )
     directions = [
@@ -225,6 +237,29 @@ def merge_feature_evidence(
     insights["feature_patterns"] = list(feature.patterns)
 
 
+def build_existing_feature_signals(
+    insights: dict[str, Any],
+    route_file_score: Callable[[str], int],
+    evidence_lines: list[str],
+) -> ExistingFeatureSignals:
+    matched_paths = [str(path).strip() for path in insights.get("matched_paths", []) if str(path).strip()]
+    runtime_paths = [path for path in matched_paths if route_file_score(path) > 0]
+    top_route_score = max((route_file_score(path) for path in runtime_paths), default=0)
+    return ExistingFeatureSignals(
+        feature_label=str(insights.get("feature_label", "feature")).strip() or "feature",
+        evidence_count=len(evidence_lines),
+        runtime_path_count=len(runtime_paths),
+        top_route_score=top_route_score,
+        strong_existing_feature=bool(evidence_lines and runtime_paths and top_route_score > 0),
+        matched_paths=matched_paths,
+        evidence_lines=list(evidence_lines),
+        inferred_framework=str(insights.get("inferred_framework", "")).strip() or None,
+        architecture=str(insights.get("architecture", "")).strip() or None,
+        signal_scores=dict(insights.get("signal_scores", {}) or {}),
+        existing_feature=bool(insights.get("existing_feature")),
+    )
+
+
 async def build_existing_endpoint_deep_summary(
     *,
     evidence_lines: list[str],
@@ -292,9 +327,10 @@ async def build_existing_feature_enhancement_summary(
     )
     deep_summary, functional_summary = await deep_summary_loader()
     specific_improvement = normalize_requested_improvement(requested_improvement)
-    original_intent = normalize_requested_improvement(original_request)
+    original_intent = normalize_requested_improvement(original_request, drop_creation_style=True)
     directions = suggest_enhancement_directions(
         feature_label=feature_label,
+        requested_improvement=specific_improvement,
         original_request=original_request,
         functional_summary=functional_summary,
         deep_summary=deep_summary,

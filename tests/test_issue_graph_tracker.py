@@ -1,9 +1,15 @@
 from __future__ import annotations
 
-from prscope.config import IssueDedupeConfig, IssueGraphConfig
+import pytest
+
+from prscope.config import IssueDedupeConfig, IssueGraphConfig, PlanningConfig, PrscopeConfig, RepoProfile
+from prscope.planning.runtime.authoring.models import PlanDocument, render_markdown
 from prscope.planning.runtime.critic import ReviewResult
+from prscope.planning.runtime.orchestration import PlanningRuntime
+from prscope.planning.runtime.pipeline.round_context import PlanningRoundContext
 from prscope.planning.runtime.pipeline.stages import review_issue_severity
 from prscope.planning.runtime.review import IssueCausalityExtractor, IssueGraphTracker, IssueSimilarityService
+from prscope.store import Store
 
 
 def _tracker() -> IssueGraphTracker:
@@ -159,3 +165,113 @@ def test_review_issue_severity_demotes_architectural_and_implementability_items(
     assert review_issue_severity("architectural_concern") == "minor"
     assert review_issue_severity("validation_architectural_concern") == "minor"
     assert review_issue_severity("implementability_detail") == "minor"
+
+
+def test_issue_graph_snapshot_persists_related_decision_ids():
+    tracker = _tracker()
+    issue = tracker.add_issue("Database choice remains underspecified.", 1, preferred_id="issue_1")
+
+    tracker.link_issue_to_decisions(issue.id, ["architecture.database"], relation="missing")
+
+    snapshot = tracker.graph_snapshot()
+    assert snapshot["nodes"][0]["related_decision_ids"] == ["architecture.database"]
+    assert "decision:missing" in snapshot["nodes"][0]["tags"]
+
+    restored = _tracker()
+    restored.load_snapshot(snapshot)
+    restored_snapshot = restored.graph_snapshot()
+    assert restored_snapshot["nodes"][0]["related_decision_ids"] == ["architecture.database"]
+    assert "decision:missing" in restored_snapshot["nodes"][0]["tags"]
+
+
+@pytest.mark.asyncio
+async def test_design_review_links_issues_to_related_decisions(tmp_path):
+    store = Store(tmp_path / "test.db")
+    config = PrscopeConfig(
+        local_repo=str(tmp_path),
+        planning=PlanningConfig(author_model="gpt-4o-mini", critic_model="gpt-4o-mini"),
+    )
+    repo = RepoProfile(name="repo", path=str(tmp_path))
+    runtime = PlanningRuntime(store=store, config=config, repo=repo)
+
+    session = store.create_planning_session(
+        repo_name=repo.name,
+        title="decision-links",
+        requirements="r",
+        seed_type="chat",
+        status="refining",
+    )
+    plan = PlanDocument(
+        title="Plan",
+        summary="Add persistence.",
+        goals="Support durable state.",
+        non_goals="Do not change the external API.",
+        files_changed="`src/app.py` - wire persistence.",
+        architecture="Keep the storage layer abstract until the database decision is confirmed.",
+        implementation_steps="1. Add the storage abstraction.",
+        test_strategy="Add integration tests for persistence.",
+        rollback_plan="Revert the storage integration if rollout fails.",
+        open_questions="- Which database should store the primary application data?",
+    )
+    version = runtime._core(session.id).save_plan_version(
+        render_markdown(plan),
+        round_number=1,
+        plan_document=plan,
+    )
+    runtime._attach_plan_version_artifacts(
+        version_id=version.id,
+        plan_document=plan,
+        plan_content=version.plan_content,
+    )
+    state = runtime._state(session.id)
+    ctx = PlanningRoundContext(
+        core=runtime._core(session.id),
+        session_id=session.id,
+        round_number=1,
+        requirements="r",
+        state=state,
+        issue_tracker=state.issue_tracker,
+        selected_author_model="gpt-4o-mini",
+        selected_critic_model="gpt-4o-mini",
+        event_callback=None,
+    )
+
+    async def fake_run_design_review(**kwargs):  # type: ignore[no-untyped-def]
+        del kwargs
+        return ReviewResult(
+            strengths=[],
+            architectural_concerns=["Database choice remains underspecified for persistence rollout."],
+            risks=[],
+            simplification_opportunities=[],
+            blocking_issues=[],
+            reviewer_questions=[],
+            recommended_changes=[],
+            design_quality_score=6.0,
+            confidence="medium",
+            review_complete=False,
+            simplest_possible_design=None,
+            primary_issue="Database choice remains underspecified for persistence rollout.",
+            resolved_issues=[],
+            constraint_violations=[],
+            issue_priority=[],
+            prose="Database choice remains underspecified for persistence rollout.",
+            parse_error=None,
+        )
+
+    runtime.critic.run_design_review = fake_run_design_review  # type: ignore[method-assign]
+
+    async def emit_tool(*args, **kwargs):  # type: ignore[no-untyped-def]
+        del args, kwargs
+
+    await runtime._stages.design_review(  # noqa: SLF001
+        ctx=ctx,
+        current_plan_content=version.plan_content,
+        emit_tool=emit_tool,
+    )
+
+    linked_nodes = {
+        node["id"]: node for node in ctx.issue_tracker.graph_snapshot()["nodes"] if node.get("related_decision_ids")
+    }
+    assert linked_nodes
+    assert any(node["related_decision_ids"] == ["architecture.database"] for node in linked_nodes.values())
+    assert any("decision:missing" in node.get("tags", []) for node in linked_nodes.values())

@@ -1,6 +1,7 @@
 from .decision_graph import (
     DEFAULT_DECISION_CATALOG,
     DecisionCatalogEntry,
+    DecisionEdge,
     DecisionGraph,
     DecisionNode,
     FollowupQuestionArtifact,
@@ -9,16 +10,19 @@ from .decision_graph import (
     apply_answer_to_graph,
     decision_graph_from_json,
     decision_graph_from_open_questions,
+    decision_graph_from_plan,
     decision_graph_to_json,
     followups_from_json,
     followups_to_json,
     graph_to_followup_questions,
+    merge_decision_graphs,
 )
 from .engine import FollowupEngine
 
 __all__ = [
     "DEFAULT_DECISION_CATALOG",
     "DecisionCatalogEntry",
+    "DecisionEdge",
     "DecisionGraph",
     "DecisionNode",
     "FollowupEngine",
@@ -28,8 +32,10 @@ __all__ = [
     "apply_answer_to_graph",
     "decision_graph_from_json",
     "decision_graph_from_open_questions",
+    "decision_graph_from_plan",
     "decision_graph_to_json",
     "followups_from_json",
     "followups_to_json",
     "graph_to_followup_questions",
+    "merge_decision_graphs",
 ]

@@ -43,6 +43,7 @@ class IssueNode:
     source: IssueSource = "critic"
     embedding: list[float] | None = None
     tags: set[str] = field(default_factory=set)
+    related_decision_ids: set[str] = field(default_factory=set)
 
 
 @dataclass(frozen=True)
@@ -218,6 +219,24 @@ class IssueGraphTracker:
                 ):
                     queue.append(child_id)
 
+    def link_issue_to_decisions(
+        self,
+        issue_id: str,
+        decision_ids: list[str],
+        *,
+        relation: str | None = None,
+    ) -> None:
+        canonical_issue_id = self.canonical_issue_id(issue_id)
+        node = self._graph.nodes.get(canonical_issue_id)
+        if node is None:
+            return
+        for decision_id in decision_ids:
+            normalized = str(decision_id).strip()
+            if normalized:
+                node.related_decision_ids.add(normalized)
+        if relation:
+            node.tags.add(f"decision:{relation}")
+
     def open_nodes(self) -> list[IssueNode]:
         return [node for node in self._graph.nodes.values() if node.status == "open"]
 
@@ -308,6 +327,7 @@ class IssueGraphTracker:
                 "source": node.source,
                 "embedding": node.embedding,
                 "tags": sorted(node.tags),
+                "related_decision_ids": sorted(node.related_decision_ids),
             }
             for node in self._sorted_nodes(self._graph.nodes.values())
         ]
@@ -378,6 +398,9 @@ class IssueGraphTracker:
                 source=source,
                 embedding=raw.get("embedding") if isinstance(raw.get("embedding"), list) else None,
                 tags={str(tag) for tag in raw.get("tags", []) if str(tag).strip()},
+                related_decision_ids={
+                    str(decision_id) for decision_id in raw.get("related_decision_ids", []) if str(decision_id).strip()
+                },
             )
         for alias, canonical in duplicate_alias.items():
             alias_id = str(alias).strip()

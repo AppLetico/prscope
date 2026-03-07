@@ -17,12 +17,14 @@ If you remember one thing: the database session row is canonical state, and ever
 - `session_state` SSE snapshots (real-time projection updates)
 
 Turns and tool traces are audit artifacts, not control state.
+Plan markdown is a rendered artifact. Long-lived planning state also includes persisted plan-version artifacts such as `decision_graph_json` and `followups_json`.
 
 Why this matters:
 
 - reloads are deterministic
 - retries are safe
 - UI behavior is not dependent on parsing assistant text
+- plan refinement can preserve decisions/issues across rewrites because graph artifacts survive markdown changes
 
 ## Protected Session Fields
 
@@ -205,6 +207,20 @@ This supports reconnect correctness and multi-tab consistency.
 - Groups are persisted before the `session_state` snapshot is emitted (no race condition)
 - Truncated to most recent 50 groups
 - The frontend merges turns and groups by `sequence` into a single chronological timeline
+
+## Planning Artifacts
+
+Each saved plan version may carry structured artifacts in addition to markdown:
+
+- `plan_json` — structured section payload used for deterministic edits/rendering
+- `decision_graph_json` — decision-state graph with stable node identity, evidence, and dependency edges
+- `followups_json` — unresolved decision follow-up questions + suggestions derived from the decision graph
+
+Design intent:
+
+- session row remains canonical for live UI state and command handling
+- plan-version artifacts remain canonical for draft content, decision state, and follow-up continuity
+- markdown is a human-readable projection, not the only durable planning representation
 
 ## Issue Graph and Dedupe Configuration
 

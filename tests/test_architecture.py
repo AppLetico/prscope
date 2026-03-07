@@ -65,6 +65,13 @@ INTELLIGENCE = {
     "planning.runtime.discovery_support.existing_feature",
     "planning.runtime.discovery_support.bootstrap",
     "planning.runtime.discovery_support.llm",
+    "planning.runtime.reasoning",
+    "planning.runtime.reasoning.base",
+    "planning.runtime.reasoning.models",
+    "planning.runtime.reasoning.discovery_reasoner",
+    "planning.runtime.reasoning.refinement_reasoner",
+    "planning.runtime.reasoning.review_reasoner",
+    "planning.runtime.reasoning.convergence_reasoner",
     "planning.runtime.orchestration_support",
     "planning.runtime.orchestration_support.event_router",
     "planning.runtime.orchestration_support.state_snapshots",
@@ -117,6 +124,22 @@ INTERFACE = {
     "web.api",
     "web.server",
     "web.events",
+}
+
+RUNTIME_LEAF_MODULES = {
+    "planning.runtime.tools",
+    "planning.runtime.telemetry",
+    "planning.runtime.transport.llm_client",
+    "planning.runtime.context.budget",
+    "planning.runtime.context.clarification",
+    "planning.runtime.context.compression",
+    "planning.runtime.events.analytics_emitter",
+}
+
+APPROVED_LEAF_HELPERS = {
+    "planning.runtime.tools",
+    "planning.runtime.telemetry",
+    "planning.runtime.events.analytics_emitter",
 }
 
 
@@ -289,24 +312,41 @@ def test_storage_imports_only_foundation():
 
 
 def test_runtime_leaf_modules_stay_leaf():
-    """Runtime leaf modules (tools, budget, analytics_emitter, clarification, compression)
-    must not import from planning.core or planning.executor."""
-    leaf_modules = {
-        "planning.runtime.tools",
-        "planning.runtime.budget",
-        "planning.runtime.analytics_emitter",
-        "planning.runtime.clarification",
-        "planning.runtime.compression",
-    }
-    forbidden_targets = {"planning.core", "planning.executor"}
+    """Runtime leaf modules may only import Foundation and approved leaf helpers."""
     violations = []
     for filepath in _collect_python_files():
         mod_name = _module_name(filepath)
         source_module = _normalize_to_known_module(mod_name)
-        if source_module not in leaf_modules:
+        if source_module not in RUNTIME_LEAF_MODULES:
             continue
         for imp in _extract_prscope_imports(filepath):
             target = _normalize_to_known_module(imp)
-            if target in forbidden_targets:
-                violations.append(f"{mod_name} imports {imp} — leaf modules must not import core/executor")
+            if target is None:
+                continue
+            if target == source_module:
+                continue
+            if target in FOUNDATION:
+                continue
+            if target in APPROVED_LEAF_HELPERS:
+                continue
+            violations.append(
+                f"{mod_name} imports {imp} — leaf modules may only import foundation or approved leaf helpers"
+            )
     assert violations == [], "Leaf module violations:\n" + "\n".join(f"  • {v}" for v in violations)
+
+
+def test_reasoning_modules_do_not_import_review_state():
+    """Reasoning modules stay independent from runtime review state."""
+    violations = []
+    for filepath in _collect_python_files():
+        mod_name = _module_name(filepath)
+        source_module = _normalize_to_known_module(mod_name)
+        if source_module is None or not source_module.startswith("planning.runtime.reasoning"):
+            continue
+        for imp in _extract_prscope_imports(filepath):
+            target = _normalize_to_known_module(imp)
+            if target is None:
+                continue
+            if target.startswith("planning.runtime.review"):
+                violations.append(f"{mod_name} imports {imp} — reasoning modules must not import review state")
+    assert violations == [], "Reasoning → Review violations:\n" + "\n".join(f"  • {v}" for v in violations)

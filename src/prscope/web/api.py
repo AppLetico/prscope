@@ -155,6 +155,14 @@ class RuntimeRegistry:
             "errors_total": 0,
             "author_call_timeouts": 0,
             "author_fallback_warnings": 0,
+            "routing_decisions_total": 0,
+            "routing_heuristic_decisions": 0,
+            "routing_model_decisions": 0,
+            "routing_fallback_decisions": 0,
+            "route_author_chat_total": 0,
+            "route_lightweight_refine_total": 0,
+            "route_full_refine_total": 0,
+            "route_existing_feature_total": 0,
             "llm_calls_total": 0,
             "llm_call_latency_ms_total": 0.0,
             "llm_call_latency_ms_max": 0.0,
@@ -352,6 +360,25 @@ class RuntimeRegistry:
                         latency,
                     )
                 changed = True
+        elif etype == "routing_decision":
+            timing["routing_decisions_total"] = int(timing.get("routing_decisions_total", 0)) + 1
+            source = str(event.get("source", "")).strip().lower()
+            route = str(event.get("route", "")).strip().lower()
+            if source == "heuristic":
+                timing["routing_heuristic_decisions"] = int(timing.get("routing_heuristic_decisions", 0)) + 1
+            elif source == "model":
+                timing["routing_model_decisions"] = int(timing.get("routing_model_decisions", 0)) + 1
+            elif source == "fallback":
+                timing["routing_fallback_decisions"] = int(timing.get("routing_fallback_decisions", 0)) + 1
+            if route == "author_chat":
+                timing["route_author_chat_total"] = int(timing.get("route_author_chat_total", 0)) + 1
+            elif "lightweight" in route:
+                timing["route_lightweight_refine_total"] = int(timing.get("route_lightweight_refine_total", 0)) + 1
+            elif "full_refine" in route:
+                timing["route_full_refine_total"] = int(timing.get("route_full_refine_total", 0)) + 1
+            elif "existing_feature" in route or "proposal_review" in route or "revision_input" in route:
+                timing["route_existing_feature_total"] = int(timing.get("route_existing_feature_total", 0)) + 1
+            changed = True
         elif etype == "phase_timing":
             stage = str(event.get("session_stage", "")).strip().lower()
             state = str(event.get("state", "")).strip().lower()
@@ -886,7 +913,6 @@ def create_app() -> FastAPI:
             followup_answer = str(payload.get("followup_answer") or "").strip()
             if not followup_id or not followup_answer:
                 raise CommandConflictError("invalid_status", "followup_id and followup_answer are required")
-            question_text = followup_id
             target_sections: list[str] = []
             if current.followups_json:
                 try:
@@ -899,7 +925,6 @@ def create_app() -> FastAPI:
                         if not isinstance(item, dict):
                             continue
                         if str(item.get("id", "")) == followup_id:
-                            question_text = str(item.get("question") or followup_id)
                             raw_sections = item.get("target_sections")
                             if isinstance(raw_sections, list):
                                 target_sections = [str(section) for section in raw_sections if str(section).strip()]
@@ -909,27 +934,18 @@ def create_app() -> FastAPI:
                 payload.get("author_model") or session.author_model,
                 "author",
             )
-            critic_model = _validated_model_or_400(
-                payload.get("critic_model") or session.critic_model,
-                "critic",
-            )
 
             async def callback(event: dict[str, Any]) -> None:
                 enriched = dict(event)
                 enriched.setdefault("command_id", command_id)
                 await _emit_session_event(ctx.session_id, enriched)
 
-            target_hint = f" Update these section(s): {', '.join(target_sections)}." if target_sections else ""
-            user_message = (
-                f"Follow-up answer for plan version {current.id}: "
-                f"'{question_text}' -> '{followup_answer}'."
-                f"{target_hint} Apply the decision and remove any now-resolved open question."
-            )
-            mode, reply = await runtime.handle_refinement_message(
+            mode, reply = await runtime.apply_followup_answer(
                 session_id=ctx.session_id,
-                user_message=user_message,
+                followup_id=followup_id,
+                followup_answer=followup_answer,
+                target_sections=target_sections,
                 author_model_override=author_model,
-                critic_model_override=critic_model,
                 event_callback=callback,
             )
             return HandlerResult(metadata={"accepted": True, "mode": mode, "reply": reply})

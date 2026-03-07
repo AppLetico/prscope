@@ -35,9 +35,10 @@ from .events import ToolEventStateManager
 from .followups import (
     FollowupEngine,
     decision_graph_from_json,
-    decision_graph_from_open_questions,
+    decision_graph_from_plan,
     decision_graph_to_json,
     followups_to_json,
+    merge_decision_graphs,
 )
 from .orchestration_support import (
     RuntimeChatFlow,
@@ -622,13 +623,18 @@ class PlanningRuntime:
         current_version_id: int | None,
         previous_graph_json: str | None = None,
     ) -> tuple[str, str]:
-        current_graph = decision_graph_from_open_questions(getattr(plan_document, "open_questions", ""))
+        compatibility_graph = decision_graph_from_plan(
+            open_questions=getattr(plan_document, "open_questions", ""),
+            plan_content=plan_content,
+        )
         previous_graph = decision_graph_from_json(previous_graph_json)
-        if previous_graph.nodes:
-            for node_id, previous in previous_graph.nodes.items():
-                current = current_graph.nodes.get(node_id)
-                if current is not None and current.value is None:
-                    current.value = previous.value
+        current_graph = previous_graph if previous_graph.nodes else compatibility_graph
+        if compatibility_graph.nodes:
+            current_graph = merge_decision_graphs(
+                compatibility_graph,
+                current_graph,
+                carry_forward_unresolved=True,
+            )
         followups = self._followup_engine.generate(
             current_graph=current_graph,
             plan_content=plan_content,
@@ -835,6 +841,25 @@ class PlanningRuntime:
             user_message=user_message,
             author_model_override=author_model_override,
             critic_model_override=critic_model_override,
+            event_callback=event_callback,
+        )
+
+    async def apply_followup_answer(
+        self,
+        *,
+        session_id: str,
+        followup_id: str,
+        followup_answer: str,
+        target_sections: list[str] | None = None,
+        author_model_override: str | None = None,
+        event_callback: Any | None = None,
+    ) -> tuple[str, str | None]:
+        return await self._chat_flow.apply_followup_answer(
+            session_id=session_id,
+            followup_id=followup_id,
+            followup_answer=followup_answer,
+            target_sections=target_sections,
+            author_model_override=author_model_override,
             event_callback=event_callback,
         )
 

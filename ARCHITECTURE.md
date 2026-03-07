@@ -48,7 +48,7 @@ Layers are ordered top-to-bottom. A module may import from its own layer or any 
 
 ### Within Intelligence: Planning Sublayers
 
-The `planning/` package has its own internal layering:
+The `planning/` package has its own internal layering and several conceptual runtime subdomains:
 
 ```
 planning/runtime/orchestration.py   ← top: wires everything together
@@ -58,6 +58,8 @@ planning/runtime/{discovery,author,critic,round_controller,state}.py
 planning/runtime/orchestration_support/{event_router,state_snapshots,initial_draft,session_starts,chat_flow,round_entry}.py
     ↓
 planning/runtime/discovery_support/{models,signals,existing_feature,bootstrap,llm}.py
+    ↓
+planning/runtime/reasoning/{base,models,discovery_reasoner,refinement_reasoner,review_reasoner,convergence_reasoner}.py
     ↓
 planning/runtime/authoring/{models,discovery,validation,repair,pipeline}.py
     ↓
@@ -73,10 +75,24 @@ planning/scanners/*                 ← codebase scanning backends
 ```
 
 - `orchestration.py` remains the public coordinator/facade; orchestration internals live under `orchestration_support/*`.
-- `discovery.py` is the runtime entrypoint for discovery orchestration; helper logic lives in `discovery_support/*`.
-- `tools.py`, `telemetry.py`, and `transport/llm_client.py` are leaf modules with no imports from orchestration; `context/` (including budget) holds context assembly and budgeting.
+- `discovery.py`, `author.py`, and `critic.py` are runtime entrypoints coordinated by orchestration, not independent policy owners.
+- `discovery_support/*` plus `planning/scanners/*` form the evidence layer: signal extraction, heuristics, and repository facts.
+- `reasoning/*` is the policy layer: it interprets structured evidence and must not depend on review state, `issue_graph`, or other persisted critique artifacts.
+- `authoring/*` plus `pipeline/*` form the drafting/refinement engine.
+- `review/*` is the critique subsystem; it may consume reasoning outputs when needed, but it does not own orchestration or decision persistence.
+- `followups/*` plus `decision_catalog.py` hold persisted decision/follow-up artifacts.
+- `tools.py`, `telemetry.py`, `transport/llm_client.py`, `context/{budget,clarification,compression}.py`, and `events/analytics_emitter.py` are runtime leaf utilities. They may import Foundation plus explicitly approved leaf helpers, but not orchestration, reasoning, pipeline, review, followups, `planning.core`, or `planning.executor`.
+- `context/` (including budget) and `events/` remain infrastructure-style helpers for context assembly, clarification, compression, and event bookkeeping; they do not own control flow.
 - `core.py` and `executor.py` import from Storage and Foundation only — never from runtime.
 - Runtime agents (`author.py`, `critic.py`, `discovery.py`) import from Foundation + their own leaf utilities. They do **not** import from `core.py` or `executor.py` directly.
+
+Minimal dependency direction within runtime:
+
+- orchestration may coordinate discovery, authoring/pipeline, review, followups, context/events, and reasoning
+- pipeline may depend on authoring and review outputs
+- review may consume reasoning outputs, but not pipeline orchestration
+- reasoning remains policy-oriented and does not depend on review state or persisted critique artifacts
+- leaf/context/event utilities remain reusable helpers rather than mini-controllers
 
 ### Web Sublayers
 
@@ -120,6 +136,7 @@ src/prscope/
 │   ├── core.py                [Intelligence] state machine, transitions, convergence
 │   ├── executor.py            [Intelligence] command reserve/execute/finalize
 │   ├── render.py              [Intelligence] plan export rendering
+│   ├── decision_catalog.py    [Intelligence] stable decision identity/catalog entries
 │   ├── scanners/
 │   │   ├── base.py            [Intelligence] scanner interface
 │   │   ├── grep.py            [Intelligence] grep-backed scanner
@@ -137,10 +154,17 @@ src/prscope/
 │       ├── discovery.py       [Intelligence] discovery orchestrator / compatibility façade
 │       ├── discovery_support/ [Intelligence] discovery helper package
 │       │   ├── models.py      [Intelligence] discovery dataclasses + parsing helpers
-│       │   ├── signals.py     [Intelligence] intent extraction + framework/signal heuristics
+│       │   ├── signals.py     [Intelligence] raw signal extraction + framework evidence helpers
 │       │   ├── existing_feature.py [Intelligence] existing-feature evidence/summarization helpers
 │       │   ├── bootstrap.py   [Intelligence] first-turn bootstrap scanning + evidence ingest
 │       │   └── llm.py         [Intelligence] discovery LLM/tool-call loop wrapper
+│       ├── reasoning/         [Intelligence] shared reasoning contract + policy modules
+│       │   ├── base.py        [Intelligence] `Reasoner` interface
+│       │   ├── models.py      [Intelligence] `ReasoningContext`, decisions, signal payloads
+│       │   ├── discovery_reasoner.py [Intelligence] discovery routing policy
+│       │   ├── refinement_reasoner.py [Intelligence] refinement routing + open-question policy
+│       │   ├── review_reasoner.py [Intelligence] issue-to-decision interpretation
+│       │   └── convergence_reasoner.py [Intelligence] convergence policy
 │       ├── author.py          [Intelligence] plan authoring agent
 │       ├── authoring/         [Intelligence] author subsystem package
 │       │   ├── models.py      [Intelligence] author dataclasses + markdown helpers
@@ -176,21 +200,77 @@ These are enforced by `tests/test_architecture.py`:
 2. **Storage** imports only from Foundation.
 3. **Intelligence** never imports from Interface.
 4. **Interface** never imports from other Interface modules except `web/` internal layering (`server→api→events`).
-5. **Runtime leaf modules** (`tools`, `telemetry`, `transport/llm_client`) do not import from `planning.core` or `planning.executor`.
+5. **Runtime leaf modules** may import only Foundation, approved leaf helpers, and their own local leaf types — not broader runtime subsystems, `planning.core`, or `planning.executor`.
+6. **Reasoning modules** do not import runtime review state.
 
 Violations are caught at CI time. See `tests/test_architecture.py`.
 
 ## Discovery Engine Notes
 
-`planning/runtime/discovery.py` is intentionally data-driven and feature-agnostic:
+`planning/runtime/discovery.py` is intentionally orchestration-focused and feature-agnostic:
 
 - feature detection is derived from user intent + code evidence, not hardcoded feature names
 - framework detection is registry-based and scored from observed route signals
-- directory/file prioritization is heuristic-scored (`_select_scan_directories`, `_route_file_score`)
-- evidence is confidence-ranked and deduplicated before planner decisions
+- directory/file prioritization is heuristic-scored (`_select_scan_directories`, `_route_file_score`) but remains evidence, not routing policy
+- evidence is confidence-ranked and deduplicated before reasoner decisions
 - bootstrap insights are session-scoped and keyed by generic fields (`existing_feature`, `feature_label`)
+- semantic routing belongs in `planning/runtime/reasoning/*`, not in discovery helpers or orchestration wrappers
 
 Guardrail: avoid introducing feature-specific conditionals in engine logic. Add new feature/framework support by extending registries and patterns, not by adding special-case branches.
+
+## Evidence → Reasoning → Decision
+
+Planning decisions should follow a causal flow:
+
+`Evidence -> Reasoning -> Decision`
+
+Role boundaries:
+
+- **Evidence** modules extract structured observations and repository facts. Examples: `planning/runtime/discovery_support/signals.py`, `planning/runtime/discovery_support/existing_feature.py`, `planning/runtime/discovery_support/bootstrap.py`, `planning/scanners/*`, `semantic.py`.
+- **Reasoning** modules interpret evidence into policy outcomes. Examples: `planning/runtime/reasoning/*`.
+- **Decision** modules persist stable architectural state and follow-up artifacts. Examples: `planning/runtime/followups/decision_graph.py`, `planning/decision_catalog.py`.
+- **Orchestration** coordinates the flow around these layers, but it does not interpret raw evidence into architectural decisions.
+
+Guardrails:
+
+- evidence modules produce observations, not architecture choices or routing policy
+- reasoners consume structured evidence; they do not scan repos, execute tools, or persist decisions directly
+- orchestration may coordinate evidence collection and invoke reasoners, but it must not derive architectural decisions directly from raw evidence
+- authoring, review, and discovery helpers must not bypass reasoning when turning evidence into architectural conclusions
+
+This separation keeps decisions traceable from persisted decision state back to reasoner outputs and underlying repository evidence.
+
+## Decision Graph Notes
+
+Plan versions now persist a first-class decision graph plus follow-up artifacts.
+
+- `planning/runtime/followups/decision_graph.py` owns graph extraction, merge, and JSON serialization
+- `planning/decision_catalog.py` provides stable catalog-backed node identity for common architecture decisions
+- `planning/runtime/orchestration.py` treats persisted graph state as primary and uses markdown extraction as compatibility/backfill
+- `planning/runtime/review/issue_graph.py` remains separate from the decision graph; links are additive via `related_decision_ids`
+- `issue_graph` may reference decision nodes, but `decision_graph` does not import or depend on review state
+- decision graph state remains deterministic and plan-version scoped
+- decision graph nodes represent architectural state, not critic-derived evaluation state
+
+## State And Persistence Notes
+
+Protected planning-session lifecycle state must be written through `PlanningCore.transition_and_snapshot()`. See `docs/planning-state-machine.md` and `docs/agent-harness.md`.
+
+- planning lifecycle state includes stage, round progression, convergence status, and plan-version transitions
+- runtime modules may still persist auxiliary artifacts through the storage layer, such as telemetry, event state, issue graphs, decision graphs, and related metadata
+
+This invariant is about protected session state, not about banning all runtime persistence.
+
+## Testing And Validation Notes
+
+Use `tests/` intentionally rather than as a dumping ground:
+
+- architecture boundary tests protect import rules and sublayer invariants
+- runtime/unit tests cover deterministic helpers and reasoners
+- integration/web/API tests cover interface and persistence flows
+- regression tests cover planning behavior and previously fixed edge cases
+
+When reviewing runtime architecture changes, inspect newly introduced `runtime/<subdomain> -> runtime/<different_subdomain>` imports. Coordinator edges from `runtime.orchestration` and `runtime.orchestration_support` are expected; other new cross-subdomain edges deserve scrutiny even if they do not violate a hard CI boundary.
 
 ## Adding a New Module
 

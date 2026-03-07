@@ -583,6 +583,7 @@ export function PlanningViewPage() {
             contextWindowTokens={null}
             contextPercent={null}
             contextCompactionEnabled={false}
+            routingDiagnostics={sessionQuery.data?.draft_timing ?? null}
           />
         ) : null}
         <div className="flex-1 flex flex-col items-center justify-center p-8">
@@ -634,6 +635,7 @@ export function PlanningViewPage() {
             contextWindowTokens={contextWindowTokens}
             contextPercent={contextPercent}
             contextCompactionEnabled={contextCompactionEnabled}
+            routingDiagnostics={sessionQuery.data?.draft_timing ?? null}
             onDelete={onDelete}
             roundMetrics={sessionQuery.data?.round_metrics}
           />
@@ -656,6 +658,7 @@ export function PlanningViewPage() {
               left={(
                 <PlanPanel
                   content={planContent}
+                  decisionGraph={sessionQuery.data?.current_plan?.decision_graph ?? null}
                   status={effectiveStatus ?? session.status}
                   isProcessing={sessionState?.is_processing ?? false}
                   canExport={Boolean(sessionQuery.data?.current_plan)}

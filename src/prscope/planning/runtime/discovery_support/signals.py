@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+from ..reasoning import FrameworkSignals
 from .models import (
     CodeSignal,
     DiscoveryTurnResult,
@@ -383,11 +384,17 @@ def location_score(path: str, file_line_count: int | None = None) -> int:
 
 
 def detect_framework(index: SignalIndex) -> str | None:
+    return build_framework_signals(index).inferred_framework
+
+
+def build_framework_signals(index: SignalIndex) -> FrameworkSignals:
     candidates = index.get("framework", [])
     if not candidates:
-        return None
+        return FrameworkSignals(candidates={}, inferred_framework=None, evidence=[])
     best_name: str | None = None
     best_score = 0
+    scores: dict[str, int] = {}
+    evidence: list[str] = []
     for framework in FRAMEWORKS:
         score = 0
         for match in candidates:
@@ -399,10 +406,17 @@ def detect_framework(index: SignalIndex) -> str | None:
             match_weight = 1 + max(path_score, 0) + file_bonus
             if any(pattern.search(match.line) for pattern in framework.route_patterns):
                 score += match_weight
+                if len(evidence) < 6:
+                    evidence.append(f"{framework.name}:{match.path}:{match.line_number}")
+        scores[framework.name] = score
         if score > best_score:
             best_name = framework.name
             best_score = score
-    return best_name if best_score > 0 else None
+    return FrameworkSignals(
+        candidates={name: score for name, score in scores.items() if score > 0},
+        inferred_framework=best_name if best_score > 0 else None,
+        evidence=evidence,
+    )
 
 
 def is_framework_identification_question(text: str) -> bool:

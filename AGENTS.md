@@ -43,6 +43,7 @@ benchmarks/                ← prompt suites, configs, historical results
 
 - **State writes**: only through `PlanningCore.transition_and_snapshot()`. Never mutate protected session fields directly.
 - **Persist then emit**: DB commit before SSE event. No split-brain.
+- **Runtime layers**: keep `discovery_support/*` as evidence extraction only, `reasoning/*` as semantic policy, and orchestration/stage modules as execution + persistence.
 - **Manifesto**: `.prscope/manifesto.md` defines hard/soft constraints for the Critic. Keep constraints concise and actionable.
 - **Memory layers** (injection order): Manifesto → Skills → Recall → Memory blocks. Historical precedent never overrides policy.
 - **Import boundaries**: see `ARCHITECTURE.md` — layers import downward only.

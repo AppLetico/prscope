@@ -1,4 +1,4 @@
-import type { RoundMetric, SessionStatus } from "../types";
+import type { DraftTimingDiagnostics, RoundMetric, SessionStatus } from "../types";
 import { ChevronDown, Trash2 } from "lucide-react";
 import { Link } from "react-router-dom";
 import { clsx } from "clsx";
@@ -18,6 +18,7 @@ interface ActionBarProps {
   contextWindowTokens?: number | null;
   contextPercent?: number | null;
   contextCompactionEnabled?: boolean;
+  routingDiagnostics?: DraftTimingDiagnostics | null;
   onDelete?: () => void;
   roundMetrics?: RoundMetric[];
 }
@@ -38,6 +39,7 @@ export function ActionBar({
   sessionCostUsd = 0,
   maxPromptTokens = 0,
   contextCompactionEnabled = false,
+  routingDiagnostics = null,
   onDelete,
   roundMetrics,
 }: ActionBarProps) {
@@ -75,6 +77,14 @@ export function ActionBar({
   const displayRevision = Math.max(1, round + 1);
   const latestScoredRound = sortedMetrics.length > 0 ? Math.max(1, sortedMetrics[0].round + 1) : null;
   const hasUnscoredRevision = latestScoredRound !== null && latestScoredRound < displayRevision;
+  const routingDecisionCount = Number(routingDiagnostics?.routing_decisions_total ?? 0);
+  const routingHeuristicCount = Number(routingDiagnostics?.routing_heuristic_decisions ?? 0);
+  const routingModelCount = Number(routingDiagnostics?.routing_model_decisions ?? 0);
+  const routingFallbackCount = Number(routingDiagnostics?.routing_fallback_decisions ?? 0);
+  const routeAuthorChatCount = Number(routingDiagnostics?.route_author_chat_total ?? 0);
+  const routeLightweightCount = Number(routingDiagnostics?.route_lightweight_refine_total ?? 0);
+  const routeFullRefineCount = Number(routingDiagnostics?.route_full_refine_total ?? 0);
+  const routeExistingFeatureCount = Number(routingDiagnostics?.route_existing_feature_total ?? 0);
 
   const totalCost = useMemo(
     () => sortedMetrics.reduce((sum, m) => sum + (m.call_cost_usd ?? 0), 0),
@@ -338,6 +348,26 @@ export function ActionBar({
           {contextCompactionEnabled && (
             <Tooltip content="Context compaction is active">
               <span className="text-indigo-400 bg-indigo-500/10 px-1.5 py-0.5 rounded border border-indigo-500/20">compacted</span>
+            </Tooltip>
+          )}
+          {routingDecisionCount > 0 && (
+            <Tooltip
+              content={(
+                <div className="space-y-1 text-[11px]">
+                  <div>Routing decisions: {routingDecisionCount}</div>
+                  <div>Heuristic: {routingHeuristicCount}</div>
+                  <div>Model: {routingModelCount}</div>
+                  <div>Fallback: {routingFallbackCount}</div>
+                  <div>Author chat: {routeAuthorChatCount}</div>
+                  <div>Lightweight refine: {routeLightweightCount}</div>
+                  <div>Full refine: {routeFullRefineCount}</div>
+                  <div>Existing-feature routes: {routeExistingFeatureCount}</div>
+                </div>
+              )}
+            >
+              <span className="text-cyan-400 bg-cyan-500/10 px-1.5 py-0.5 rounded border border-cyan-500/20">
+                routing {routingDecisionCount}
+              </span>
             </Tooltip>
           )}
         </div>

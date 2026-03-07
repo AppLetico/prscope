@@ -1,5 +1,6 @@
 import type {
   DiscoveryTurnResult,
+  DraftTimingDiagnostics,
   ModelCatalogItem,
   PlanVersion,
   PlanningSession,
@@ -163,6 +164,8 @@ export function getSession(sessionId: string) {
     current_plan: PlanVersion | null;
     tool_summary: { recent_tool_calls: string[] };
     round_metrics?: RoundMetric[];
+    draft_timing?: DraftTimingDiagnostics;
+    draft_timing_source?: string;
   }>(withRepoQuery(`/api/sessions/${sessionId}`));
 }
 

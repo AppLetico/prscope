@@ -27,6 +27,20 @@ export interface PlanningSession {
   max_prompt_tokens?: number | null;
 }
 
+export interface DraftTimingDiagnostics {
+  warnings_total?: number;
+  errors_total?: number;
+  routing_decisions_total?: number;
+  routing_heuristic_decisions?: number;
+  routing_model_decisions?: number;
+  routing_fallback_decisions?: number;
+  route_author_chat_total?: number;
+  route_lightweight_refine_total?: number;
+  route_full_refine_total?: number;
+  route_existing_feature_total?: number;
+  [key: string]: string | number | boolean | null | undefined;
+}
+
 export interface PlanningTurn {
   id: number | null;
   session_id: string;
@@ -66,10 +80,18 @@ export interface DecisionNode {
   section: string;
   required?: boolean;
   concept?: string | null;
+  evidence?: string[] | null;
+}
+
+export interface DecisionEdge {
+  source: string;
+  target: string;
+  relation: string;
 }
 
 export interface DecisionGraph {
   nodes: Record<string, DecisionNode>;
+  edges?: DecisionEdge[];
 }
 
 export interface FollowupQuestion {
@@ -166,6 +188,8 @@ export interface IssueGraphNode {
   resolution_source?: "review" | "lightweight" | null;
   severity?: "major" | "minor" | "info";
   source?: "critic" | "validation" | "inference";
+  tags?: string[];
+  related_decision_ids?: string[];
 }
 
 export interface IssueGraphEdge {

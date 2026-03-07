@@ -12,6 +12,13 @@ from typing import Any, Literal
 from ...core import ConvergenceResult
 from ..author import PlanDocument, RepairPlan, RevisionResult, apply_section_updates, render_markdown
 from ..critic import ImplementabilityResult, ReviewResult
+from ..followups import decision_graph_from_json, decision_graph_from_plan, merge_decision_graphs
+from ..reasoning import (
+    ConvergenceReasoner,
+    ConvergenceSignals,
+    ReasoningContext,
+    ReviewReasoner,
+)
 from ..review import ManifestoCheckResult
 from .round_context import PlanningRoundContext
 
@@ -50,6 +57,37 @@ class PlanningStages:
         self._review_chat_summary = review_chat_summary
         self._manifesto_checker = manifesto_checker
         self._causality_extractor = causality_extractor
+        self._review_reasoner = ReviewReasoner()
+        self._convergence_reasoner = ConvergenceReasoner()
+
+    async def _link_issue_to_decisions(
+        self,
+        *,
+        ctx: PlanningRoundContext,
+        issue_id: str,
+        issue_text: str,
+        decision_graph_json: str | None,
+    ) -> None:
+        review_decision = await self._review_reasoner.link_issue(
+            issue_text=issue_text,
+            decision_graph_json=decision_graph_json,
+        )
+        if not review_decision.issue_links:
+            return
+        ctx.issue_tracker.link_issue_to_decisions(
+            issue_id,
+            review_decision.issue_links,
+            relation=review_decision.decision_relation,
+        )
+
+    @staticmethod
+    def _open_questions_from_graph(graph: Any) -> str:
+        unresolved = [
+            node.description.strip() for node in graph.unresolved_nodes() if str(node.description or "").strip()
+        ]
+        if not unresolved:
+            return "- None."
+        return "\n".join(f"- {item}" for item in unresolved)
 
     def _confirmed_constraint_violations(
         self,
@@ -112,6 +150,8 @@ class PlanningStages:
             constraints=ctx.state.constraints,
             candidate_violations=review_result.constraint_violations,
         )
+        current_plan = ctx.core.get_current_plan()
+        current_decision_graph_json = getattr(current_plan, "decision_graph_json", None)
         ctx.state.review = review_result
         await emit_tool(
             "design_review",
@@ -128,12 +168,19 @@ class PlanningStages:
         for item in [*review_result.blocking_issues, *review_result.architectural_concerns]:
             if item.strip():
                 kind = "blocking_issue" if item in review_result.blocking_issues else "architectural_concern"
-                ctx.issue_tracker.add_issue(
+                added_issue = ctx.issue_tracker.add_issue(
                     item,
                     ctx.round_number,
                     severity=review_issue_severity(kind),  # type: ignore[arg-type]
                     source="critic",
                 )
+                if added_issue.id:
+                    await self._link_issue_to_decisions(
+                        ctx=ctx,
+                        issue_id=added_issue.id,
+                        issue_text=item,
+                        decision_graph_json=current_decision_graph_json,
+                    )
         primary_issue_id = ""
         if review_result.primary_issue and review_result.primary_issue.strip():
             primary_issue_id = ctx.issue_tracker.add_issue(
@@ -141,6 +188,13 @@ class PlanningStages:
                 ctx.round_number,
                 source="critic",
             ).id
+            if primary_issue_id:
+                await self._link_issue_to_decisions(
+                    ctx=ctx,
+                    issue_id=primary_issue_id,
+                    issue_text=review_result.primary_issue,
+                    decision_graph_json=current_decision_graph_json,
+                )
             for derived_item in [*review_result.blocking_issues, *review_result.architectural_concerns]:
                 if not derived_item.strip():
                     continue
@@ -153,6 +207,13 @@ class PlanningStages:
                 )
                 if primary_issue_id and derived.id:
                     ctx.issue_tracker.add_edge(primary_issue_id, derived.id, "causes")
+                if derived.id:
+                    await self._link_issue_to_decisions(
+                        ctx=ctx,
+                        issue_id=derived.id,
+                        issue_text=derived_item,
+                        decision_graph_json=current_decision_graph_json,
+                    )
         for constraint_id in review_result.constraint_violations:
             constraint_issue = ctx.issue_tracker.add_issue(
                 f"Constraint violation: {constraint_id}",
@@ -313,10 +374,28 @@ class PlanningStages:
             model_override=ctx.selected_author_model,
             simplest_possible_design=review_result.simplest_possible_design,
         )
-        updated_plan = apply_section_updates(current_plan_doc, revision_result.updates)
-        updated_markdown = render_markdown(updated_plan)
-        changed_sections = sorted(list(revision_result.updates.keys()))
         previous_version = ctx.core.get_current_plan()
+        updated_plan = apply_section_updates(current_plan_doc, revision_result.updates)
+        preliminary_markdown = render_markdown(updated_plan)
+        previous_graph = decision_graph_from_json(getattr(previous_version, "decision_graph_json", None))
+        candidate_graph = decision_graph_from_plan(
+            open_questions=updated_plan.open_questions,
+            plan_content=preliminary_markdown,
+        )
+        reconciled_graph = merge_decision_graphs(
+            candidate_graph,
+            previous_graph,
+            carry_forward_unresolved=True,
+        )
+        canonical_open_questions = self._open_questions_from_graph(reconciled_graph)
+        if updated_plan.open_questions != canonical_open_questions:
+            updated_plan = apply_section_updates(updated_plan, {"open_questions": canonical_open_questions})
+        updated_markdown = render_markdown(updated_plan)
+        changed_sections = sorted(
+            section
+            for section in {*revision_result.updates.keys(), "open_questions"}
+            if str(getattr(current_plan_doc, section, "")) != str(getattr(updated_plan, section, ""))
+        )
         version = ctx.core.save_plan_version(
             updated_markdown,
             round_number=ctx.round_number,
@@ -415,6 +494,8 @@ class PlanningStages:
             stage="reviewer",
             duration_ms=round((time.perf_counter() - validation_started) * 1000),
         )
+        current_plan = ctx.core.get_current_plan()
+        current_decision_graph_json = getattr(current_plan, "decision_graph_json", None)
         for issue_id in validation_review.resolved_issues:
             ctx.issue_tracker.resolve_issue(issue_id, ctx.round_number)
         validation_primary_id = ""
@@ -425,6 +506,13 @@ class PlanningStages:
                 severity=review_issue_severity("validation_primary_issue"),  # type: ignore[arg-type]
                 source="validation",
             ).id
+            if validation_primary_id:
+                await self._link_issue_to_decisions(
+                    ctx=ctx,
+                    issue_id=validation_primary_id,
+                    issue_text=validation_review.primary_issue,
+                    decision_graph_json=current_decision_graph_json,
+                )
         for item in [*validation_review.blocking_issues, *validation_review.architectural_concerns]:
             if item.strip():
                 kind = (
@@ -438,6 +526,13 @@ class PlanningStages:
                     severity=review_issue_severity(kind),  # type: ignore[arg-type]
                     source="validation",
                 )
+                if issue.id:
+                    await self._link_issue_to_decisions(
+                        ctx=ctx,
+                        issue_id=issue.id,
+                        issue_text=item,
+                        decision_graph_json=current_decision_graph_json,
+                    )
                 if validation_primary_id and issue.id:
                     ctx.issue_tracker.add_edge(validation_primary_id, issue.id, "causes")
         if self._causality_extractor is not None:
@@ -464,27 +559,26 @@ class PlanningStages:
             prose="Skipped - prerequisites not met",
         )
         score_history = [*ctx.state.review_score_history, float(validation_review.design_quality_score)]
-        architecture_recent = ctx.state.architecture_change_rounds[-2:]
-        architecture_stable = bool(architecture_recent) and not any(architecture_recent)
-        score_window = score_history[-3:] if len(score_history) >= 3 else score_history[-2:]
-        score_stable = len(score_window) >= 2 and (max(score_window) - min(score_window)) <= 0.75
-        no_major_open_findings = (
-            not validation_review.blocking_issues
-            and not validation_review.architectural_concerns
-            and not validation_review.primary_issue
-            and not validation_review.constraint_violations
+        pre_impl_decision = await self._convergence_reasoner.decide(
+            ReasoningContext(
+                signals=ConvergenceSignals(
+                    round_number=ctx.round_number,
+                    design_quality_score=float(validation_review.design_quality_score),
+                    review_complete=bool(validation_review.review_complete),
+                    blocking_issue_count=len(validation_review.blocking_issues),
+                    architectural_concern_count=len(validation_review.architectural_concerns),
+                    has_primary_issue=bool(validation_review.primary_issue),
+                    constraint_violation_count=len(validation_review.constraint_violations),
+                    root_open_issue_count=len(ctx.issue_tracker.root_open_issues()),
+                    unresolved_dependency_chains=int(ctx.issue_tracker.unresolved_dependency_chains()),
+                    architecture_change_rounds=list(ctx.state.architecture_change_rounds),
+                    review_score_history=list(ctx.state.review_score_history),
+                    open_issue_history=list(ctx.state.open_issue_history),
+                    implementable=True,
+                )
+            )
         )
-        heuristic_ready = (
-            no_major_open_findings and validation_review.design_quality_score >= 7.8 and ctx.round_number >= 1
-        )
-        base_ready = (
-            (validation_review.review_complete or heuristic_ready)
-            and len(ctx.issue_tracker.root_open_issues()) == 0
-            and int(ctx.issue_tracker.unresolved_dependency_chains()) == 0
-            and validation_review.design_quality_score >= 7.8
-        )
-        stability_ready = architecture_stable and score_stable
-        would_converge = base_ready and stability_ready
+        would_converge = pre_impl_decision.converged
         if would_converge:
             await emit_tool("implementability_check", "running", stage="reviewer")
             impl_started = time.perf_counter()
@@ -523,36 +617,33 @@ class PlanningStages:
         open_issue_count = len(ctx.issue_tracker.open_issues())
         root_open_issue_count = len(ctx.issue_tracker.root_open_issues())
         issue_history = [*ctx.state.open_issue_history, open_issue_count]
-        recent_issue_history = issue_history[-3:]
-        issue_trend_ready = len(recent_issue_history) >= 3 and all(
-            recent_issue_history[idx] <= recent_issue_history[idx - 1] for idx in range(1, len(recent_issue_history))
-        )
         ctx.state.review_score_history = score_history[-8:]
         ctx.state.open_issue_history = issue_history[-8:]
-        stalled_refinement = (
-            ctx.round_number >= 3
-            and len(score_history) >= 3
-            and (max(score_history[-3:]) - min(score_history[-3:])) <= 0.2
-            and len(recent_issue_history) >= 3
-            and len(set(recent_issue_history)) == 1
-            and validation_review.design_quality_score >= 7.0
-            and not validation_review.constraint_violations
-            and implementability.implementable
+        convergence_decision = await self._convergence_reasoner.decide(
+            ReasoningContext(
+                signals=ConvergenceSignals(
+                    round_number=ctx.round_number,
+                    design_quality_score=float(validation_review.design_quality_score),
+                    review_complete=bool(validation_review.review_complete),
+                    blocking_issue_count=len(validation_review.blocking_issues),
+                    architectural_concern_count=len(validation_review.architectural_concerns),
+                    has_primary_issue=bool(validation_review.primary_issue),
+                    constraint_violation_count=len(validation_review.constraint_violations),
+                    root_open_issue_count=root_open_issue_count,
+                    unresolved_dependency_chains=int(ctx.issue_tracker.unresolved_dependency_chains()),
+                    architecture_change_rounds=list(ctx.state.architecture_change_rounds),
+                    review_score_history=score_history[:-1],
+                    open_issue_history=issue_history[:-1],
+                    implementable=bool(implementability.implementable),
+                )
+            )
         )
-        converged = (
-            base_ready and stability_ready and issue_trend_ready and implementability.implementable
-        ) or stalled_refinement
+        converged = convergence_decision.converged
         convergence = ConvergenceResult(
             converged=converged,
-            reason="review_complete" if converged else "review_open_issues",
+            reason=convergence_decision.rationale or ("review_complete" if converged else "review_open_issues"),
             change_pct=0.0,
             regression=None,
             major_issues=root_open_issue_count,
         )
-        if stalled_refinement and not (
-            base_ready and stability_ready and issue_trend_ready and implementability.implementable
-        ):
-            convergence.reason = "stalled_refinement"
-        if not converged and base_ready and root_open_issue_count == 0 and implementability.implementable:
-            convergence.reason = "stability_not_met"
         return implementability, convergence
