@@ -781,6 +781,7 @@ class AuthorAgent:
         plan: PlanDocument,
         requirements: str,
         design_record: dict[str, Any] | None = None,
+        reconsideration_candidates: list[dict[str, Any]] | None = None,
         model_override: str | None = None,
     ) -> RepairPlan:
         return await AuthorRepairService(self._llm_call).plan_repair(
@@ -788,6 +789,7 @@ class AuthorAgent:
             plan=plan,
             requirements=requirements,
             design_record=design_record,
+            reconsideration_candidates=reconsideration_candidates,
             model_override=model_override,
         )
 
@@ -816,6 +818,7 @@ class AuthorAgent:
         model_override: str | None = None,
         simplest_possible_design: str | None = None,
         revision_hints: list[str] | None = None,
+        reconsideration_candidates: list[dict[str, Any]] | None = None,
     ) -> RevisionResult:
         return await AuthorRepairService(self._llm_call).revise_plan(
             repair_plan=repair_plan,
@@ -826,6 +829,7 @@ class AuthorAgent:
             model_override=model_override,
             simplest_possible_design=simplest_possible_design,
             revision_hints=revision_hints,
+            reconsideration_candidates=reconsideration_candidates,
         )
 
     def incremental_grounding_failures(

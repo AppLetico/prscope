@@ -25,17 +25,75 @@ This separation is intentional. A plan version can have durable architectural st
 
 `impact_view` sits on top of that boundary. It is not a third source of truth. It is a derived reasoning surface that makes architectural pressure visible without mutating either persisted graph.
 
+## Mental Model
+
+The graph architecture is easiest to reason about in three layers:
+
+```mermaid
+flowchart TD
+    subgraph canonicalArtifacts [Canonical Persisted Artifacts]
+        planVersions[plan_versions]
+        decisionGraphJson[decision_graph_json]
+        issueGraphSnapshot[issue_graph snapshot]
+    end
+
+    subgraph deterministicProjections [Deterministic Projections]
+        decisionGraph[decision_graph]
+        impactView[impact_view]
+        reconsiderationCandidates[reconsideration_candidates]
+    end
+
+    subgraph agentGeneration [Agent Generation And Ingestion]
+        planAuthoring[plan authoring]
+        reviewCritique[review critique]
+        issueIngestion[issue dedupe and linking]
+    end
+
+    planVersions --> decisionGraph
+    decisionGraphJson --> decisionGraph
+    issueGraphSnapshot --> impactView
+    decisionGraph --> impactView
+    impactView --> reconsiderationCandidates
+    planAuthoring --> planVersions
+    reviewCritique --> issueGraphSnapshot
+    issueIngestion --> issueGraphSnapshot
+```
+
+This layering keeps the core invariant simple:
+
+- persisted artifacts are canonical state
+- runtime graphs and views are deterministic read models over explicit persisted inputs
+- authoring, critique, and ingestion may use model-driven logic, but their outputs only become authoritative after persistence
+
+Terminology note:
+
+- `decision_graph_json` is the canonical persisted artifact stored on a plan version
+- `decision_graph` is the runtime graph object or API field derived from persisted artifacts
+- the session `issue_graph` snapshot is the canonical persisted review artifact
+- the runtime `issue_graph` structure loaded from that snapshot is a deterministic projection over the persisted payload
+
+## Projection Rules
+
+All graph-derived read models should:
+
+- depend only on explicit persisted inputs
+- avoid model calls, timestamps, and randomness
+- produce identical output for identical inputs
+- remain safe to recompute after reload, retry, or crash recovery
+
 ## Decision Graph
 
 ### Purpose
 
-The decision graph is the durable planning-state artifact for a plan version. It captures:
+The canonical persisted planning-state artifact for a plan version is `decision_graph_json`.
+
+The runtime `decision_graph` projection captures:
 
 - architecture decisions already made in the plan
 - unresolved questions that still need answers
 - dependencies between decisions when they are declared explicitly
 
-The graph is also the source for persisted follow-up questions shown after a plan is generated.
+That deterministic projection is also the source for persisted follow-up questions shown after a plan is generated.
 
 ### Ownership
 
@@ -66,13 +124,13 @@ Each decision node carries:
 
 ### How It Is Built
 
-Decision graph construction merges three sources:
+Decision graph construction merges three explicit inputs:
 
 1. Open questions extracted from planning state.
 2. Catalog-backed matches found in plan sections like `Architecture` and `Design Decision Records`.
 3. Explicit decision blocks in markdown, including optional dependencies.
 
-When a new plan version is created, the current graph is merged with the previous plan version's graph so answers can carry forward even if wording changes slightly. Matching prefers:
+When a new plan version is created, the runtime `decision_graph` projection is merged with the previous plan version's graph so answers can carry forward even if wording changes slightly. Matching prefers:
 
 - exact id
 - semantic identity via `(section, concept)`
@@ -92,6 +150,8 @@ The API parses those JSON columns into structured response fields:
 - `decision_graph`
 - `followups`
 
+So the persisted JSON remains authoritative, while the API field `decision_graph` is the materialized runtime structure exposed to clients.
+
 The frontend consumes `current_plan.decision_graph` directly rather than rebuilding decision state from markdown.
 
 ### Follow-Ups
@@ -102,13 +162,15 @@ Unresolved required decision nodes become follow-up question artifacts. Each fol
 - the target plan section
 - the concept / semantic identity
 
-Answering a follow-up updates the decision graph first; the rendered plan can then be refreshed from that updated state.
+Answering a follow-up updates the persisted decision graph state first; the rendered plan can then be refreshed from that updated state.
 
 ## Issue Graph
 
 ### Purpose
 
-The issue graph is the session-scoped review artifact. It tracks:
+The canonical persisted review artifact is the session `issue_graph` snapshot.
+
+The runtime `issue_graph` structure tracks:
 
 - open and resolved issues
 - causal chains between issues
@@ -116,7 +178,7 @@ The issue graph is the session-scoped review artifact. It tracks:
 - duplicate detection and canonical issue ids
 - links from issues to related architectural decisions
 
-It replaces a purely flat issue list with something that can explain why an issue exists and what else it affects.
+That structure replaces a purely flat issue list with something that can explain why an issue exists and what else it affects.
 
 ### Ownership
 
@@ -186,6 +248,8 @@ Snapshot behavior:
 - `issue_graph` is the richer additive structure
 - adjacency indexes are runtime-derived and are not persisted
 
+Once persisted, the issue-graph payload is deterministic and replayable on reload. The non-hermetic boundary is earlier in ingestion: dedupe and linking can depend on embedding-backed similarity or other model-assisted logic before the final snapshot is written.
+
 Session APIs expose `issue_graph` directly from the snapshot, and frontend screens render from it when present.
 
 ## Impact View
@@ -248,6 +312,7 @@ The projector is deterministic and defensive:
 - it guards against malformed cycles with a visited set and depth cap
 - it picks canonical roots deterministically by severity, `raised_round`, then issue id
 - it excludes resolved issues and dependency-blocked issues from pressure scoring
+- it may consult `previous_decision_graph` to compute `recently_changed` and reconsideration eligibility without introducing hidden inputs
 
 Pressure and cluster ranking are heuristic but deterministic:
 
@@ -257,9 +322,13 @@ Pressure and cluster ranking are heuristic but deterministic:
 
 ### Reconsideration Candidates
 
-`impact_view.reconsideration_candidates` is the beginning of a controlled reconsideration loop.
+`impact_view.reconsideration_candidates` is part of the same deterministic projection, not a separate persisted artifact or independent pipeline stage.
+
+It is the beginning of a controlled reconsideration loop.
 
 It does **not** mutate `decision_graph`. Instead it surfaces when a decision is under sustained pressure and may need explicit reconsideration.
+
+Later refinement prompts may consume these candidates directly. When no candidate clears the strict reconsideration threshold, the runtime may still pass the top medium-or-higher pressure decisions as non-persistent pressure guidance so refinement can address the most stressed architectural area without waiting for a harder failure.
 
 Current candidate fields include:
 
@@ -283,7 +352,7 @@ The graphs are linked in one direction:
 
 - issue nodes may include `related_decision_ids`
 - review reasoning uses the decision graph to infer which architectural decisions an issue is about
-- `impact_view` combines both graphs into a derived read model
+- `impact_view` combines both graphs, and sometimes `previous_decision_graph`, into a derived read model
 
 The reverse is intentionally not true:
 
@@ -332,9 +401,10 @@ Use `impact_view` when the question is:
 
 Keep these invariants intact when evolving the system:
 
-- `decision_graph` is plan-version scoped and deterministic
+- `decision_graph_json` is the authoritative plan-version artifact
+- `decision_graph` is a deterministic projection over persisted plan-version inputs
 - `issue_graph` is session-scoped and may evolve across rounds
-- `impact_view` is derived, ephemeral, and recomputable from current plan + session snapshot state
+- `impact_view` is derived, ephemeral, and recomputable from current plan + session snapshot state, plus `previous_decision_graph` when reconsideration eligibility needs it
 - issue state may reference decisions through ids, but decision state must not depend on review state
 - persisted graphs are authoritative; derived indexes and render-time projections are not
 - legacy compatibility fields may coexist with graph payloads, but graph payloads are the richer contract

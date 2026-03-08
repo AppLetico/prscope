@@ -201,6 +201,7 @@ Issue snapshot expectation:
 - plan version payloads also carry `decision_graph` and `followups`; the decision graph is the primary planning-state artifact and markdown extraction is compatibility/backfill only
 - `GET /api/sessions/{id}` also emits an additive derived `impact_view` computed from `current_plan.decision_graph` plus snapshot `issue_graph`
 - `impact_view` is not persisted; it is a deterministic read model that can include per-decision pressure, root-cause clusters, and reconsideration candidates
+- persisted JSON artifacts are authoritative; runtime graph objects and read models must stay deterministic functions of those explicit persisted inputs
 
 ## Runtime Invariants Enforced by Core
 

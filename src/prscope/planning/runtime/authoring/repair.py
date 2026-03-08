@@ -84,12 +84,34 @@ class AuthorRepairService:
     def __init__(self, llm_call: LlmCaller) -> None:
         self._llm_call = llm_call
 
+    @staticmethod
+    def _pressure_guidance_block(reconsideration_candidates: list[dict[str, Any]] | None) -> str:
+        items = reconsideration_candidates or []
+        if not items:
+            return "(none)"
+        lines: list[str] = []
+        for candidate in items[:2]:
+            if not isinstance(candidate, dict):
+                continue
+            decision_id = str(candidate.get("decision_id", "")).strip() or "(unknown decision)"
+            reason = str(candidate.get("reason", "")).strip() or "pressure_guidance"
+            pressure = int(candidate.get("decision_pressure", 0) or 0)
+            action = str(candidate.get("suggested_action", "")).strip() or "clarify pressured decision"
+            cluster = candidate.get("dominant_cluster")
+            cluster_payload = cluster if isinstance(cluster, dict) else {}
+            root_issue = str(cluster_payload.get("root_issue", "")).strip() or "unspecified root issue"
+            lines.append(
+                f"- `{decision_id}` pressure={pressure} reason={reason}; root issue: {root_issue}; suggested action: {action}"
+            )
+        return "\n".join(lines) if lines else "(none)"
+
     async def plan_repair(
         self,
         review: Any,
         plan: PlanDocument,
         requirements: str,
         design_record: dict[str, Any] | None = None,
+        reconsideration_candidates: list[dict[str, Any]] | None = None,
         model_override: str | None = None,
     ) -> RepairPlan:
         prompt = (
@@ -108,6 +130,9 @@ class AuthorRepairService:
             "For localized UI or API-wiring work that explicitly reuses existing helpers/endpoints, reject feedback that introduces "
             "service layers, dedicated hooks/contexts, centralized state/error handling, observability/telemetry work, or broad architecture refactors unless the requirements or verified "
             "repository evidence explicitly require those structures.\n\n"
+            "If cross-graph reconsideration candidates are provided, treat them as architectural pressure signals. "
+            "Explicitly decide whether the top pressured decision should be clarified, narrowed, reconsidered, or defended with a concrete rationale in the revised plan.\n"
+            "Do not ignore the top pressure signal when one is provided.\n\n"
             "Example: for a request to add or verify a lightweight `/health` endpoint, reject suggestions to add database "
             "checks, external-service checks, authentication, or concurrency-control machinery unless the requirements explicitly ask for them.\n\n"
             "Return JSON with fields:\n"
@@ -127,7 +152,9 @@ class AuthorRepairService:
                     f"## Requirements\n{requirements}\n\n"
                     f"## Current Plan JSON\n{json.dumps(plan.__dict__, indent=2)}\n\n"
                     f"## Review Result\n{json.dumps(review.__dict__, indent=2)}\n\n"
-                    f"## Design Record\n{json.dumps(design_record or {}, indent=2)}"
+                    f"## Architectural Pressure Guidance\n{self._pressure_guidance_block(reconsideration_candidates)}\n\n"
+                    f"## Design Record\n{json.dumps(design_record or {}, indent=2)}\n\n"
+                    f"## Reconsideration Candidates\n{json.dumps(reconsideration_candidates or [], indent=2)}"
                 ),
             },
         ]
@@ -211,6 +238,7 @@ class AuthorRepairService:
         model_override: str | None = None,
         simplest_possible_design: str | None = None,
         revision_hints: list[str] | None = None,
+        reconsideration_candidates: list[dict[str, Any]] | None = None,
     ) -> RevisionResult:
         simplification_hint = (
             "\nIf a simplification proposal is provided and sound, prefer it over incremental fixes."
@@ -237,6 +265,9 @@ class AuthorRepairService:
                     "unless the requirements or accepted issues explicitly replace them with another verified spelling.\n"
                     "Do not shorten, normalize, or rename existing paths or symbols "
                     "(for example, keep `src/prscope/web/frontend/src/lib/api.ts` and `exportSession` exactly as written).\n"
+                    "If reconsideration candidates are provided, update the relevant plan sections so the highest-pressure "
+                    "decision is explicitly clarified, constrained, reconsidered, or defended with concrete rationale rather than left as implicit pressure.\n"
+                    "When architectural pressure guidance is present, make a visible plan change that addresses that pressure unless you can justify preserving the current decision.\n"
                     "Before generating updates:\n"
                     "Step 1: Restate the primary concern.\n"
                     "Step 2: Explain how revisions resolve it.\n"
@@ -255,9 +286,11 @@ class AuthorRepairService:
                     f"## Requirements\n{requirements}\n\n"
                     f"## Repair Plan\n{json.dumps(repair_plan.__dict__, indent=2)}\n\n"
                     f"## Current Plan JSON\n{json.dumps(current_plan.__dict__, indent=2)}\n\n"
+                    f"## Architectural Pressure Guidance\n{self._pressure_guidance_block(reconsideration_candidates)}\n\n"
                     f"## Design Record\n{json.dumps(design_record or {}, indent=2)}\n\n"
                     f"## Simplest Possible Design\n{simplest_possible_design or '(none)'}\n\n"
-                    f"## Revision Hints\n{json.dumps(revision_hints or [], indent=2)}"
+                    f"## Revision Hints\n{json.dumps(revision_hints or [], indent=2)}\n\n"
+                    f"## Reconsideration Candidates\n{json.dumps(reconsideration_candidates or [], indent=2)}"
                 ),
             },
         ]

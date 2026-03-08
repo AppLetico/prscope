@@ -629,10 +629,22 @@ async def test_followup_answer_updates_decision_graph_before_refreshing_sections
         round_number=1,
         plan_document=plan,
     )
-    runtime._attach_plan_version_artifacts(
+    runtime.store.update_plan_version_artifacts(
         version_id=version.id,
-        plan_document=plan,
-        plan_content=version.plan_content,
+        decision_graph_json=json.dumps(
+            {
+                "nodes": {
+                    "architecture.database": {
+                        "id": "architecture.database",
+                        "description": "Which database should store the primary application data?",
+                        "value": "PostgreSQL",
+                        "section": "architecture",
+                    }
+                },
+                "edges": [],
+            }
+        ),
+        followups_json=json.dumps({"questions": []}),
     )
     runtime.store.update_planning_session(session.id, current_round=1)
 
@@ -709,10 +721,22 @@ async def test_full_revision_reconciles_decision_graph_before_persisting(tmp_pat
         round_number=1,
         plan_document=plan,
     )
-    runtime._attach_plan_version_artifacts(
+    runtime.store.update_plan_version_artifacts(
         version_id=version.id,
-        plan_document=plan,
-        plan_content=version.plan_content,
+        decision_graph_json=json.dumps(
+            {
+                "nodes": {
+                    "architecture.database": {
+                        "id": "architecture.database",
+                        "description": "Which database should store the primary application data?",
+                        "value": "PostgreSQL",
+                        "section": "architecture",
+                    }
+                },
+                "edges": [],
+            }
+        ),
+        followups_json=json.dumps({"questions": []}),
     )
     runtime.store.update_planning_session(session.id, current_round=1)
 
@@ -794,6 +818,242 @@ async def test_full_revision_reconciles_decision_graph_before_persisting(tmp_pat
     assert "open_questions" in changed_sections
     assert plan_payload["open_questions"] == "- None."
     assert graph_payload["nodes"]["architecture.database"]["value"] == "PostgreSQL"
+
+
+def test_top_reconsideration_candidates_falls_back_to_medium_pressure_decisions(tmp_path) -> None:
+    runtime = PlanningRuntime(
+        store=Store(tmp_path / "test.db"),
+        config=PrscopeConfig(
+            local_repo=str(tmp_path),
+            planning=PlanningConfig(author_model="gpt-4o-mini", critic_model="gpt-4o-mini"),
+        ),
+        repo=RepoProfile(name="repo", path=str(tmp_path)),
+    )
+    ctx = SimpleNamespace(
+        session_id="session-1",
+        issue_tracker=SimpleNamespace(
+            graph_snapshot=lambda: {
+                "nodes": [
+                    {
+                        "id": "issue_1",
+                        "description": "Database scaling limits remain unresolved.",
+                        "status": "open",
+                        "raised_round": 1,
+                        "severity": "major",
+                        "issue_type": "architecture",
+                        "related_decision_ids": ["architecture.database"],
+                        "tags": [],
+                    },
+                    {
+                        "id": "issue_2",
+                        "description": "Database throughput may bottleneck rollout traffic.",
+                        "status": "open",
+                        "raised_round": 1,
+                        "severity": "minor",
+                        "issue_type": "performance",
+                        "related_decision_ids": ["architecture.database"],
+                        "tags": [],
+                    },
+                ],
+                "edges": [{"source": "issue_1", "target": "issue_2", "relation": "causes"}],
+                "duplicate_alias": {},
+            }
+        ),
+        core=SimpleNamespace(
+            store=SimpleNamespace(get_plan_versions=lambda session_id, limit=2: [])
+        ),
+    )
+
+    candidates = runtime._stages._top_reconsideration_candidates(  # type: ignore[attr-defined]  # noqa: SLF001
+        ctx=ctx,
+        decision_graph_json=json.dumps(
+            {
+                "nodes": {
+                    "architecture.database": {
+                        "id": "architecture.database",
+                        "description": "Which database should store the primary application data?",
+                        "value": "PostgreSQL",
+                        "section": "architecture",
+                    }
+                }
+            }
+        ),
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0]["decision_id"] == "architecture.database"
+    assert candidates[0]["reason"] == "pressure_guidance"
+    assert candidates[0]["decision_pressure"] == 4
+    assert candidates[0]["dominant_cluster"]["root_issue"] == "Database scaling limits remain unresolved."
+
+
+@pytest.mark.asyncio
+async def test_revise_plan_receives_reconsideration_candidates_from_impact_view(tmp_path):
+    store = Store(tmp_path / "test.db")
+    config = PrscopeConfig(
+        local_repo=str(tmp_path),
+        planning=PlanningConfig(author_model="gpt-4o-mini", critic_model="gpt-4o-mini"),
+    )
+    repo = RepoProfile(name="repo", path=str(tmp_path))
+    runtime = PlanningRuntime(store=store, config=config, repo=repo)
+
+    session = store.create_planning_session(
+        repo_name=repo.name,
+        title="revision-pressure",
+        requirements="r",
+        seed_type="chat",
+        status="refining",
+    )
+    plan = PlanDocument(
+        title="Plan",
+        summary="Add persistence caching.",
+        goals="Support faster reads.",
+        non_goals="Do not change the external API.",
+        files_changed="`src/app.py` - add cache reads.",
+        architecture="Use PostgreSQL as the canonical database and add an in-memory cache for repeated reads.",
+        implementation_steps="1. Add cache lookup before SQLite reads.",
+        test_strategy="Add tests for cache hits and invalidation.",
+        rollback_plan="Disable caching if rollout fails.",
+        open_questions="- None.",
+    )
+    version = runtime._core(session.id).save_plan_version(
+        render_markdown(plan),
+        round_number=1,
+        plan_document=plan,
+    )
+    runtime.store.update_plan_version_artifacts(
+        version_id=version.id,
+        decision_graph_json=json.dumps(
+            {
+                "nodes": {
+                    "architecture.database": {
+                        "id": "architecture.database",
+                        "description": "Which database should store the primary application data?",
+                        "value": "PostgreSQL",
+                        "section": "architecture",
+                    }
+                },
+                "edges": [],
+            }
+        ),
+        followups_json=json.dumps({"questions": []}),
+    )
+    runtime.store.update_planning_session(session.id, current_round=1)
+
+    state = runtime._state(session.id)
+    tracker = state.issue_tracker
+    issue_a = tracker.add_issue(
+        "Cache invalidation strategy is underspecified and may serve stale data.",
+        1,
+        severity="major",
+        source="critic",
+        issue_type="architecture",
+    )
+    tracker.link_issue_to_decisions(issue_a.id, ["architecture.database"], relation="conflict")
+    issue_b = tracker.add_issue(
+        "Source-of-truth ambiguity between SQLite and cache remains unresolved.",
+        1,
+        severity="major",
+        source="critic",
+        issue_type="correctness",
+    )
+    tracker.link_issue_to_decisions(issue_b.id, ["architecture.database"], relation="conflict")
+    tracker.add_edge(issue_a.id, issue_b.id, "causes")
+
+    ctx = PlanningRoundContext(
+        core=runtime._core(session.id),
+        session_id=session.id,
+        round_number=2,
+        requirements="r",
+        state=state,
+        issue_tracker=tracker,
+        selected_author_model="gpt-4o-mini",
+        selected_critic_model="gpt-4o-mini",
+        event_callback=None,
+    )
+    review_result = ReviewResult(
+        strengths=[],
+        architectural_concerns=["Cache invalidation strategy remains underspecified."],
+        risks=[],
+        simplification_opportunities=[],
+        blocking_issues=[],
+        reviewer_questions=[],
+        recommended_changes=[],
+        design_quality_score=5.0,
+        confidence="medium",
+        review_complete=False,
+        simplest_possible_design=None,
+        primary_issue="Cache invalidation strategy remains underspecified.",
+        resolved_issues=[],
+        constraint_violations=[],
+        issue_priority=[],
+        prose="Cache invalidation strategy remains underspecified.",
+        parse_error=None,
+    )
+    repair_plan = RepairPlan(
+        problem_understanding="Clarify cache invalidation and source-of-truth ownership.",
+        accepted_issues=["Cache invalidation strategy remains underspecified."],
+        rejected_issues=[],
+        root_causes=["Caching decision is under pressure from stale-data risks."],
+        repair_strategy="Clarify decision boundaries and invalidation ownership.",
+        target_sections=["architecture"],
+        revision_plan="Update architecture to make cache invalidation explicit.",
+    )
+    runtime._stages._top_reconsideration_candidates = (  # type: ignore[attr-defined]  # noqa: SLF001
+        lambda **kwargs: [
+            {
+                "decision_id": "architecture.database",
+                "reason": "high_pressure_cluster",
+                "decision_pressure": 6,
+                "suggested_action": "reconsider architecture",
+                "recently_changed": False,
+                "dominant_cluster": {
+                    "root_issue_id": "issue_1",
+                    "root_issue": "Cache invalidation strategy is underspecified and may serve stale data.",
+                    "severity": "major",
+                    "affected_plan_sections": ["architecture"],
+                    "suggested_action": "reconsider architecture",
+                },
+            }
+        ]
+    )
+    captured: dict[str, object] = {}
+
+    async def fake_revise_plan(**kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
+        return RevisionResult(
+            problem_understanding="Clarify cache invalidation and SQLite ownership.",
+            updates={
+                "architecture": (
+                    "Keep SQLite canonical, scope the cache to read-through behavior, and define explicit invalidation "
+                    "when session snapshots change."
+                )
+            },
+            justification={"architecture": "Addresses the pressured cache strategy decision."},
+            review_prediction="Reviewer should accept the clarified cache ownership decision.",
+        )
+
+    runtime.author.revise_plan = fake_revise_plan  # type: ignore[method-assign]
+
+    async def emit_tool(*args, **kwargs):  # type: ignore[no-untyped-def]
+        del args, kwargs
+
+    await runtime._stages.revise_plan(  # noqa: SLF001
+        ctx=ctx,
+        current_plan_doc=plan,
+        repair_plan=repair_plan,
+        review_result=review_result,
+        emit_tool=emit_tool,
+    )
+
+    candidates = captured.get("reconsideration_candidates")
+    assert isinstance(candidates, list)
+    assert candidates
+    top = candidates[0]
+    assert top["decision_id"] == "architecture.database"
+    assert top["reason"] == "high_pressure_cluster"
+    assert top["suggested_action"] == "reconsider architecture"
+    assert top["dominant_cluster"]["root_issue"]
 
 
 def test_open_question_guard_keeps_unanswered_items(tmp_path) -> None:

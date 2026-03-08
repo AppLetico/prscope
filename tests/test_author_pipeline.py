@@ -413,6 +413,21 @@ async def test_revise_plan_recovers_from_trailing_commas_in_json() -> None:
         requirements="Keep behavior stable.",
         revision_budget=2,
         revision_hints=["Preserve `src/prscope/web/frontend/src/lib/api.ts` exactly as written."],
+        reconsideration_candidates=[
+            {
+                "decision_id": "architecture.database",
+                "reason": "high_pressure_cluster",
+                "decision_pressure": 6,
+                "suggested_action": "reconsider architecture",
+                "dominant_cluster": {
+                    "root_issue_id": "issue_1",
+                    "root_issue": "Database choice remains underspecified.",
+                    "severity": "major",
+                    "affected_plan_sections": ["architecture"],
+                    "suggested_action": "reconsider architecture",
+                },
+            }
+        ],
     )
 
     assert result.problem_understanding
@@ -427,7 +442,13 @@ async def test_revise_plan_recovers_from_trailing_commas_in_json() -> None:
     assert "localized UI or API-wiring requests that reuse existing helpers/endpoints" in system_prompt
     assert "observability/telemetry work" in system_prompt
     assert "dedicated hooks/contexts" in system_prompt
+    assert "If reconsideration candidates are provided" in system_prompt
+    assert "Architectural Pressure Guidance" in user_prompt
+    assert "Do not ignore the top pressure signal" in system_prompt or "make a visible plan change" in system_prompt
     assert "Preserve `src/prscope/web/frontend/src/lib/api.ts` exactly as written." in user_prompt
+    assert "## Reconsideration Candidates" in user_prompt
+    assert "architecture.database" in user_prompt
+    assert "root issue:" in user_prompt
 
 
 def test_incremental_grounding_failures_detects_new_unverified_paths(tmp_path: Path) -> None:

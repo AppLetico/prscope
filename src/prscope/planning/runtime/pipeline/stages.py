@@ -19,7 +19,7 @@ from ..reasoning import (
     ReasoningContext,
     ReviewReasoner,
 )
-from ..review import ManifestoCheckResult, infer_issue_type
+from ..review import ManifestoCheckResult, build_impact_view, infer_issue_type
 from ..tools import extract_file_references
 from .round_context import PlanningRoundContext
 
@@ -68,6 +68,112 @@ class PlanningStages:
         self._causality_extractor = causality_extractor
         self._review_reasoner = ReviewReasoner()
         self._convergence_reasoner = ConvergenceReasoner()
+
+    @staticmethod
+    def _load_graph_payload(raw: str | None) -> dict[str, Any] | None:
+        if not raw:
+            return None
+        try:
+            payload = json.loads(str(raw))
+        except json.JSONDecodeError:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _top_reconsideration_candidates(
+        self,
+        *,
+        ctx: PlanningRoundContext,
+        decision_graph_json: str | None,
+    ) -> list[dict[str, Any]]:
+        decision_graph = self._load_graph_payload(decision_graph_json)
+        if decision_graph is None or not hasattr(ctx.issue_tracker, "graph_snapshot"):
+            return []
+        try:
+            issue_graph = ctx.issue_tracker.graph_snapshot()
+        except Exception:  # noqa: BLE001
+            return []
+        if not isinstance(issue_graph, dict):
+            return []
+        try:
+            versions = ctx.core.store.get_plan_versions(ctx.session_id, limit=2)
+        except Exception:  # noqa: BLE001
+            versions = []
+        previous_graph = None
+        if len(versions) > 1:
+            previous_graph = self._load_graph_payload(getattr(versions[1], "decision_graph_json", None))
+        impact_view = build_impact_view(
+            decision_graph=decision_graph,
+            issue_graph=issue_graph,
+            previous_decision_graph=previous_graph,
+        )
+        raw_candidates = impact_view.get("reconsideration_candidates", []) if isinstance(impact_view, dict) else []
+        raw_decisions = impact_view.get("decisions", []) if isinstance(impact_view, dict) else []
+        candidates: list[dict[str, Any]] = []
+        for candidate in raw_candidates:
+            if not isinstance(candidate, dict):
+                continue
+            if candidate.get("eligible") is False:
+                continue
+            dominant_cluster = candidate.get("dominant_cluster")
+            cluster_payload = dominant_cluster if isinstance(dominant_cluster, dict) else {}
+            candidates.append(
+                {
+                    "decision_id": str(candidate.get("decision_id", "")).strip(),
+                    "reason": str(candidate.get("reason", "")).strip(),
+                    "decision_pressure": int(candidate.get("decision_pressure", 0) or 0),
+                    "suggested_action": str(candidate.get("suggested_action", "")).strip(),
+                    "recently_changed": bool(candidate.get("recently_changed", False)),
+                    "dominant_cluster": {
+                        "root_issue_id": str(cluster_payload.get("root_issue_id", "")).strip(),
+                        "root_issue": str(cluster_payload.get("root_issue", "")).strip(),
+                        "severity": str(cluster_payload.get("severity", "")).strip(),
+                        "affected_plan_sections": list(cluster_payload.get("affected_plan_sections", []) or []),
+                        "suggested_action": str(cluster_payload.get("suggested_action", "")).strip(),
+                    },
+                }
+            )
+        filtered_candidates = [candidate for candidate in candidates if candidate.get("decision_id")][:2]
+        if filtered_candidates:
+            return filtered_candidates
+
+        fallback_candidates: list[dict[str, Any]] = []
+        for decision in raw_decisions:
+            if not isinstance(decision, dict):
+                continue
+            dominant_cluster = decision.get("dominant_cluster")
+            cluster_payload = dominant_cluster if isinstance(dominant_cluster, dict) else {}
+            decision_id = str(decision.get("decision_id", "")).strip()
+            decision_pressure = int(decision.get("decision_pressure", 0) or 0)
+            risk_level = str(decision.get("risk_level", "")).strip().lower()
+            highest_severity = str(decision.get("highest_severity", "")).strip().lower()
+            if not decision_id:
+                continue
+            if decision_pressure < 4 and risk_level not in {"medium", "high"} and highest_severity != "major":
+                continue
+            fallback_candidates.append(
+                {
+                    "decision_id": decision_id,
+                    "reason": "pressure_guidance",
+                    "decision_pressure": decision_pressure,
+                    "suggested_action": str(cluster_payload.get("suggested_action", "")).strip()
+                    or "clarify pressured decision",
+                    "recently_changed": bool(decision.get("recently_changed", False)),
+                    "dominant_cluster": {
+                        "root_issue_id": str(cluster_payload.get("root_issue_id", "")).strip(),
+                        "root_issue": str(cluster_payload.get("root_issue", "")).strip(),
+                        "severity": str(cluster_payload.get("severity", "")).strip(),
+                        "affected_plan_sections": list(cluster_payload.get("affected_plan_sections", []) or []),
+                        "suggested_action": str(cluster_payload.get("suggested_action", "")).strip(),
+                    },
+                }
+            )
+        fallback_candidates.sort(
+            key=lambda candidate: (
+                -int(candidate.get("decision_pressure", 0) or 0),
+                candidate.get("decision_id", ""),
+            )
+        )
+        return fallback_candidates[:2]
 
     async def _link_issue_to_decisions(
         self,
@@ -291,6 +397,11 @@ class PlanningStages:
         await self._emit_event(ctx.event_callback, snapshot, ctx.session_id)
         await emit_tool("repair_planning", "running", stage="author")
         repair_started = time.perf_counter()
+        current_plan = ctx.core.get_current_plan()
+        reconsideration_candidates = self._top_reconsideration_candidates(
+            ctx=ctx,
+            decision_graph_json=getattr(current_plan, "decision_graph_json", None),
+        )
         design_record_payload = self._design_record_payload(ctx.state.design_record)
         if design_record_payload:
             try:
@@ -315,6 +426,7 @@ class PlanningStages:
             plan=current_plan_doc,
             requirements=ctx.requirements,
             design_record=self._design_record_payload(ctx.state.design_record),
+            reconsideration_candidates=reconsideration_candidates,
             model_override=ctx.selected_author_model,
         )
         must_fix_count = 2
@@ -336,6 +448,7 @@ class PlanningStages:
                     + "\n".join(f"- {item}" for item in missing_must_fix)
                 ),
                 design_record=self._design_record_payload(ctx.state.design_record),
+                reconsideration_candidates=reconsideration_candidates,
                 model_override=ctx.selected_author_model,
             )
             accepted = {item.strip() for item in repair_plan.accepted_issues}
@@ -396,6 +509,10 @@ class PlanningStages:
         revision_hints: list[str] | None = None
         previous_plan = ctx.core.get_current_plan()
         previous_plan_content = getattr(previous_plan, "plan_content", "") if previous_plan is not None else ""
+        reconsideration_candidates = self._top_reconsideration_candidates(
+            ctx=ctx,
+            decision_graph_json=getattr(previous_plan, "decision_graph_json", None),
+        )
         verified_paths = set(ctx.state.accessed_paths) | set(extract_file_references(previous_plan_content))
         for attempt in range(2):
             revision_result = await self._author.revise_plan(
@@ -407,6 +524,7 @@ class PlanningStages:
                 model_override=ctx.selected_author_model,
                 simplest_possible_design=review_result.simplest_possible_design,
                 revision_hints=revision_hints,
+                reconsideration_candidates=reconsideration_candidates,
             )
             updated_plan = apply_section_updates(current_plan_doc, revision_result.updates)
             preliminary_markdown = render_markdown(updated_plan)
