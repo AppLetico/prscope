@@ -258,6 +258,57 @@ def test_explore_repo_prefers_planning_view_health_paths_for_diagnostics_ui_work
     assert "src/prscope/web/frontend/src/lib/decisionGraphRender.test.ts" not in understanding.file_contents
 
 
+def test_explore_repo_includes_web_api_models_test_for_localized_backend_payload_tweak(tmp_path: Path) -> None:
+    (tmp_path / "src" / "prscope" / "web" / "frontend" / "src" / "components").mkdir(parents=True)
+    (tmp_path / "src" / "prscope" / "web" / "frontend" / "src" / "pages").mkdir(parents=True)
+    (tmp_path / "src" / "prscope" / "web" / "frontend" / "src" / "lib").mkdir(parents=True)
+    (tmp_path / "src" / "prscope" / "web").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "src" / "prscope" / "web" / "frontend" / "src" / "components" / "ActionBar.tsx").write_text(
+        "export function ActionBar() { return null; }\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "prscope" / "web" / "frontend" / "src" / "components" / "PlanPanel.tsx").write_text(
+        "export function PlanPanel() { return null; }\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "prscope" / "web" / "frontend" / "src" / "pages" / "PlanningView.tsx").write_text(
+        "const snapshotQuery = getSessionSnapshot('1');\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "prscope" / "web" / "frontend" / "src" / "lib" / "api.ts").write_text(
+        "export function getSessionSnapshot() {}\nexport function downloadFile() {}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "prscope" / "web" / "api.py").write_text(
+        "class SessionSnapshotResponse:\n    updated_at: str\n    open_issue_count: int\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "prscope" / "web" / "frontend" / "src" / "pages" / "PlanningView.test.ts").write_text(
+        "test('summary chip', () => {})\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "tests" / "test_web_api_models.py").write_text(
+        "def test_snapshot_response_shape():\n    assert True\n",
+        encoding="utf-8",
+    )
+
+    agent = _make_agent(tmp_path)
+    candidates = agent.scan_repo_candidates(mental_model="")
+    understanding = agent.explore_repo(
+        requirements=(
+            "Add a compact session summary chip to the ActionBar and, if a backend payload response shape tweak "
+            "is needed, keep it localized to the existing web API serialization path while reusing the current "
+            "snapshot/download endpoints and adding tests."
+        ),
+        candidates=candidates,
+    )
+
+    assert "src/prscope/web/api.py" in understanding.file_contents
+    assert "tests/test_web_api_models.py" in understanding.file_contents
+    assert "src/prscope/web/frontend/src/pages/PlanningView.test.ts" in understanding.file_contents
+
+
 def test_classify_complexity_uses_module_count_and_keywords(tmp_path: Path) -> None:
     agent = _make_agent(tmp_path)
     simple = RepoUnderstanding(
@@ -599,6 +650,192 @@ def test_validate_draft_result_requires_explicit_snapshot_helper_reuse_for_diagn
     assert "missing_helper_reuse" in result.reason_codes
     assert any("missing explicit helper reuse reference for snapshot" in failure for failure in result.failure_messages)
     assert any("getSessionSnapshot" in failure for failure in result.failure_messages)
+
+
+def test_validate_draft_result_ignores_pascal_case_ui_labels_when_requiring_helper_reuse(tmp_path: Path) -> None:
+    agent = _make_agent(tmp_path)
+    repo_understanding = RepoUnderstanding(
+        entrypoints=["src/prscope/web/frontend/src/pages/PlanningView.tsx"],
+        core_modules=["src/prscope/web/frontend/src/pages/PlanningView.tsx"],
+        relevant_modules=[
+            "src/prscope/web/frontend/src/components/ActionBar.tsx",
+            "src/prscope/web/frontend/src/lib/api.ts",
+        ],
+        relevant_tests=["src/prscope/web/frontend/src/pages/PlanningView.test.ts"],
+        architecture_summary="frontend utilities menu flow",
+        risks=[],
+        file_contents={
+            "src/prscope/web/frontend/src/components/ActionBar.tsx": "import { Download } from 'lucide-react';",
+            "src/prscope/web/frontend/src/lib/api.ts": "export function downloadFile() {}\nexport function exportSession() {}",
+        },
+        from_mental_model=False,
+    )
+
+    result = agent.validate_draft_result(
+        plan_content=(
+            "# Draft\n\n## Summary\nx\n\n## Goals\n- x\n\n## Non-Goals\n- y\n\n## Files Changed\n"
+            "- `src/prscope/web/frontend/src/components/ActionBar.tsx`\n"
+            "- `src/prscope/web/frontend/src/pages/PlanningView.test.ts`\n\n"
+            "## Architecture\nReuse the existing export helpers.\n\n## Open Questions\n- None.\n"
+        ),
+        repo_understanding=repo_understanding,
+        draft_phase="planner",
+        min_grounding_ratio=0.45,
+        requirements_text=(
+            "Add export actions to the ActionBar, reuse existing download/export helpers, and add tests."
+        ),
+    )
+
+    assert "missing_helper_reuse" in result.reason_codes
+    assert any("downloadFile" in failure for failure in result.failure_messages)
+    assert not any("mention one of: Download" in failure for failure in result.failure_messages)
+
+
+def test_validate_draft_result_reads_prioritized_api_helper_file_for_mixed_utilities_prompt(tmp_path: Path) -> None:
+    agent = _make_agent(tmp_path)
+    repo_understanding = RepoUnderstanding(
+        entrypoints=["src/prscope/web/frontend/src/pages/PlanningView.tsx"],
+        core_modules=["src/prscope/web/frontend/src/pages/PlanningView.tsx"],
+        relevant_modules=[
+            "src/prscope/web/frontend/src/components/ActionBar.tsx",
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx",
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+            "src/prscope/web/frontend/src/components/IssueList.tsx",
+            "src/prscope/web/frontend/src/components/ReviewNotes.tsx",
+            "src/prscope/web/frontend/src/components/SessionBanner.tsx",
+            "src/prscope/web/frontend/src/lib/api.ts",
+        ],
+        relevant_tests=["src/prscope/web/frontend/src/pages/PlanningView.test.ts"],
+        architecture_summary="mixed utilities flow",
+        risks=[],
+        file_contents={
+            "src/prscope/web/frontend/src/components/ActionBar.tsx": "export function ActionBar() {}",
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx": "export function PlanPanel() {}",
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx": "const snapshot = getSessionSnapshot(id);",
+            "src/prscope/web/frontend/src/lib/api.ts": "export function getSessionSnapshot() {}",
+        },
+        from_mental_model=False,
+    )
+    agent.tool_executor.read_file = lambda path, max_lines=120: {
+        "content": (
+            "export function getSessionSnapshot() {}\n"
+            "export function exportSession() {}\n"
+            "export async function downloadFile() {}\n"
+        )
+        if path.endswith("/lib/api.ts")
+        else ""
+    }
+
+    result = agent.validate_draft_result(
+        plan_content=(
+            "# Draft\n\n## Summary\nx\n\n## Goals\n- x\n\n## Non-Goals\n- y\n\n## Files Changed\n"
+            "- `src/prscope/web/frontend/src/components/ActionBar.tsx`\n"
+            "- `src/prscope/web/frontend/src/pages/PlanningView.test.ts`\n\n"
+            "## Architecture\nReuse `getSessionSnapshot` without adding new routes.\n\n## Open Questions\n- None.\n"
+        ),
+        repo_understanding=repo_understanding,
+        draft_phase="planner",
+        min_grounding_ratio=0.45,
+        requirements_text=(
+            "Add a combined utilities menu that reuses existing export, download, and snapshot helpers, "
+            "keeps PlanPanel behavior intact, and adds tests."
+        ),
+    )
+
+    assert "missing_helper_reuse" in result.reason_codes
+    assert any("exportSession" in failure for failure in result.failure_messages)
+    assert any("downloadFile" in failure for failure in result.failure_messages)
+
+
+def test_validate_draft_result_requires_existing_web_api_path_for_localized_backend_payload_tweak(tmp_path: Path) -> None:
+    agent = _make_agent(tmp_path)
+    repo_understanding = RepoUnderstanding(
+        entrypoints=["src/prscope/web/api.py"],
+        core_modules=[
+            "src/prscope/web/api.py",
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+        ],
+        relevant_modules=[
+            "src/prscope/web/api.py",
+            "src/prscope/web/frontend/src/components/ActionBar.tsx",
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+        ],
+        relevant_tests=["tests/test_web_api_models.py", "src/prscope/web/frontend/src/pages/PlanningView.test.ts"],
+        architecture_summary="localized frontend with small backend payload tweak",
+        risks=[],
+        file_contents={
+            "src/prscope/web/api.py": "class SessionSnapshotResponse(BaseModel):\n    updated_at: str\n",
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx": "const snapshot = getSessionSnapshot(id);",
+        },
+        from_mental_model=False,
+    )
+
+    result = agent.validate_draft_result(
+        plan_content=(
+            "# Draft\n\n## Summary\nx\n\n## Goals\n- x\n\n## Non-Goals\n- y\n\n## Files Changed\n"
+            "- `src/prscope/web/frontend/src/components/ActionBar.tsx`\n"
+            "- `src/prscope/web/frontend/src/pages/PlanningView.test.ts`\n\n"
+            "## Architecture\nIf the payload shape needs a small adjustment, keep the backend response change localized.\n\n"
+            "## Open Questions\n- What payload fields need to be added for the summary chip?\n"
+        ),
+        repo_understanding=repo_understanding,
+        draft_phase="planner",
+        min_grounding_ratio=0.45,
+        requirements_text=(
+            "Add a compact summary chip in the ActionBar, reuse existing snapshot/download endpoints, and if a "
+            "backend payload response shape tweak is needed keep it localized to the existing web API serialization path."
+        ),
+    )
+
+    assert "missing_localized_backend_grounding" in result.reason_codes
+    assert any("`src/prscope/web/api.py`" in failure for failure in result.failure_messages)
+    assert any("`tests/test_web_api_models.py`" in failure for failure in result.failure_messages)
+
+
+def test_validate_draft_result_prefers_frontend_snapshot_helper_name_over_backend_snake_case(tmp_path: Path) -> None:
+    agent = _make_agent(tmp_path)
+    repo_understanding = RepoUnderstanding(
+        entrypoints=["src/prscope/web/api.py"],
+        core_modules=[
+            "src/prscope/web/api.py",
+            "src/prscope/web/frontend/src/lib/api.ts",
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+        ],
+        relevant_modules=[
+            "src/prscope/web/api.py",
+            "src/prscope/web/frontend/src/lib/api.ts",
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+        ],
+        relevant_tests=["src/prscope/web/frontend/src/pages/PlanningView.test.ts"],
+        architecture_summary="localized frontend snapshot reuse",
+        risks=[],
+        file_contents={
+            "src/prscope/web/api.py": "async def get_session_snapshot():\n    return {}\n",
+            "src/prscope/web/frontend/src/lib/api.ts": "export function getSessionSnapshot() {}\n",
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx": "const snapshot = getSessionSnapshot(id);\n",
+        },
+        from_mental_model=False,
+    )
+
+    result = agent.validate_draft_result(
+        plan_content=(
+            "# Draft\n\n## Summary\nx\n\n## Goals\n- x\n\n## Non-Goals\n- y\n\n## Files Changed\n"
+            "- `src/prscope/web/frontend/src/components/ActionBar.tsx`\n"
+            "- `src/prscope/web/frontend/src/pages/PlanningView.test.ts`\n\n"
+            "## Architecture\nReuse `get_session_snapshot` from the existing helper layer.\n\n## Open Questions\n- None.\n"
+        ),
+        repo_understanding=repo_understanding,
+        draft_phase="planner",
+        min_grounding_ratio=0.45,
+        requirements_text=(
+            "Add a compact diagnostics summary in the ActionBar, reuse the existing frontend snapshot helper, "
+            "and add tests."
+        ),
+    )
+
+    assert "missing_helper_reuse" in result.reason_codes
+    assert any("getSessionSnapshot" in failure for failure in result.failure_messages)
+    assert not any("get_session_snapshot" in failure for failure in result.failure_messages)
 
 
 @pytest.mark.asyncio
@@ -1401,6 +1638,266 @@ async def test_author_planner_pipeline_preserves_helper_owner_file_when_helper_r
     )
 
     assert "src/prscope/web/frontend/src/lib/api.ts" in result.plan
+
+
+@pytest.mark.asyncio
+async def test_author_planner_pipeline_deterministically_repairs_missing_helper_reuse_reference() -> None:
+    repo_understanding = RepoUnderstanding(
+        entrypoints=["src/prscope/web/frontend/src/pages/PlanningView.tsx"],
+        core_modules=[
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+            "src/prscope/web/frontend/src/lib/api.ts",
+        ],
+        relevant_modules=[
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+            "src/prscope/web/frontend/src/components/ActionBar.tsx",
+            "src/prscope/web/frontend/src/lib/api.ts",
+        ],
+        relevant_tests=["src/prscope/web/frontend/src/pages/PlanningView.test.ts"],
+        architecture_summary="frontend utilities flow",
+        risks=[],
+        file_contents={
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx": "queryFn: () => getSessionSnapshot(id)",
+            "src/prscope/web/frontend/src/components/ActionBar.tsx": "export function ActionBar() {}",
+            "src/prscope/web/frontend/src/lib/api.ts": (
+                "export function getSessionSnapshot() {}\n"
+                "export function exportSession() {}\n"
+                "export async function downloadFile() {}\n"
+            ),
+        },
+        from_mental_model=False,
+    )
+    validations = [
+        ValidationResult(
+            failure_messages=(
+                "missing explicit helper reuse reference for snapshot; mention one of: getSessionSnapshot",
+            ),
+            reason_codes=("missing_helper_reuse",),
+            retryable=True,
+            failure_count=1,
+        ),
+        ValidationResult(
+            failure_messages=(
+                "missing explicit helper reuse reference for snapshot; mention one of: getSessionSnapshot",
+            ),
+            reason_codes=("missing_helper_reuse",),
+            retryable=True,
+            failure_count=1,
+        ),
+        ValidationResult.success(),
+    ]
+
+    async def _draft_plan(**_: object) -> str:
+        return (
+            "# Draft\n\n## Summary\nx\n\n## Goals\n- x\n\n## Non-Goals\n- y\n\n## Changes\n- z\n\n"
+            "## Files Changed\n- `src/prscope/web/frontend/src/components/ActionBar.tsx`\n"
+            "- `src/prscope/web/frontend/src/pages/PlanningView.tsx`\n\n"
+            "## Architecture\nReuse `exportSession` and `downloadFile` without adding new routes.\n\n"
+            "## Open Questions\n- None.\n"
+        )
+
+    pipeline = AuthorPlannerPipeline(
+        tool_executor=SimpleNamespace(memory_block_callback=None, read_history={}),
+        scan_repo_candidates=lambda **_: RepoCandidates(
+            entrypoints=["src/prscope/web/frontend/src/pages/PlanningView.tsx"],
+            source_modules=[
+                "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+                "src/prscope/web/frontend/src/components/ActionBar.tsx",
+                "src/prscope/web/frontend/src/lib/api.ts",
+            ],
+            tests_and_config=["src/prscope/web/frontend/src/pages/PlanningView.test.ts"],
+            all_paths=[
+                "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+                "src/prscope/web/frontend/src/components/ActionBar.tsx",
+                "src/prscope/web/frontend/src/lib/api.ts",
+                "src/prscope/web/frontend/src/pages/PlanningView.test.ts",
+            ],
+        ),
+        explore_repo=lambda **_: repo_understanding,
+        classify_complexity=lambda **_: "moderate",
+        draft_plan=_draft_plan,
+        validate_draft=lambda **_: validations.pop(0),
+    )
+
+    result = await pipeline.run(
+        requirements="Add a combined utilities menu that reuses snapshot, export, and download helpers.",
+        min_grounding_ratio=0.45,
+        grounding_paths={"src/prscope/web/frontend/src/components/ActionBar.tsx"},
+        model_override=None,
+        rejection_counts={},
+        rejection_reasons=[],
+        timeout_seconds_override=None,
+    )
+
+    assert "getSessionSnapshot" in result.plan
+    assert "src/prscope/web/frontend/src/lib/api.ts" in result.plan
+    assert result.draft_diagnostics["quality_gate_failures"] == []
+
+
+@pytest.mark.asyncio
+async def test_author_planner_pipeline_deterministically_repairs_localized_backend_grounding() -> None:
+    repo_understanding = RepoUnderstanding(
+        entrypoints=["src/prscope/web/api.py"],
+        core_modules=[
+            "src/prscope/web/api.py",
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+        ],
+        relevant_modules=[
+            "src/prscope/web/api.py",
+            "src/prscope/web/frontend/src/components/ActionBar.tsx",
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+        ],
+        relevant_tests=["tests/test_web_api_models.py", "src/prscope/web/frontend/src/pages/PlanningView.test.ts"],
+        architecture_summary="localized frontend with small backend payload tweak",
+        risks=[],
+        file_contents={
+            "src/prscope/web/api.py": "class SessionSnapshotResponse(BaseModel):\n    updated_at: str\n",
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx": "const snapshot = getSessionSnapshot(id);",
+        },
+        from_mental_model=False,
+    )
+    validations = [
+        ValidationResult(
+            failure_messages=(
+                "localized backend payload/response change must reference the existing API path; mention `src/prscope/web/api.py`",
+                "localized backend payload/response change must reference the API model regression target; mention `tests/test_web_api_models.py`",
+            ),
+            reason_codes=("missing_localized_backend_grounding",),
+            retryable=True,
+            failure_count=2,
+        ),
+        ValidationResult(
+            failure_messages=(
+                "localized backend payload/response change must reference the existing API path; mention `src/prscope/web/api.py`",
+                "localized backend payload/response change must reference the API model regression target; mention `tests/test_web_api_models.py`",
+            ),
+            reason_codes=("missing_localized_backend_grounding",),
+            retryable=True,
+            failure_count=2,
+        ),
+        ValidationResult.success(),
+    ]
+
+    async def _draft_plan(**_: object) -> str:
+        return (
+            "# Draft\n\n## Summary\nx\n\n## Goals\n- x\n\n## Non-Goals\n- y\n\n## Changes\n- z\n\n"
+            "## Files Changed\n- `src/prscope/web/frontend/src/components/ActionBar.tsx`\n"
+            "- `src/prscope/web/frontend/src/pages/PlanningView.tsx`\n"
+            "- `src/prscope/web/frontend/src/pages/PlanningView.test.ts`\n\n"
+            "## Architecture\nIf the payload shape needs a small adjustment, keep the backend response change localized.\n\n"
+            "## Open Questions\n- What payload fields need to be added?\n"
+        )
+
+    pipeline = AuthorPlannerPipeline(
+        tool_executor=SimpleNamespace(memory_block_callback=None, read_history={}),
+        scan_repo_candidates=lambda **_: RepoCandidates(
+            entrypoints=["src/prscope/web/api.py"],
+            source_modules=[
+                "src/prscope/web/api.py",
+                "src/prscope/web/frontend/src/components/ActionBar.tsx",
+                "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+            ],
+            tests_and_config=["tests/test_web_api_models.py", "src/prscope/web/frontend/src/pages/PlanningView.test.ts"],
+            all_paths=[
+                "src/prscope/web/api.py",
+                "src/prscope/web/frontend/src/components/ActionBar.tsx",
+                "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+                "tests/test_web_api_models.py",
+                "src/prscope/web/frontend/src/pages/PlanningView.test.ts",
+            ],
+        ),
+        explore_repo=lambda **_: repo_understanding,
+        classify_complexity=lambda **_: "moderate",
+        draft_plan=_draft_plan,
+        validate_draft=lambda **_: validations.pop(0),
+    )
+
+    result = await pipeline.run(
+        requirements=(
+            "Add a compact summary chip in the ActionBar and, if a backend payload response shape tweak is needed, "
+            "keep it localized to the existing web API serialization path."
+        ),
+        min_grounding_ratio=0.45,
+        grounding_paths={"src/prscope/web/frontend/src/components/ActionBar.tsx"},
+        model_override=None,
+        rejection_counts={},
+        rejection_reasons=[],
+        timeout_seconds_override=None,
+    )
+
+    assert "src/prscope/web/api.py" in result.plan
+    assert "tests/test_web_api_models.py" in result.plan
+    assert result.draft_diagnostics["quality_gate_failures"] == []
+
+
+@pytest.mark.asyncio
+async def test_author_planner_pipeline_preserves_planpanel_file_when_requirements_anchor_compatibility() -> None:
+    repo_understanding = RepoUnderstanding(
+        entrypoints=["src/prscope/web/frontend/src/pages/PlanningView.tsx"],
+        core_modules=[
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx",
+        ],
+        relevant_modules=[
+            "src/prscope/web/frontend/src/components/ActionBar.tsx",
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx",
+            "src/prscope/web/frontend/src/lib/api.ts",
+        ],
+        relevant_tests=["src/prscope/web/frontend/src/pages/PlanningView.test.ts"],
+        architecture_summary="localized summary chip with PlanPanel compatibility",
+        risks=[],
+        file_contents={
+            "src/prscope/web/frontend/src/components/ActionBar.tsx": "export function ActionBar() {}",
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx": "export function PlanPanel() {}",
+            "src/prscope/web/frontend/src/lib/api.ts": "export function getSessionSnapshot() {}\nexport async function downloadFile() {}\n",
+        },
+        from_mental_model=False,
+    )
+    validations = [ValidationResult.success(), ValidationResult.success()]
+
+    async def _draft_plan(**_: object) -> str:
+        return (
+            "# Draft\n\n## Summary\nx\n\n## Goals\n- x\n\n## Non-Goals\n- y\n\n## Changes\n- Keep PlanPanel behavior intact.\n\n"
+            "## Files Changed\n- `src/prscope/web/frontend/src/components/ActionBar.tsx`\n"
+            "- `src/prscope/web/frontend/src/lib/api.ts`\n\n"
+            "## Architecture\nPlanPanel compatibility must remain intact while reusing existing helpers.\n\n"
+            "## Open Questions\n- None.\n"
+        )
+
+    pipeline = AuthorPlannerPipeline(
+        tool_executor=SimpleNamespace(memory_block_callback=None, read_history={}),
+        scan_repo_candidates=lambda **_: RepoCandidates(
+            entrypoints=["src/prscope/web/frontend/src/pages/PlanningView.tsx"],
+            source_modules=[
+                "src/prscope/web/frontend/src/components/ActionBar.tsx",
+                "src/prscope/web/frontend/src/components/PlanPanel.tsx",
+                "src/prscope/web/frontend/src/lib/api.ts",
+            ],
+            tests_and_config=["src/prscope/web/frontend/src/pages/PlanningView.test.ts"],
+            all_paths=[
+                "src/prscope/web/frontend/src/components/ActionBar.tsx",
+                "src/prscope/web/frontend/src/components/PlanPanel.tsx",
+                "src/prscope/web/frontend/src/lib/api.ts",
+                "src/prscope/web/frontend/src/pages/PlanningView.test.ts",
+            ],
+        ),
+        explore_repo=lambda **_: repo_understanding,
+        classify_complexity=lambda **_: "simple",
+        draft_plan=_draft_plan,
+        validate_draft=lambda **_: validations.pop(0),
+    )
+
+    result = await pipeline.run(
+        requirements="Add a compact summary chip to the ActionBar and keep current PlanPanel export and health behavior working during rollout.",
+        min_grounding_ratio=0.45,
+        grounding_paths={"src/prscope/web/frontend/src/components/ActionBar.tsx"},
+        model_override=None,
+        rejection_counts={},
+        rejection_reasons=[],
+        timeout_seconds_override=None,
+    )
+
+    assert "src/prscope/web/frontend/src/components/PlanPanel.tsx" in result.plan
 
 
 @pytest.mark.asyncio

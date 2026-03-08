@@ -23,6 +23,7 @@ _RETRYABLE_REASON_CODES = frozenset(
         "missing_tests",
         "missing_helper_reuse",
         "localized_scope_drift",
+        "missing_localized_backend_grounding",
     }
 )
 
@@ -75,17 +76,26 @@ class AuthorValidationService:
             str(path).strip()
             for path in (
                 list(getattr(repo_understanding, "relevant_modules", []))
+                + list(getattr(repo_understanding, "core_modules", []))
                 + list(getattr(repo_understanding, "entrypoints", []))
+                + list(file_contents.keys())
             )
             if str(path).strip()
         ]
-        for path in candidate_paths[:6]:
+        prioritized_paths = list(dict.fromkeys(candidate_paths))
+        prioritized_paths.sort(
+            key=lambda path: (
+                0 if path.lower().endswith("/lib/api.ts") else 1,
+                0 if path.lower().endswith(("planningview.tsx", "actionbar.tsx", "planpanel.tsx", "/lib/api.ts")) else 1,
+            )
+        )
+        for path in prioritized_paths[:8]:
             lowered = path.lower()
             should_read = lowered.endswith(("planningview.tsx", "actionbar.tsx", "planpanel.tsx", "/lib/api.ts"))
             if not should_read:
                 continue
             existing = str(file_contents.get(path, "") or "").strip()
-            if existing and any(
+            if existing and all(
                 token in existing.lower() for token in ("getsessionsnapshot", "exportsession", "downloadfile")
             ):
                 continue
@@ -103,6 +113,13 @@ class AuthorValidationService:
             for match in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\b", text):
                 lowered = match.lower()
                 if not any(token in lowered for token in ("snapshot", "diagnostic", "export", "download")):
+                    continue
+                if match[0].isupper():
+                    continue
+                if not lowered.startswith(("get", "export", "download")):
+                    continue
+                is_helper_like = "_" in match or any(ch.isupper() for ch in match[1:])
+                if not is_helper_like:
                     continue
                 if lowered in seen:
                     continue
@@ -315,11 +332,74 @@ class AuthorValidationService:
             matching_helpers = [name for name in helper_names if token in name.lower()]
             if not matching_helpers:
                 continue
+            camel_case_helpers = [name for name in matching_helpers if "_" not in name]
+            if camel_case_helpers:
+                matching_helpers = camel_case_helpers
             if any(name.lower() in lowered_plan for name in matching_helpers):
                 continue
             candidates = ", ".join(matching_helpers[:3])
             failures.append(f"missing explicit helper reuse reference for {token}; mention one of: {candidates}")
         return failures
+
+    @staticmethod
+    def localized_backend_grounding_failures(
+        plan_content: str,
+        repo_understanding: Any,
+        requirements_text: str | None,
+    ) -> list[str]:
+        requirements = str(requirements_text or "").lower()
+        if not is_localized_frontend_request(requirements):
+            return []
+        if not any(token in requirements for token in ("payload", "response", "serialization", "serializer", "shape")):
+            return []
+        verified_backend_paths = {
+            str(path).strip()
+            for path in (
+                list(getattr(repo_understanding, "entrypoints", []))
+                + list(getattr(repo_understanding, "core_modules", []))
+                + list(getattr(repo_understanding, "relevant_modules", []))
+            )
+            if str(path).strip().endswith("/web/api.py")
+        }
+        if not verified_backend_paths:
+            return []
+        lowered_plan = str(plan_content or "").lower()
+        backend_change_markers = (
+            "payload",
+            "response",
+            "serialization",
+            "serializer",
+            "shape tweak",
+            "shape change",
+            "format change",
+            "field change",
+            "backend payload",
+            "api response",
+        )
+        mentions_backend_adjustment = any(marker in lowered_plan for marker in backend_change_markers)
+        mentions_open_question = "open questions" in lowered_plan and any(
+            marker in lowered_plan for marker in ("payload", "response", "format")
+        )
+        if not (mentions_backend_adjustment or mentions_open_question):
+            return []
+        referenced = extract_file_references(plan_content)
+        missing: list[str] = []
+        if not any(path in referenced for path in verified_backend_paths):
+            target = sorted(verified_backend_paths)[0]
+            missing.append(
+                f"localized backend payload/response change must reference the existing API path; mention `{target}`"
+            )
+        relevant_api_tests = [
+            str(path).strip()
+            for path in getattr(repo_understanding, "relevant_tests", [])
+            if str(path).strip().endswith("test_web_api_models.py")
+        ]
+        if relevant_api_tests and not any(path in referenced for path in relevant_api_tests):
+            target = relevant_api_tests[0]
+            missing.append(
+                f"localized backend payload/response change must reference the API model regression target; mention `{target}`"
+            )
+        return missing
 
     @staticmethod
     def missing_required_sections(plan_content: str, draft_phase: Literal["planner", "refiner"]) -> list[str]:
@@ -435,6 +515,8 @@ class AuthorValidationService:
             return "missing_helper_reuse"
         if "localized ui/api draft introduced" in normalized:
             return "localized_scope_drift"
+        if normalized.startswith("localized backend payload/response change must reference "):
+            return "missing_localized_backend_grounding"
         return "validation_failure"
 
     @classmethod
@@ -468,6 +550,7 @@ class AuthorValidationService:
         failures.extend(self.localized_ui_scope_failures(plan_content, requirements_text))
         failures.extend(self.missing_test_target_failures(plan_content, repo_understanding, requirements_text))
         failures.extend(self.missing_helper_reuse_failures(plan_content, repo_understanding, requirements_text))
+        failures.extend(self.localized_backend_grounding_failures(plan_content, repo_understanding, requirements_text))
         if min_grounding_ratio is not None:
             verified_paths = (
                 set(repo_understanding.file_contents.keys())

@@ -244,6 +244,8 @@ class AuthorPlannerPipeline:
                 hints.append(f"Reference at least one exact verified test target in the plan: {candidates}.")
             elif text.startswith("missing explicit helper reuse reference for "):
                 hints.append(text.replace("missing explicit helper reuse reference for ", "Mention exact verified helper reuse for "))
+            elif text.startswith("localized backend payload/response change must reference "):
+                hints.append(text.replace("must reference", "should explicitly reference"))
             elif text.startswith("replace unverified path "):
                 hints.append(text)
         return tuple(dict.fromkeys(hints))
@@ -279,6 +281,46 @@ class AuthorPlannerPipeline:
         return plan_content[: match.start(1)] + updated_section + plan_content[match.end(1) :]
 
     @staticmethod
+    def _insert_helper_reuse_note(plan_content: str, helper_name: str, rationale: str) -> str:
+        if not helper_name or helper_name in plan_content:
+            return plan_content
+        pattern = re.compile(r"(^##\s+Architecture\b.*?)(?=^##\s+|\Z)", re.IGNORECASE | re.MULTILINE | re.DOTALL)
+        match = pattern.search(plan_content)
+        if not match:
+            return plan_content
+        section = match.group(1)
+        note = f"- Reuse `{helper_name}` {rationale}\n"
+        if note.strip() in section:
+            return plan_content
+        updated_section = section.rstrip() + "\n" + note
+        return plan_content[: match.start(1)] + updated_section + plan_content[match.end(1) :]
+
+    @staticmethod
+    def _helper_reuse_candidates(validation_result: ValidationResult) -> tuple[tuple[str, str], ...]:
+        repairs: list[tuple[str, str]] = []
+        for failure in validation_result.failure_messages:
+            match = re.match(
+                r"missing explicit helper reuse reference for ([a-z]+); mention one of: ([A-Za-z0-9_, ]+)",
+                str(failure or "").strip(),
+            )
+            if not match:
+                continue
+            concept = match.group(1).strip()
+            helper_name = match.group(2).split(",", 1)[0].strip()
+            if concept and helper_name:
+                repairs.append((concept, helper_name))
+        return tuple(dict.fromkeys(repairs))
+
+    @staticmethod
+    def _backend_grounding_candidates(validation_result: ValidationResult) -> tuple[str, ...]:
+        candidates: list[str] = []
+        for failure in validation_result.failure_messages:
+            match = re.search(r"mention `([^`]+)`", str(failure or "").strip())
+            if match:
+                candidates.append(match.group(1).strip())
+        return tuple(dict.fromkeys(path for path in candidates if path))
+
+    @staticmethod
     def _strip_localized_scope_drift_lines(plan_content: str) -> str:
         filtered_lines = [
             line
@@ -304,6 +346,28 @@ class AuthorPlannerPipeline:
             repaired = self._insert_test_target_into_files_changed(repaired, evidence_bundle.test_targets[0])
         if "localized_scope_drift" in validation_result.reason_codes:
             repaired = self._strip_localized_scope_drift_lines(repaired)
+        if "missing_helper_reuse" in validation_result.reason_codes:
+            for concept, helper_name in self._helper_reuse_candidates(validation_result):
+                repaired = self._insert_helper_reuse_note(
+                    repaired,
+                    helper_name,
+                    f"from `src/prscope/web/frontend/src/lib/api.ts` for the existing {concept} flow.",
+                )
+        if "missing_localized_backend_grounding" in validation_result.reason_codes:
+            for path in self._backend_grounding_candidates(validation_result):
+                rationale = (
+                    "Keep the small backend payload/response adjustment localized to the existing web API path."
+                    if path.endswith("/web/api.py")
+                    else "Cover the localized backend payload/response adjustment with the existing API model regression test."
+                )
+                repaired = self._insert_path_into_files_changed(repaired, path, rationale)
+        planpanel_path = "src/prscope/web/frontend/src/components/PlanPanel.tsx"
+        if "planpanel" in requirements.lower() and "PlanPanel" in repaired and planpanel_path in evidence_bundle.relevant_files:
+            repaired = self._insert_path_into_files_changed(
+                repaired,
+                planpanel_path,
+                "Preserve existing PlanPanel export and health behavior while wiring the localized UI change.",
+            )
         helper_owner_path = "src/prscope/web/frontend/src/lib/api.ts"
         helper_tokens = ("exportSession", "downloadFile", "getSessionSnapshot")
         if (

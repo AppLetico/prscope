@@ -259,8 +259,13 @@ class AuthorDiscoveryService:
         seeded_paths = extract_paths_from_mental_model(mental_model or "")
         req_keywords = requirements_keywords(requirements)
         localized_frontend = is_localized_frontend_request(requirements)
+        needs_backend_contract_test = bool(
+            localized_frontend and {"payload", "response", "serialization", "serializer", "shape"} & req_keywords
+        )
         if localized_frontend and max_file_reads < 6:
             max_file_reads = 6
+        if needs_backend_contract_test and max_file_reads < 7:
+            max_file_reads = 7
         search_roots: list[str | None] = []
         top_level_roots = []
         for path in [*candidates.source_modules, *candidates.tests_and_config]:
@@ -338,8 +343,17 @@ class AuthorDiscoveryService:
                     score += 5
                 if "endpoint" in req_keywords and lower_path.endswith("/web/api.py"):
                     score += 4
+                if {"payload", "response", "serialization", "serializer", "shape"} & req_keywords:
+                    if lower_path.endswith("/web/api.py"):
+                        score += 6
+                    if path in candidates.tests_and_config and "web_api_models" in lower_path:
+                        score += 5
                 if path in candidates.tests_and_config and "planningview" in lower_path:
                     score += 4
+                if path in candidates.tests_and_config and any(
+                    marker in lower_path for marker in ("planningview", "actionbar", "planpanel")
+                ):
+                    score += 3
                 if path in candidates.tests_and_config and "decisiongraphrender" in lower_path and not (
                     {"decision", "graph"} & req_keywords
                 ):
@@ -368,16 +382,28 @@ class AuthorDiscoveryService:
         test_candidates = [path for _, path in scored_paths if path in candidates.tests_and_config]
         selected: list[str] = []
         if source_candidates:
-            reserved_for_test = 1 if wants_tests and test_candidates and max_file_reads > 1 else 0
+            reserved_for_test = 0
+            if wants_tests and test_candidates and max_file_reads > 1:
+                reserved_for_test = 1
+                if needs_backend_contract_test and len(test_candidates) > 1 and max_file_reads > 2:
+                    reserved_for_test = 2
             source_budget = max(1, max_file_reads - reserved_for_test)
             selected.extend(source_candidates[:source_budget])
         if wants_tests and test_candidates:
             source_token_pool: set[str] = set()
             for path in selected or source_candidates[:2]:
                 source_token_pool |= path_tokens(path)
+            selected_has_web_api = any(path.lower().endswith("/web/api.py") for path in selected)
             ranked_tests = sorted(
                 test_candidates,
                 key=lambda path: (
+                    -(
+                        1
+                        if needs_backend_contract_test
+                        and selected_has_web_api
+                        and "web_api_models" in path.lower()
+                        else 0
+                    ),
                     -len(path_tokens(path) & source_token_pool),
                     -(score_by_path.get(path, 0)),
                     path,
