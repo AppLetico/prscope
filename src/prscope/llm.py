@@ -24,6 +24,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .config import LLMConfig
+from .model_catalog import litellm_model_name
 
 logger = logging.getLogger(__name__)
 
@@ -365,7 +366,7 @@ class LLMClient:
             elif model_lower.startswith(("claude-",)):
                 return bool(os.environ.get("ANTHROPIC_API_KEY"))
             elif model_lower.startswith(("gemini-",)):
-                return bool(os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY"))
+                return bool(os.environ.get("GEMINI_API_KEY"))
             elif model_lower.startswith(("ollama",)):
                 return True
             else:
@@ -421,7 +422,7 @@ class LLMClient:
 
         try:
             response = litellm.completion(
-                model=self.model,
+                model=litellm_model_name(self.model),
                 messages=[
                     {"role": "system", "content": ANALYSIS_SYSTEM_PROMPT},
                     {"role": "user", "content": user_prompt},

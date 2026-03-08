@@ -4,6 +4,7 @@ import asyncio
 import json
 from typing import Any
 
+from ....model_catalog import litellm_model_name, model_provider
 from ....pricing import MODEL_CONTEXT_WINDOWS
 from ..telemetry import completion_telemetry
 from ..tools import CODEBASE_TOOLS
@@ -165,11 +166,12 @@ class DiscoveryLLMClient:
 
         last_error: Exception | None = None
         for idx, model in enumerate(models_to_try):
+            litellm_model = litellm_model_name(model)
             try:
                 llm_started = asyncio.get_running_loop().time()
                 response = await asyncio.to_thread(
                     litellm.completion,
-                    model=model,
+                    model=litellm_model,
                     **kwargs,
                 )
                 llm_elapsed_ms = (asyncio.get_running_loop().time() - llm_started) * 1000.0
@@ -180,6 +182,7 @@ class DiscoveryLLMClient:
                         "type": "token_usage",
                         "session_stage": "discovery",
                         "model": model,
+                        "model_provider": model_provider(model),
                         "prompt_tokens": telemetry.usage.prompt_tokens,
                         "completion_tokens": telemetry.usage.completion_tokens,
                         "call_cost_usd": telemetry.cost.total_cost_usd,

@@ -48,6 +48,13 @@ planning:
   # author_model: gpt-4o-mini    # drafts + discovery (default)
   # critic_model: gpt-4o-mini    # critic (default)
   # memory_model: gpt-4o-mini    # optional; codebase memory build (defaults to author_model)
+  # Current Google option: set GEMINI_API_KEY in .env
+  # author_model: gemini-2.5-flash
+  # critic_model: gemini-2.5-flash
+  # memory_model: gemini-2.5-flash
+  author_model: gpt-4o-mini
+  critic_model: gpt-4o-mini
+  memory_model: gpt-4o-mini
   author_call_timeout_seconds: 50
   memory_prep_timeout_seconds: 120
   initial_draft_timeout_seconds: 45

@@ -16,6 +16,7 @@ from typing import Any, Callable
 import yaml
 
 from .config import PlanningConfig, RepoProfile
+from .model_catalog import litellm_model_name, model_provider
 from .planning.scanners import ScannerBackend, get_scanner
 from .pricing import MODEL_CONTEXT_WINDOWS, estimate_cost_usd
 
@@ -428,7 +429,7 @@ class MemoryStore:
 
         def _run_completion() -> Any:
             return litellm.completion(
-                model=self.config.memory_model,
+                model=litellm_model_name(self.config.memory_model),
                 messages=[
                     {
                         "role": "system",
@@ -468,6 +469,7 @@ class MemoryStore:
                 "session_stage": "memory",
                 "memory_block": block_name,
                 "model": model,
+                "model_provider": model_provider(model),
                 "prompt_tokens": prompt_tokens,
                 "completion_tokens": completion_tokens,
                 "call_cost_usd": estimate.total_cost_usd,

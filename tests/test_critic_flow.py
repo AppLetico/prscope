@@ -314,6 +314,37 @@ async def test_run_critic_filters_overengineering_for_localized_reuse_requests(t
 
 
 @pytest.mark.asyncio
+async def test_run_critic_falls_back_after_google_json_contract_failures(tmp_path):
+    agent = CriticAgent(
+        config=PlanningConfig(critic_model="gemini-2.5-flash"),
+        repo=RepoProfile(name="alpha", path=str(Path(tmp_path))),
+    )
+    calls: list[str | None] = []
+
+    async def fake_call_with_telemetry(*, messages, temperature, model_override=None):  # type: ignore[no-untyped-def]
+        del messages, temperature
+        calls.append(model_override)
+        if model_override == "gemini-2.5-flash":
+            return '{"strengths": ["Clear decomposition"]', None
+        return _review_json(), None
+
+    agent._call_with_telemetry = fake_call_with_telemetry  # type: ignore[method-assign]
+    result = await agent.run_critic(
+        requirements="R",
+        plan_content="P",
+        manifesto="M",
+        architecture="A",
+        constraints=[],
+        max_retries=1,
+        model_override="gemini-2.5-flash",
+        fallback_model_override="gpt-4o-mini",
+    )
+
+    assert result.design_quality_score == 7.5
+    assert calls == ["gemini-2.5-flash", "gemini-2.5-flash", "gpt-4o-mini"]
+
+
+@pytest.mark.asyncio
 async def test_run_critic_raises_on_missing_required_field(tmp_path):
     repo = RepoProfile(name="alpha", path=str(Path(tmp_path)))
     agent = CriticAgent(config=PlanningConfig(critic_model="gpt-4o-mini"), repo=repo)

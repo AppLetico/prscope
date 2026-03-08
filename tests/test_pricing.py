@@ -5,18 +5,16 @@ from prscope.pricing import MODEL_CONTEXT_WINDOWS, MODEL_PRICING, estimate_cost_
 
 # Keep this list intentionally small. If a model lacks a known context window,
 # add it here with a clear decision rather than silently drifting.
-ALLOWED_UNKNOWN_CONTEXT_WINDOWS = {
-    "gpt-5.2",
-    "gpt-5.3-codex",
-}
+ALLOWED_UNKNOWN_CONTEXT_WINDOWS: set[str] = set()
 
 
 def test_model_pricing_contains_new_frontier_models():
     assert MODEL_PRICING["o3"] == (2.00, 8.00)
     assert MODEL_PRICING["o4-mini"] == (1.10, 4.40)
+    assert MODEL_PRICING["gpt-5.4"] == (2.50, 15.00)
     assert MODEL_PRICING["claude-sonnet-4-6"] == (3.00, 15.00)
     assert MODEL_PRICING["claude-opus-4-6"] == (5.00, 25.00)
-    assert MODEL_PRICING["gemini-3.1-pro"] == (2.00, 12.00)
+    assert MODEL_PRICING["gemini-3.1-pro-preview"] == (2.00, 12.00)
 
 
 def test_estimate_cost_uses_per_million_rates():

@@ -8,10 +8,11 @@ import pytest
 
 from prscope.config import PlanningConfig, PrscopeConfig, RepoProfile
 from prscope.planning.runtime.author import RepairPlan, RevisionResult
-from prscope.planning.runtime.authoring.models import PlanDocument, render_markdown
+from prscope.planning.runtime.authoring.models import PlanDocument, ValidationResult, render_markdown
 from prscope.planning.runtime.critic import CriticResult, ReviewResult
 from prscope.planning.runtime.discovery import DiscoveryQuestion, DiscoveryTurnResult, QuestionOption
 from prscope.planning.runtime.orchestration import PlanningRuntime
+from prscope.planning.runtime.pipeline.stages import PlanningStages
 from prscope.planning.runtime.pipeline.round_context import PlanningRoundContext
 from prscope.store import Store
 
@@ -33,7 +34,23 @@ async def test_round_returns_quickly_when_clarification_requested(tmp_path):
         seed_type="chat",
         status="refining",
     )
-    runtime._core(session.id).save_plan_version("# Plan\n\nInitial", round_number=1)
+    initial_plan = PlanDocument(
+        title="Plan",
+        summary="Keep the current rollout scoped.",
+        goals="- Preserve the existing endpoint behavior.",
+        non_goals="- Do not broaden the scope without clarification.",
+        files_changed="- `src/prscope/web/api.py`: Keep the existing route wiring intact.",
+        architecture="Keep the existing route and rollout shape stable until clarification arrives.",
+        implementation_steps="1. Wait for clarification before broadening rollout assumptions.",
+        test_strategy="- Assert the current route behavior remains unchanged.",
+        rollback_plan="- If rollout assumptions change unexpectedly, restore the previous plan wording.",
+        open_questions="- None.",
+    )
+    runtime._core(session.id).save_plan_version(
+        render_markdown(initial_plan),
+        round_number=1,
+        plan_document=initial_plan,
+    )
 
     async def fake_run_critic(**kwargs):  # type: ignore[no-untyped-def]
         del kwargs
@@ -820,6 +837,505 @@ async def test_full_revision_reconciles_decision_graph_before_persisting(tmp_pat
     assert graph_payload["nodes"]["architecture.database"]["value"] == "PostgreSQL"
 
 
+@pytest.mark.asyncio
+async def test_revise_plan_retries_when_full_refiner_validation_fails(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    runtime = PlanningRuntime(
+        store=store,
+        config=PrscopeConfig(
+            local_repo=str(tmp_path),
+            planning=PlanningConfig(author_model="gpt-4o-mini", critic_model="gpt-4o-mini"),
+        ),
+        repo=RepoProfile(name="repo", path=str(tmp_path)),
+    )
+    session = store.create_planning_session(
+        repo_name="repo",
+        title="retry-refiner-validation",
+        requirements=(
+            "Update the Planning UI to show the last export result and disable the export action while an export is "
+            "already in progress. Reuse the existing exportSession and downloadFile helpers, preserve current "
+            "PlanPanel behavior, and keep the change localized. Do not introduce new hooks, contexts, shared state "
+            "layers, or background polling."
+        ),
+        seed_type="requirements",
+        status="refining",
+    )
+    plan = PlanDocument(
+        title="Plan",
+        summary="Keep the change localized.",
+        goals="- Show the last export result.",
+        non_goals="- Do not introduce new hooks, contexts, shared state layers, or background polling.",
+        files_changed="- `src/prscope/web/frontend/src/components/PlanPanel.tsx`\n- `src/prscope/web/frontend/src/lib/api.ts`",
+        architecture="Use the existing `PlanPanel` wiring.",
+        implementation_steps="",
+        test_strategy="",
+        rollback_plan="",
+        open_questions="- None.",
+    )
+    store_plan = runtime._core(session.id).save_plan_version(render_markdown(plan), round_number=1, plan_document=plan)
+    runtime.store.update_plan_version_artifacts(
+        version_id=store_plan.id,
+        decision_graph_json=json.dumps({"nodes": {}, "edges": []}),
+        followups_json=json.dumps({"questions": []}),
+    )
+    runtime.store.update_planning_session(session.id, current_round=1)
+
+    state = runtime._state(session.id)
+    state.accessed_paths.update(
+        {
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx",
+            "src/prscope/web/frontend/src/lib/api.ts",
+            "src/prscope/web/frontend/src/pages/PlanningView.test.ts",
+        }
+    )
+    ctx = PlanningRoundContext(
+        core=runtime._core(session.id),
+        session_id=session.id,
+        round_number=2,
+        requirements=session.requirements,
+        state=state,
+        issue_tracker=state.issue_tracker,
+        selected_author_model="gpt-4o-mini",
+        selected_critic_model="gpt-4o-mini",
+        event_callback=None,
+    )
+    review_result = ReviewResult(
+        strengths=[],
+        architectural_concerns=["The revised plan still needs concrete implementation and test sections."],
+        risks=[],
+        simplification_opportunities=[],
+        blocking_issues=[],
+        reviewer_questions=[],
+        recommended_changes=[],
+        design_quality_score=6.0,
+        confidence="medium",
+        review_complete=False,
+        simplest_possible_design=None,
+        primary_issue="The revised plan still needs concrete implementation and test sections.",
+        resolved_issues=[],
+        constraint_violations=[],
+        issue_priority=[],
+        prose="The revised plan still needs concrete implementation and test sections.",
+        parse_error=None,
+    )
+    repair_plan = RepairPlan(
+        problem_understanding="Restore the missing execution details.",
+        accepted_issues=["The revised plan still needs concrete implementation and test sections."],
+        rejected_issues=[],
+        root_causes=["The current plan is still at planner-draft completeness."],
+        repair_strategy="Fill the missing refiner sections without broadening scope.",
+        target_sections=["implementation_steps", "test_strategy", "rollback_plan"],
+        revision_plan="Restore the missing refiner sections.",
+    )
+
+    revise_calls: list[dict[str, object]] = []
+    responses = [
+        RevisionResult(
+            problem_understanding="First pass keeps the plan too thin.",
+            updates={
+                "architecture": "Keep the change localized to `PlanPanel` and existing helper wiring.",
+            },
+            justification={"architecture": "Keeps the plan scoped."},
+            review_prediction="Reviewer will still ask for missing sections.",
+        ),
+        RevisionResult(
+            problem_understanding="Second pass restores the missing sections.",
+            updates={
+                "architecture": "Keep the change localized to `PlanPanel` and existing helper wiring.",
+                "implementation_steps": (
+                    "1. Update `PlanPanel.tsx` to render the last export result.\n"
+                    "2. Disable the export action while the existing export request is in progress.\n"
+                    "3. Reuse `exportSession` and `downloadFile` exactly as already wired."
+                ),
+                "test_strategy": (
+                    "- Assert the export action is disabled while the request is in progress.\n"
+                    "- Assert the last export result is rendered after a successful export."
+                ),
+                "rollback_plan": (
+                    "- If the localized export UI behavior regresses, revert the `PlanPanel.tsx` wiring and restore the previous export button behavior."
+                ),
+            },
+            justification={"implementation_steps": "Restores missing execution detail."},
+            review_prediction="Reviewer should accept the completed plan.",
+        ),
+    ]
+
+    async def fake_revise_plan(**kwargs):  # type: ignore[no-untyped-def]
+        revise_calls.append(kwargs)
+        return responses.pop(0)
+
+    runtime.author.revise_plan = fake_revise_plan  # type: ignore[method-assign]
+
+    def fake_validate_refinement_result(**kwargs):  # type: ignore[no-untyped-def]
+        plan_content = str(kwargs.get("plan_content", "") or "")
+        if "## Implementation Steps" in plan_content and "## Test Strategy" in plan_content and "## Rollback Plan" in plan_content:
+            return ValidationResult.success()
+        return ValidationResult(
+            failure_messages=(
+                "required section is empty: Implementation Steps",
+                "required section is empty: Test Strategy",
+                "required section is empty: Rollback Plan",
+            ),
+            reason_codes=("missing_sections",),
+            retryable=True,
+            failure_count=3,
+        )
+
+    runtime.author.validate_refinement_result = fake_validate_refinement_result  # type: ignore[method-assign]
+
+    async def emit_tool(*args, **kwargs):  # type: ignore[no-untyped-def]
+        del args, kwargs
+
+    updated_markdown, changed_sections, _ = await runtime._stages.revise_plan(  # noqa: SLF001
+        ctx=ctx,
+        current_plan_doc=plan,
+        repair_plan=repair_plan,
+        review_result=review_result,
+        emit_tool=emit_tool,
+    )
+
+    assert len(revise_calls) == 1
+    first_hints = revise_calls[0].get("revision_hints")
+    assert isinstance(first_hints, list)
+    assert "required section is empty: Implementation Steps" in first_hints
+    assert "required section is empty: Test Strategy" in first_hints
+    assert "required section is empty: Rollback Plan" in first_hints
+    assert "## Implementation Steps" in updated_markdown
+    assert "## Test Strategy" in updated_markdown
+    assert "## Rollback Plan" in updated_markdown
+    assert "implementation_steps" in changed_sections
+    assert "test_strategy" in changed_sections
+    assert "rollback_plan" in changed_sections
+
+
+@pytest.mark.asyncio
+async def test_revise_plan_deterministically_supplements_partial_refiner_output(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    runtime = PlanningRuntime(
+        store=store,
+        config=PrscopeConfig(
+            local_repo=str(tmp_path),
+            planning=PlanningConfig(author_model="gpt-4o-mini", critic_model="gpt-4o-mini"),
+        ),
+        repo=RepoProfile(name="repo", path=str(tmp_path)),
+    )
+    session = store.create_planning_session(
+        repo_name="repo",
+        title="supplement-partial-refiner",
+        requirements=(
+            "Update the Planning UI to show the last export result and disable the export action while an export is "
+            "already in progress. Reuse the existing exportSession and downloadFile helpers, preserve current "
+            "PlanPanel behavior, and keep the change localized. Do not introduce new hooks, contexts, shared state "
+            "layers, or background polling. Include focused frontend tests and any minimal backend contract test only "
+            "if the response shape must change."
+        ),
+        seed_type="requirements",
+        status="refining",
+    )
+    plan = PlanDocument(
+        title="Plan",
+        summary="Keep the change localized.",
+        goals="- Show the last export result.",
+        non_goals="- Do not introduce new hooks, contexts, shared state layers, or background polling.",
+        files_changed=(
+            "- `src/prscope/web/frontend/src/components/PlanPanel.tsx`\n"
+            "- `src/prscope/web/frontend/src/lib/api.ts`\n"
+            "- `src/prscope/web/frontend/src/pages/PlanningView.test.ts`"
+        ),
+        architecture="Keep the change localized to existing `PlanPanel` wiring and helper reuse.",
+        implementation_steps="",
+        test_strategy="",
+        rollback_plan="",
+        open_questions="- None.",
+    )
+    store_plan = runtime._core(session.id).save_plan_version(render_markdown(plan), round_number=1, plan_document=plan)
+    runtime.store.update_plan_version_artifacts(
+        version_id=store_plan.id,
+        decision_graph_json=json.dumps({"nodes": {}, "edges": []}),
+        followups_json=json.dumps({"questions": []}),
+    )
+    runtime.store.update_planning_session(session.id, current_round=1)
+
+    state = runtime._state(session.id)
+    state.accessed_paths.update(
+        {
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx",
+            "src/prscope/web/frontend/src/lib/api.ts",
+            "src/prscope/web/frontend/src/pages/PlanningView.test.ts",
+            "src/prscope/web/api.py",
+            "tests/test_web_api_models.py",
+        }
+    )
+    ctx = PlanningRoundContext(
+        core=runtime._core(session.id),
+        session_id=session.id,
+        round_number=2,
+        requirements=session.requirements,
+        state=state,
+        issue_tracker=state.issue_tracker,
+        selected_author_model="gpt-4o-mini",
+        selected_critic_model="gpt-4o-mini",
+        event_callback=None,
+    )
+    review_result = ReviewResult(
+        strengths=[],
+        architectural_concerns=["The revised plan still needs complete execution sections."],
+        risks=[],
+        simplification_opportunities=[],
+        blocking_issues=[],
+        reviewer_questions=[],
+        recommended_changes=[],
+        design_quality_score=6.0,
+        confidence="medium",
+        review_complete=False,
+        simplest_possible_design=None,
+        primary_issue="The revised plan still needs complete execution sections.",
+        resolved_issues=[],
+        constraint_violations=[],
+        issue_priority=[],
+        prose="The revised plan still needs complete execution sections.",
+        parse_error=None,
+    )
+    repair_plan = RepairPlan(
+        problem_understanding="Restore the missing execution details.",
+        accepted_issues=["The revised plan still needs complete execution sections."],
+        rejected_issues=[],
+        root_causes=["The current plan is still too close to a planner draft."],
+        repair_strategy="Fill the missing refiner sections without broadening scope.",
+        target_sections=["architecture", "implementation_steps", "test_strategy", "rollback_plan", "files_changed"],
+        revision_plan="Restore the missing refiner sections and keep backend contract references explicit.",
+    )
+
+    async def fake_revise_plan(**kwargs):  # type: ignore[no-untyped-def]
+        del kwargs
+        return RevisionResult(
+            problem_understanding="Still too thin.",
+            updates={
+                "architecture": "",
+            },
+            justification={"architecture": "Keeps the plan scoped."},
+            review_prediction="Reviewer will still ask for missing execution detail.",
+        )
+
+    runtime.author.revise_plan = fake_revise_plan  # type: ignore[method-assign]
+
+    async def emit_tool(*args, **kwargs):  # type: ignore[no-untyped-def]
+        del args, kwargs
+
+    updated_markdown, changed_sections, _ = await runtime._stages.revise_plan(  # noqa: SLF001
+        ctx=ctx,
+        current_plan_doc=plan,
+        repair_plan=repair_plan,
+        review_result=review_result,
+        emit_tool=emit_tool,
+    )
+
+    assert "## Implementation Steps" in updated_markdown
+    assert "## Test Strategy" in updated_markdown
+    assert "## Rollback Plan" in updated_markdown
+    assert "Keep the change localized to the existing component and verified helper wiring." in updated_markdown
+    assert "`src/prscope/web/api.py`" in updated_markdown
+    assert "`tests/test_web_api_models.py`" in updated_markdown
+    assert "architecture" in changed_sections
+    assert "implementation_steps" in changed_sections
+    assert "test_strategy" in changed_sections
+    assert "rollback_plan" in changed_sections
+    assert "files_changed" in changed_sections
+
+
+@pytest.mark.asyncio
+async def test_revise_plan_preserves_localized_owner_files_and_test_target(tmp_path) -> None:
+    store = Store(tmp_path / "test.db")
+    runtime = PlanningRuntime(
+        store=store,
+        config=PrscopeConfig(
+            local_repo=str(tmp_path),
+            planning=PlanningConfig(author_model="gpt-4o-mini", critic_model="gpt-4o-mini"),
+        ),
+        repo=RepoProfile(name="repo", path=str(tmp_path)),
+    )
+    session = store.create_planning_session(
+        repo_name="repo",
+        title="preserve-localized-refinement",
+        requirements=(
+            "Update the Planning UI to show the last export result and disable the export action while an export is "
+            "already in progress. Reuse the existing exportSession and downloadFile helpers, preserve current "
+            "PlanPanel behavior, and keep the change localized. Do not introduce new hooks, contexts, shared state "
+            "layers, or background polling. Include focused frontend tests."
+        ),
+        seed_type="requirements",
+        status="refining",
+    )
+    plan = PlanDocument(
+        title="Plan",
+        summary="Keep the change localized.",
+        goals="- Show the last export result.",
+        non_goals="- Do not introduce new hooks, contexts, shared state layers, or background polling.",
+        files_changed=(
+            "- `src/prscope/web/frontend/src/pages/PlanningView.tsx`\n"
+            "- `src/prscope/web/frontend/src/components/PlanPanel.tsx`\n"
+            "- `src/prscope/web/frontend/src/lib/api.ts`\n"
+            "- `src/prscope/web/frontend/src/pages/PlanningView.test.ts`"
+        ),
+        architecture="Keep the change localized to the existing component and verified helper wiring.",
+        implementation_steps=(
+            "1. Update `src/prscope/web/frontend/src/pages/PlanningView.tsx` to manage the export UI state.\n"
+            "2. Update `src/prscope/web/frontend/src/components/PlanPanel.tsx` to render the status.\n"
+            "3. Reuse `exportSession` and `downloadFile` from `src/prscope/web/frontend/src/lib/api.ts`.\n"
+            "4. Cover the localized flow in `src/prscope/web/frontend/src/pages/PlanningView.test.ts`."
+        ),
+        test_strategy=(
+            "- Assert the export button is disabled during the in-flight request in "
+            "`src/prscope/web/frontend/src/pages/PlanningView.test.ts`.\n"
+            "- Assert the last export result is rendered after success in "
+            "`src/prscope/web/frontend/src/pages/PlanningView.test.ts`."
+        ),
+        rollback_plan="- If the localized export UI behavior regresses, restore the prior UI flow.",
+        open_questions="- None.",
+    )
+    store_plan = runtime._core(session.id).save_plan_version(render_markdown(plan), round_number=1, plan_document=plan)
+    runtime.store.update_plan_version_artifacts(
+        version_id=store_plan.id,
+        decision_graph_json=json.dumps({"nodes": {}, "edges": []}),
+        followups_json=json.dumps({"questions": []}),
+    )
+    runtime.store.update_planning_session(session.id, current_round=1)
+
+    state = runtime._state(session.id)
+    state.accessed_paths.update(
+        {
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx",
+            "src/prscope/web/frontend/src/lib/api.ts",
+            "src/prscope/web/frontend/src/pages/PlanningView.test.ts",
+        }
+    )
+    ctx = PlanningRoundContext(
+        core=runtime._core(session.id),
+        session_id=session.id,
+        round_number=2,
+        requirements=session.requirements,
+        state=state,
+        issue_tracker=state.issue_tracker,
+        selected_author_model="gpt-4o-mini",
+        selected_critic_model="gpt-4o-mini",
+        event_callback=None,
+    )
+    review_result = ReviewResult(
+        strengths=[],
+        architectural_concerns=["Keep the localized export flow but tighten the critique response."],
+        risks=[],
+        simplification_opportunities=[],
+        blocking_issues=[],
+        reviewer_questions=[],
+        recommended_changes=[],
+        design_quality_score=6.0,
+        confidence="medium",
+        review_complete=False,
+        simplest_possible_design=None,
+        primary_issue="Keep the localized export flow but tighten the critique response.",
+        resolved_issues=[],
+        constraint_violations=[],
+        issue_priority=[],
+        prose="Keep the localized export flow but tighten the critique response.",
+        parse_error=None,
+    )
+    repair_plan = RepairPlan(
+        problem_understanding="Tighten the localized export refinement output.",
+        accepted_issues=["Need a cleaner critique response."],
+        rejected_issues=[],
+        root_causes=["The revised plan collapsed concrete file ownership."],
+        repair_strategy="Keep the localized file ownership and focused test target while addressing the critique.",
+        target_sections=["files_changed", "implementation_steps", "test_strategy"],
+        revision_plan="Revise the localized plan without dropping grounded owner files or regression targets.",
+    )
+
+    async def fake_revise_plan(**kwargs):  # type: ignore[no-untyped-def]
+        del kwargs
+        return RevisionResult(
+            problem_understanding="Tighten the plan.",
+            updates={
+                "files_changed": "- `src/prscope/web/frontend/src/components/PlanPanel.tsx`: Disable the export button while work is in progress.",
+                "implementation_steps": (
+                    "1. Update the existing localized UI/component flow to implement the requested behavior.\n"
+                    "2. Reuse `exportSession` and `downloadFile` exactly as already wired."
+                ),
+                "test_strategy": (
+                    "- Assert the requested user-visible behavior in the focused frontend regression test.\n"
+                    "- Avoid broad new abstractions while refining the export flow."
+                ),
+            },
+            justification={"files_changed": "Keep the critique focused."},
+            review_prediction="Reviewer should accept.",
+        )
+
+    runtime.author.revise_plan = fake_revise_plan  # type: ignore[method-assign]
+    runtime.author.validate_refinement_result = lambda **kwargs: ValidationResult.success()  # type: ignore[method-assign]
+
+    async def emit_tool(*args, **kwargs):  # type: ignore[no-untyped-def]
+        del args, kwargs
+
+    updated_markdown, changed_sections, _ = await runtime._stages.revise_plan(  # noqa: SLF001
+        ctx=ctx,
+        current_plan_doc=plan,
+        repair_plan=repair_plan,
+        review_result=review_result,
+        emit_tool=emit_tool,
+    )
+
+    assert "`src/prscope/web/frontend/src/pages/PlanningView.tsx`" in updated_markdown
+    assert "`src/prscope/web/frontend/src/components/PlanPanel.tsx`" in updated_markdown
+    assert "`src/prscope/web/frontend/src/lib/api.ts`" in updated_markdown
+    assert "`src/prscope/web/frontend/src/pages/PlanningView.test.ts`" in updated_markdown
+    files_changed_section = updated_markdown.split("## Files Changed", 1)[1].split("## Architecture", 1)[0]
+    assert "**Rationale**" not in files_changed_section
+    assert files_changed_section.index("`src/prscope/web/frontend/src/pages/PlanningView.tsx`") < files_changed_section.index(
+        "`src/prscope/web/frontend/src/components/PlanPanel.tsx`"
+    )
+    assert files_changed_section.index("`src/prscope/web/frontend/src/components/PlanPanel.tsx`") < files_changed_section.index(
+        "`src/prscope/web/frontend/src/lib/api.ts`"
+    )
+    assert files_changed_section.index("`src/prscope/web/frontend/src/lib/api.ts`") < files_changed_section.index(
+        "`src/prscope/web/frontend/src/pages/PlanningView.test.ts`"
+    )
+    assert "src/prscope/web/frontend/src/pages/PlanningView.tsx" in updated_markdown
+    assert "src/prscope/web/frontend/src/pages/PlanningView.test.ts" in updated_markdown
+    assert "files_changed" in changed_sections
+
+
+def test_normalize_files_changed_entries_strips_fake_symbols_and_empty_rationales() -> None:
+    normalized = PlanningStages._normalize_files_changed_entries(  # noqa: SLF001
+        files_changed=(
+            "- `src/prscope/web/frontend/src/pages/PlanningView.tsx`: **\n"
+            "- `src/prscope/web/frontend/src/components/PlanPanel.tsx`: **\n"
+            "- `src/prscope/web/frontend/src/lib/api.ts`: Preserve the existing frontend API helper wiring.\n"
+            "- `PlanPanel`: behavior is unchanged.\n"
+            "- `src/prscope/web/frontend/src/pages/PlanningView.test.ts`: **"
+        ),
+        preferred_owner_paths=(
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx",
+            "src/prscope/web/frontend/src/lib/api.ts",
+        ),
+        preferred_test_targets=("src/prscope/web/frontend/src/pages/PlanningView.test.ts",),
+        rationale_overrides={
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx": "Keep the localized export UI wiring in the existing planning page instead of introducing a new owner.",
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx": "Preserve existing PlanPanel export and health behavior while wiring the localized UI change.",
+            "src/prscope/web/frontend/src/lib/api.ts": "Preserve the existing frontend API helper wiring for the reused export/snapshot helpers.",
+            "src/prscope/web/frontend/src/pages/PlanningView.test.ts": "Keep the localized UI behavior covered by the focused frontend regression test.",
+        },
+    )
+
+    assert "`PlanPanel`" not in normalized
+    assert ": **" not in normalized
+    assert normalized.splitlines() == [
+        "- `src/prscope/web/frontend/src/pages/PlanningView.tsx`: Keep the localized export UI wiring in the existing planning page instead of introducing a new owner.",
+        "- `src/prscope/web/frontend/src/components/PlanPanel.tsx`: Preserve existing PlanPanel export and health behavior while wiring the localized UI change.",
+        "- `src/prscope/web/frontend/src/lib/api.ts`: Preserve the existing frontend API helper wiring.",
+        "- `src/prscope/web/frontend/src/pages/PlanningView.test.ts`: Keep the localized UI behavior covered by the focused frontend regression test.",
+    ]
+
+
 def test_top_reconsideration_candidates_falls_back_to_medium_pressure_decisions(tmp_path) -> None:
     runtime = PlanningRuntime(
         store=Store(tmp_path / "test.db"),
@@ -885,6 +1401,46 @@ def test_top_reconsideration_candidates_falls_back_to_medium_pressure_decisions(
     assert candidates[0]["reason"] == "pressure_guidance"
     assert candidates[0]["decision_pressure"] == 4
     assert candidates[0]["dominant_cluster"]["root_issue"] == "Database scaling limits remain unresolved."
+
+
+def test_pressure_revision_hints_preserve_source_of_truth_and_scope_invalidation(tmp_path) -> None:
+    runtime = PlanningRuntime(
+        store=Store(tmp_path / "test.db"),
+        config=PrscopeConfig(
+            local_repo=str(tmp_path),
+            planning=PlanningConfig(author_model="gpt-4o-mini", critic_model="gpt-4o-mini"),
+        ),
+        repo=RepoProfile(name="repo", path=str(tmp_path)),
+    )
+
+    hints = runtime._stages._pressure_revision_hints(  # type: ignore[attr-defined]  # noqa: SLF001
+        requirements=(
+            "Add tenant-aware caching for session snapshots in the planning UI. "
+            "Keep SQLite as the source of truth, avoid broad architecture churn, "
+            "and make sure cache invalidation is explicit when a session or plan version changes."
+        ),
+        reconsideration_candidates=[
+            {
+                "decision_id": "architecture.cache_strategy",
+                "reason": "pressure_guidance",
+                "decision_pressure": 5,
+                "suggested_action": "evaluate alternatives",
+                "dominant_cluster": {
+                    "root_issue_id": "issue_1",
+                    "root_issue": "Complex cache invalidation logic may lead to stale data if not managed properly.",
+                    "severity": "major",
+                    "affected_plan_sections": ["architecture"],
+                    "suggested_action": "evaluate alternatives",
+                },
+            }
+        ],
+    )
+
+    assert any("`architecture.cache_strategy`" in hint for hint in hints)
+    assert any("SQLite remains the source of truth" in hint for hint in hints)
+    assert any("manual admin actions" in hint for hint in hints)
+    assert any("Keep the design localized" in hint for hint in hints)
+    assert any("speculative concurrency" in hint for hint in hints)
 
 
 @pytest.mark.asyncio

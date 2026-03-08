@@ -121,6 +121,34 @@ planning:
     assert config.planning.memory_model == "gpt-4o-mini"
 
 
+def test_config_loads_stage_model_overrides_and_structured_fallback(tmp_path):
+    (tmp_path / "repo-stage").mkdir()
+    config_path = tmp_path / "prscope.yml"
+    config_path.write_text(
+        """
+repos:
+  stage:
+    path: ./repo-stage
+planning:
+  author_model: gemini-2.5-flash
+  critic_model: gemini-2.5-flash
+  initial_draft_model: gemini-2.5-flash
+  author_refine_model: gemini-2.5-flash
+  critic_review_model: gpt-4o-mini
+  discovery_model: claude-3-haiku-20240307
+  structured_output_fallback_model: gpt-4o-mini
+        """.strip()
+    )
+
+    config = PrscopeConfig.load(tmp_path)
+
+    assert config.planning.discovery_model == "claude-3-haiku-20240307"
+    assert config.planning.initial_draft_model == "gemini-2.5-flash"
+    assert config.planning.author_refine_model == "gemini-2.5-flash"
+    assert config.planning.critic_review_model == "gpt-4o-mini"
+    assert config.planning.structured_output_fallback_model == "gpt-4o-mini"
+
+
 def test_config_resolve_repo_from_cwd(tmp_path):
     (tmp_path / "repo-c").mkdir()
     (tmp_path / "repo-c" / "nested").mkdir()

@@ -226,3 +226,44 @@ def test_command_failure_emits_recovery_snapshot_and_error(tmp_path, monkeypatch
     recovery_events = [event for event in emitted_events if "status" in event and "is_processing" in event]
     assert recovery_events
     assert recovery_events[-1]["status"] == "refining"
+
+
+def test_round_value_error_returns_conflict_instead_of_500(tmp_path, monkeypatch):
+    _write_minimal_config(tmp_path)
+    monkeypatch.setenv("PRSCOPE_CONFIG_ROOT", str(tmp_path))
+    monkeypatch.setenv("PRSCOPE_DISABLE_ROUND_WORKER", "1")
+    monkeypatch.setattr("prscope.store.get_prscope_dir", lambda repo_root=None: tmp_path / ".prscope")
+
+    async def failing_round(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        del self, args, kwargs
+        raise ValueError("required section is empty: Architecture")
+
+    monkeypatch.setattr(
+        "prscope.planning.runtime.orchestration.PlanningRuntime.run_adversarial_round",
+        failing_round,
+    )
+
+    app = create_app()
+    client = TestClient(app, raise_server_exceptions=False)
+
+    repo_name = tmp_path.name
+    store = Store()
+    session = store.create_planning_session(
+        repo_name=repo_name,
+        title="Round value error",
+        requirements="r",
+        seed_type="requirements",
+        status="refining",
+    )
+
+    response = client.post(
+        f"/api/sessions/{session.id}/round",
+        params={"repo": repo_name},
+        json={"command_id": "cmd-round-fail", "user_input": "refine this"},
+    )
+
+    assert response.status_code == 409
+    detail = response.json()["detail"]
+    assert detail["reason"] == "command_failed"
+    assert "required section is empty: Architecture" in detail["detail"]
+    assert detail["status"] == "refining"

@@ -7,7 +7,7 @@
 <p align="center">
   <b>PLAN. REFINE. SHIP.</b>
   <br />
-  <i>A planning engine that turns requirements (or upstream PR context) into grounded plan/spec outputs for real codebases.</i>
+  <i>AI-assisted architecture planning for real codebases.</i>
 </p>
 
 <p align="center">
@@ -19,35 +19,61 @@
 
 ---
 
-## Contributing
+Prscope is a **local-first AI-assisted architecture planning system**.
 
-See `CONTRIBUTING.md` for development workflow, performance benchmark requirements, and PR checklist.
+Instead of jumping directly from requirements or upstream code changes to generated code, Prscope creates a **grounded implementation plan first**, using your real repository structure, codebase signals, and engineering constraints.
+
+It combines:
+
+- **Codebase-aware planning** — scans your repo into structured memory blocks
+- **Author ↔ Critic refinement loops** — adversarial review before code is written
+- **Architecture constraints** — enforce design rules through a manifesto
+- **Grounded plan exports** — outputs reference real file paths, modules, and constraints
+
+The result is a **reviewable implementation plan (`PRD.md`) in your configured output directory** that fits your codebase before code generation begins.
+
+---
+
+## Why Prscope Exists
+
+Modern AI coding tools can generate code quickly, but they rarely reason about **architecture**.
+
+That often leads to:
+
+- inconsistent designs
+- hidden dependency issues
+- large refactors later
+
+Prscope moves that reasoning earlier in the workflow:
+
+```text
+requirements or upstream changes
+-> architecture plan (Prscope)
+-> implementation
+```
+
+By forcing architectural critique and constraint validation first, teams can catch design problems **before writing large amounts of code**.
 
 ---
 
 ## Table of Contents
 
-- [What Prscope Does](#what-prscope-does)
+- [Why Prscope Exists](#why-prscope-exists)
 - [Install](#install)
 - [Quickstart](#quickstart)
+- [Example](#example)
 - [Three Ways to Start a Plan](#three-ways-to-start-a-plan)
 - [Web UI Workflow](#web-ui-workflow)
-- [Runtime State Model](#runtime-state-model)
 - [Planning Features](#planning-features)
-- [Memory Stack: Skills + Recall](#memory-stack-skills--recall)
-- [Full Configuration Reference](#full-configuration-reference)
-- [Manifesto Constraints](#manifesto-constraints)
 - [CLI Reference](#cli-reference)
-- [Environment Variables](#environment-variables)
-- [Project Structure](#project-structure)
-- [Benchmark Harness](#benchmark-harness)
 - [Development](#development)
+- [Technical Docs](#technical-docs)
 
 ---
 
 ## What Prscope Does
 
-Prscope is a local-first planning system with a CLI + web UI workflow. You give it requirements (or seed it from an upstream GitHub PR), and it:
+Prscope gives you a CLI + web UI workflow for turning requirements into grounded plan/spec outputs for real codebases:
 
 1. Scans your codebase into structured memory blocks
 2. Starts a planning session in the web UI where an **Author LLM** drafts the plan
@@ -107,9 +133,13 @@ This creates `prscope.yml`, `prscope.features.yml`, and `.prscope/` in your repo
 local_repo: .   # path to your repo (default: current directory)
 
 planning:
-  author_model: gpt-4o        # drafts and refines the plan
-  critic_model: gpt-4o-mini   # stress-tests it (same provider = one key)
+  author_model: gpt-4o        # compatibility default for authoring stages
+  critic_model: gpt-4o-mini   # compatibility default for critic stages
   memory_model: gpt-4o-mini   # optional: codebase memory build (defaults to author_model)
+  initial_draft_model: gemini-2.5-flash          # optional stage override
+  author_refine_model: gpt-4o-mini               # optional stage override
+  critic_review_model: gpt-4o-mini               # optional stage override
+  structured_output_fallback_model: gpt-4o-mini  # fallback for JSON-heavy stages
   output_dir: ./plans
 
 # Optional: seed plans from upstream GitHub PRs
@@ -117,7 +147,7 @@ upstream:
   - repo: owner/upstream-repo
 ```
 
-> **All three can be any LiteLLM-supported string.** `memory_model` is used only for the "Preparing codebase memory" step; if omitted it defaults to `author_model`. Using one provider for all three means one API key; you can set `memory_model` to a cheaper/faster model (e.g. `gpt-4o-mini`) while using a stronger `author_model` for planning.
+> **All model fields can be any LiteLLM-supported string.** `author_model` / `critic_model` remain compatibility defaults, while `initial_draft_model`, `author_refine_model`, and `critic_review_model` let you split roles by stage. `structured_output_fallback_model` is used only when JSON-heavy stages hit repeated contract failures. `memory_model` is used only for the "Preparing codebase memory" step; if omitted it defaults to `author_model`.
 
 ### 4. (Optional) Define your architecture constraints
 
@@ -149,6 +179,23 @@ prscope plan chat
 The web UI opens. The Author LLM asks clarifying questions, drafts a plan, and supports iterative Critic refinement rounds.
 
 > `prscope plan ...` auto-starts the local web server when needed. If you prefer managing it explicitly, run `prscope web` first.
+
+---
+
+## Example
+
+```bash
+prscope plan start "Add rate limiting middleware for authentication endpoints"
+```
+
+Prscope will:
+
+1. Inspect the repository for framework and architecture context
+2. Draft a grounded implementation plan
+3. Run adversarial **Author ↔ Critic** review rounds
+4. Export a final spec (`PRD.md`) in your configured output directory
+
+The resulting plan references **real modules, files, and constraints in your codebase**, making it ready for implementation or code generation.
 
 ---
 
@@ -210,7 +257,7 @@ For background operation, run `prscope web --background`.
 
 - The New Session screen includes `Author model` and `Critic model` selectors.
 - The Planning view header keeps these selectors available per interaction, so you can switch model pairs before sending a message or running a critique round.
-- Model availability is key-aware (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GOOGLE_API_KEY`/`GEMINI_API_KEY`) and exposed from `GET /api/models`.
+- Model availability is key-aware (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`) and exposed from `GET /api/models`.
 - The backend validates every selected model at request time; if a model becomes unavailable, the request fails with a clear validation error so the UI can prompt reselection.
 - Last selected model pair is persisted per repo in browser local storage for convenience.
 
@@ -340,9 +387,13 @@ llm:
 
 # Planning mode
 planning:
-  author_model: gpt-4o                        # any LiteLLM string (drafts + discovery)
-  critic_model: claude-3-5-sonnet-20241022    # any LiteLLM string
+  author_model: gpt-4o                        # compatibility default for authoring stages
+  critic_model: claude-3-5-sonnet-20241022    # compatibility default for critic stages
   memory_model: gpt-4o-mini                   # optional: codebase memory build (defaults to author_model)
+  initial_draft_model: gemini-2.5-flash       # optional stage override
+  author_refine_model: gpt-4o-mini            # optional stage override
+  critic_review_model: gpt-4o-mini            # optional stage override
+  structured_output_fallback_model: gpt-4o-mini
   issue_dedupe:
     embeddings_enabled: auto                   # auto | true | false
     embedding_model: text-embedding-3-small    # any LiteLLM embedding model
@@ -370,12 +421,16 @@ planning:
 ```
 
 Notes:
+- `author_model` / `critic_model` are still accepted everywhere for backward compatibility, but stage-specific overrides now take precedence when present.
+- `initial_draft_model` is a good place to try faster/cheaper experimental models while keeping `critic_review_model` and `author_refine_model` on a JSON-stable baseline.
+- `structured_output_fallback_model` is used only for structured JSON stages after repeated contract failures; it does not change the initial draft path.
 - `memory_model` is used only for the "Preparing codebase memory" step. Omit it to use `author_model` (backward compatible). Set it to a cheaper model (e.g. `gpt-4o-mini`) to reduce cost for memory build while keeping a stronger author/critic.
 - `issue_dedupe.embedding_model` is independent from `author_model` / `critic_model` / `memory_model`, so you can run Claude or Gemini for planning while using a different embedding provider.
 - `embeddings_enabled: auto` attempts semantic dedupe first and falls back to lexical dedupe if embeddings are unavailable.
 - With `fallback_mode: none`, dedupe will not match when embeddings fail.
 - Issue tracking is graph-backed with canonical IDs; duplicates are tracked via alias mapping (not duplicate nodes).
 - Convergence gating uses root-open + unresolved dependency-chain checks, then existing stability/implementability checks.
+- `GET /api/sessions/{id}/diagnostics` now includes selected stage models/providers plus JSON retry/fallback counters for `critic_review` and `author_refine`.
 
 ---
 
@@ -454,7 +509,7 @@ prscope recall "query terms with enough signal" --full
 | `GITHUB_TOKEN`      | For upstream sync                       | GitHub personal access token |
 | `OPENAI_API_KEY`    | If using OpenAI models                  | `gpt-4o`, `o1`, etc.         |
 | `ANTHROPIC_API_KEY` | Optional — only if using a Claude model | `claude-3-5-sonnet`, etc.    |
-| `GOOGLE_API_KEY`    | If using Google models                  | `gemini-pro`, etc.           |
+| `GEMINI_API_KEY`    | If using Google Gemini models          | `gemini-2.5-flash`, etc.     |
 
 
 Prscope uses [LiteLLM](https://docs.litellm.ai/docs/providers) — any provider it supports works as `author_model`, `critic_model`, `memory_model`, or `issue_dedupe.embedding_model`.
@@ -578,6 +633,18 @@ make web-frontend     # Vite on :5173
 ```
 
 For performance runs, use the [Benchmark Harness](#benchmark-harness) section above.
+
+---
+
+## Technical Docs
+
+For runtime internals, architecture notes, and operational details, start with `docs/README.md`.
+
+---
+
+## Contributing
+
+See `CONTRIBUTING.md` for development workflow, performance benchmark requirements, and PR checklist.
 
 ---
 

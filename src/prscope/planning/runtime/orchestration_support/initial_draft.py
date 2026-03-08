@@ -6,6 +6,7 @@ import logging
 import time
 from typing import Any, Callable
 
+from ....model_catalog import model_provider
 from ....profile import build_profile
 from ...core import PlanningCore
 from ..author import AuthorResult
@@ -155,6 +156,16 @@ class RuntimeInitialDraftFlow:
 
             async def run_planner_only() -> Any:
                 nonlocal failed_stage, planner_elapsed, planner_started_at
+                selected_model = str(author_model_override or "").strip()
+                if selected_model:
+                    await wrapped_event(
+                        {
+                            "type": "model_selection",
+                            "model_stage": "initial_draft",
+                            "model": selected_model,
+                            "provider": model_provider(selected_model),
+                        }
+                    )
                 await self._runtime._emit_event(
                     event_callback,
                     {
@@ -177,6 +188,7 @@ class RuntimeInitialDraftFlow:
                     author_model_override=self._runtime._resolve_author_model(
                         session,
                         author_model_override,
+                        stage="initial_draft",
                     ),
                     timeout_seconds_override=lambda: max(
                         5,

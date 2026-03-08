@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import deque
 from typing import Any
 
+from ....model_catalog import model_provider
 from ..pipeline import PlanningRoundContext
 
 
@@ -66,8 +67,11 @@ class RuntimeRoundEntry:
             state.requirements = requirements
             state.revision_round = round_number
             self._runtime._reset_round_telemetry(state)
-            selected_author_model = self._runtime._resolve_author_model(session, author_model_override)
-            selected_critic_model = self._runtime._resolve_critic_model(session, critic_model_override)
+            model_policy = self._runtime._resolve_model_policy(
+                session,
+                author_model_override=author_model_override,
+                critic_model_override=critic_model_override,
+            )
 
             issue_tracker = state.issue_tracker
             if not hasattr(issue_tracker, "open_issues") or not hasattr(issue_tracker, "root_open_issues"):
@@ -80,8 +84,31 @@ class RuntimeRoundEntry:
                 requirements=requirements,
                 state=state,
                 issue_tracker=issue_tracker,
-                selected_author_model=selected_author_model,
-                selected_critic_model=selected_critic_model,
+                selected_author_model=model_policy.author_refine.primary_model,
+                selected_critic_model=model_policy.critic_review.primary_model,
+                model_policy=model_policy,
                 event_callback=event_callback,
+            )
+            await self._runtime._emit_event(
+                event_callback,
+                {
+                    "type": "model_selection",
+                    "model_stage": "author_refine",
+                    "model": model_policy.author_refine.primary_model,
+                    "provider": model_provider(model_policy.author_refine.primary_model),
+                    "fallback_model": model_policy.author_refine.first_fallback_model,
+                },
+                session_id,
+            )
+            await self._runtime._emit_event(
+                event_callback,
+                {
+                    "type": "model_selection",
+                    "model_stage": "critic_review",
+                    "model": model_policy.critic_review.primary_model,
+                    "provider": model_provider(model_policy.critic_review.primary_model),
+                    "fallback_model": model_policy.critic_review.first_fallback_model,
+                },
+                session_id,
             )
             return await self._runtime._adversarial_loop.run_round(ctx=ctx, current_plan=current, user_input=user_input)

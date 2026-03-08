@@ -5,6 +5,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
+from ....model_catalog import litellm_model_name, model_provider
 from ....pricing import MODEL_CONTEXT_WINDOWS
 from ..telemetry import completion_telemetry
 from ..tools import CODEBASE_TOOLS
@@ -194,6 +195,7 @@ class AuthorLLMClient:
 
         last_error: Exception | None = None
         for idx, model in enumerate(models_to_try):
+            litellm_model = litellm_model_name(model)
             try:
                 if self.prefer_responses_api(model):
                     from openai import OpenAI
@@ -240,6 +242,7 @@ class AuthorLLMClient:
                             "type": "token_usage",
                             "session_stage": "author",
                             "model": model,
+                            "model_provider": model_provider(model),
                             "prompt_tokens": telemetry.usage.prompt_tokens,
                             "completion_tokens": telemetry.usage.completion_tokens,
                             "call_cost_usd": telemetry.cost.total_cost_usd,
@@ -265,7 +268,7 @@ class AuthorLLMClient:
                     return chat_like, model
 
                 completion_kwargs: dict[str, Any] = {
-                    "model": model,
+                    "model": litellm_model,
                     "messages": messages,
                     "max_tokens": output_cap,
                 }
@@ -299,6 +302,7 @@ class AuthorLLMClient:
                         "type": "token_usage",
                         "session_stage": "author",
                         "model": model,
+                        "model_provider": model_provider(model),
                         "prompt_tokens": telemetry.usage.prompt_tokens,
                         "completion_tokens": telemetry.usage.completion_tokens,
                         "call_cost_usd": telemetry.cost.total_cost_usd,

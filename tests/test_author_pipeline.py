@@ -21,6 +21,7 @@ from prscope.planning.runtime.authoring.models import (
 from prscope.planning.runtime.authoring import pipeline as pipeline_module
 from prscope.planning.runtime.authoring.pipeline import AuthorPlannerPipeline
 from prscope.planning.runtime.authoring.repair import AuthorRepairService
+from prscope.planning.runtime.critic import ReviewResult
 from prscope.planning.runtime.tools import ToolExecutor
 
 
@@ -363,6 +364,70 @@ def test_parse_plan_document_accepts_new_markdown_native_fields(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+async def test_plan_repair_retries_with_compact_json_when_first_response_is_truncated() -> None:
+    calls: list[list[dict[str, object]]] = []
+
+    async def _fake_llm_call(*args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        messages = args[0] if args else None
+        assert isinstance(messages, list)
+        calls.append(messages)
+        del kwargs
+        if len(calls) == 1:
+            raw = """{
+  "problem_understanding": "Need to tighten the plan",
+  "accepted_issues": ["scope drift"],
+  "rejected_issues": ["""
+        else:
+            raw = """{
+  "problem_understanding": "Need to tighten the plan",
+  "accepted_issues": ["scope drift"],
+  "rejected_issues": [],
+  "root_causes": ["repair response was too verbose"],
+  "repair_strategy": "Keep the fix localized",
+  "target_sections": ["architecture", "implementation_steps"],
+  "revision_plan": "Rewrite only the localized sections"
+}"""
+        return (
+            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=raw))]),
+            "claude-haiku-4-5-20251001",
+        )
+
+    service = AuthorRepairService(_fake_llm_call)
+    plan = PlanDocument(
+        title="Plan",
+        summary="Summary",
+        goals="Goals",
+        non_goals="Non-goals",
+        files_changed="- `a.py`",
+        architecture="Architecture",
+        implementation_steps="1. Step",
+        test_strategy="Tests",
+        rollback_plan="Rollback",
+        open_questions="- None.",
+    )
+    review = SimpleNamespace(
+        architectural_concerns=["scope drift"],
+        risks=[],
+        recommended_changes=[],
+        primary_issue="scope drift",
+    )
+
+    result = await service.plan_repair(
+        review=review,
+        plan=plan,
+        requirements="Keep the change localized and reuse existing helpers.",
+        design_record={},
+        reconsideration_candidates=[],
+        model_override="claude-haiku-4-5-20251001",
+    )
+
+    assert result.problem_understanding == "Need to tighten the plan"
+    assert result.target_sections == ["architecture", "implementation_steps"]
+    assert len(calls) == 2
+    assert "Return compact JSON only" in str(calls[1][0]["content"])
+
+
+@pytest.mark.asyncio
 async def test_revise_plan_recovers_from_trailing_commas_in_json() -> None:
     captured: dict[str, object] = {}
 
@@ -442,13 +507,126 @@ async def test_revise_plan_recovers_from_trailing_commas_in_json() -> None:
     assert "localized UI or API-wiring requests that reuse existing helpers/endpoints" in system_prompt
     assert "observability/telemetry work" in system_prompt
     assert "dedicated hooks/contexts" in system_prompt
+    assert "single state objects" in system_prompt
+    assert "concurrency-management rhetoric" in system_prompt
+    assert "code-level React prescriptions" in system_prompt
+    assert "`useRef`, `useCallback`, `Promise.race`, timeout guards, or unmount guards" in system_prompt
+    assert "Preserve already-grounded owner files and focused regression targets" in system_prompt
+    assert "Prefer surgical edits over collapsing precise implementation or test detail" in system_prompt
     assert "If reconsideration candidates are provided" in system_prompt
     assert "Architectural Pressure Guidance" in user_prompt
     assert "Do not ignore the top pressure signal" in system_prompt or "make a visible plan change" in system_prompt
+    assert "When the requirements name a source of truth" in system_prompt
+    assert "manual admin actions" in system_prompt
+    assert "speculative concurrency or abstraction drift" in system_prompt
+    assert "separation-of-concerns/module rhetoric" in system_prompt
     assert "Preserve `src/prscope/web/frontend/src/lib/api.ts` exactly as written." in user_prompt
     assert "## Reconsideration Candidates" in user_prompt
     assert "architecture.database" in user_prompt
     assert "root issue:" in user_prompt
+
+
+def test_compact_json_retry_instruction_is_strict_for_anthropic_models() -> None:
+    instruction = AuthorRepairService._compact_json_retry_instruction("claude-sonnet-4-5")
+    assert "Return compact JSON only." in instruction
+    assert "Return exactly one JSON object and nothing after the closing brace." in instruction
+
+
+@pytest.mark.asyncio
+async def test_revise_plan_sanitizes_localized_frontend_state_drift_updates() -> None:
+    async def _fake_llm_call(*args: object, **kwargs: object):  # type: ignore[no-untyped-def]
+        del args, kwargs
+        raw = json.dumps(
+            {
+                "problem_understanding": "Tighten localized UI wiring.",
+                "updates": {
+                    "architecture": (
+                        "**React Hook Patterns:**\n"
+                        "Use a local state with a single state object, self-contained state management, hooks/contexts, "
+                        "useState, useEffect, useRef, useCallback, and background polling around `exportSession`.\n"
+                        "Apply state initialization, mount tracking, unmount guard, timeout recovery, and double-click prevention.\n"
+                        "```typescript\n"
+                        "type ExportStatus = { status: 'idle' | 'inProgress' | 'success' | 'error' };\n"
+                        "const isMountedRef = useRef(true);\n"
+                        "const handleExport = useCallback(async () => {\n"
+                        "  await Promise.race([exportSession(sessionId), setTimeout(() => {}, 30000)]);\n"
+                        "}, [sessionId]);\n"
+                        "```\n"
+                        "Preserve separation of concerns, separation of UI and business logic, and clear separation of state and logic."
+                    ),
+                    "changes": "- Add polling safeguards around the export button and manage concurrency proactively.",
+                },
+                "justification": {
+                    "architecture": "Explains the new frontend structure.",
+                    "changes": "Adds export safety.",
+                },
+                "review_prediction": "Reviewer should accept.",
+            }
+        )
+        return (
+            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=raw))]),
+            "gpt-4o-mini",
+        )
+
+    service = AuthorRepairService(_fake_llm_call)
+    current_plan = PlanDocument(
+        title="Plan",
+        summary="Keep the change localized.",
+        goals="Goals",
+        non_goals="- Do not introduce new hooks, contexts, shared state layers, or background polling.",
+        files_changed="- `src/prscope/web/frontend/src/components/PlanPanel.tsx`",
+        architecture="Keep the change localized to existing `PlanPanel` wiring and helper reuse.",
+        implementation_steps="1. Update the existing UI.\n2. Reuse `exportSession` and `downloadFile`.",
+        test_strategy="Tests",
+        rollback_plan="Rollback",
+        open_questions="- None.",
+    )
+    repair_plan = RepairPlan(
+        problem_understanding="Need to keep export wiring localized.",
+        accepted_issues=["architecture drift"],
+        rejected_issues=[],
+        root_causes=["revision overreached"],
+        repair_strategy="Tighten architecture wording",
+        target_sections=["architecture", "changes"],
+        revision_plan="Remove speculative frontend abstractions",
+    )
+
+    result = await service.revise_plan(
+        repair_plan=repair_plan,
+        current_plan=current_plan,
+        requirements=(
+            "Update the Planning UI to show the last export result and disable the export action while an export "
+            "is already in progress. Reuse the existing exportSession and downloadFile helpers, preserve current "
+            "PlanPanel behavior, and keep the change localized. Do not introduce new hooks, contexts, shared state "
+            "layers, or background polling."
+        ),
+        revision_budget=2,
+    )
+
+    architecture = result.updates["architecture"].lower()
+    changes = result.updates["changes"].lower()
+    assert "local state" not in architecture
+    assert "state management" not in architecture
+    assert "hooks/contexts" not in architecture
+    assert "usestate" not in architecture
+    assert "useeffect" not in architecture
+    assert "useref" not in architecture
+    assert "usecallback" not in architecture
+    assert "promise.race" not in architecture
+    assert "settimeout" not in architecture
+    assert "ismountedref" not in architecture
+    assert "timeout recovery" not in architecture
+    assert "mount tracking" not in architecture
+    assert "double-click prevention" not in architecture
+    assert "type exportstatus" not in architecture
+    assert "background polling" not in architecture
+    assert "separation of concerns" not in architecture
+    assert "separation of ui and business logic" not in architecture
+    assert "single state object" not in architecture
+    assert "separation of state and logic" not in architecture
+    assert "polling safeguards" not in changes
+    assert "manage concurrency proactively" not in changes
+    assert "localized" in architecture
 
 
 def test_incremental_grounding_failures_detects_new_unverified_paths(tmp_path: Path) -> None:
@@ -510,6 +688,325 @@ def test_validate_draft_flags_observability_drift_for_localized_ui_requests(tmp_
     ]
 
 
+def test_validate_draft_flags_frontend_state_abstraction_drift_for_localized_ui_requests(tmp_path: Path) -> None:
+    agent = _make_agent(tmp_path)
+    repo_understanding = RepoUnderstanding(
+        entrypoints=[],
+        core_modules=["src/prscope/web/frontend/src/components/PlanPanel.tsx"],
+        relevant_modules=[
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx",
+            "src/prscope/web/frontend/src/lib/api.ts",
+        ],
+        relevant_tests=["src/prscope/web/frontend/src/pages/PlanningView.test.ts"],
+        architecture_summary="frontend export wiring",
+        risks=[],
+        file_contents={
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx": "export function PlanPanel() {}",
+            "src/prscope/web/frontend/src/lib/api.ts": "export function exportSession() {}\nexport function downloadFile() {}",
+        },
+        from_mental_model=False,
+    )
+
+    failures = agent.validate_draft(
+        plan_content=(
+            "# Plan\n\n## Summary\nShow export result.\n\n## Goals\n- x\n\n## Non-Goals\n"
+            "- Do not introduce new hooks, contexts, shared state layers, or background polling.\n\n"
+            "## Changes\n- z\n\n## Files Changed\n- `src/prscope/web/frontend/src/components/PlanPanel.tsx`\n\n"
+            "## Architecture\nUse a local state with a single state object, self-contained state management, hooks/contexts, useRef, Promise.race, setTimeout, and polling safeguards while preserving separation of UI and business logic and separation of state and logic.\n\n"
+            "## Open Questions\n- None.\n"
+        ),
+        repo_understanding=repo_understanding,
+        draft_phase="planner",
+        requirements_text=(
+            "Update the Planning UI to show the last export result and disable the export action while an export "
+            "is already in progress. Reuse the existing exportSession and downloadFile helpers, preserve current "
+            "PlanPanel behavior, and keep the change localized. Do not introduce new hooks, contexts, shared state "
+            "layers, or background polling."
+        ),
+    )
+
+    assert (
+        "localized UI/API draft introduced frontend state or polling abstractions not present in requirements; "
+        "remove hooks/contexts/shared-state/state-management/polling wording and keep the plan focused on direct component wiring, "
+        "existing helper reuse, PlanPanel compatibility, and tests"
+    ) in failures
+    assert "missing explicit helper reuse reference for export; mention one of: exportSession" in failures
+    assert "missing explicit helper reuse reference for download; mention one of: downloadFile" in failures
+
+
+def test_validate_draft_flags_backend_contract_drift_for_localized_ui_requests(tmp_path: Path) -> None:
+    agent = _make_agent(tmp_path)
+    repo_understanding = RepoUnderstanding(
+        entrypoints=["src/prscope/web/api.py"],
+        core_modules=[
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx",
+            "src/prscope/web/api.py",
+        ],
+        relevant_modules=[
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx",
+            "src/prscope/web/frontend/src/lib/api.ts",
+            "src/prscope/web/api.py",
+        ],
+        relevant_tests=["src/prscope/web/frontend/src/pages/PlanningView.test.ts", "tests/test_web_api_models.py"],
+        architecture_summary="frontend export wiring with existing API helpers",
+        risks=[],
+        file_contents={
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx": "export function PlanningView() {}",
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx": "export function PlanPanel() {}",
+            "src/prscope/web/frontend/src/lib/api.ts": "export function exportSession() {}\nexport function downloadFile() {}",
+            "src/prscope/web/api.py": "def get_session():\n    return {}\n",
+        },
+        from_mental_model=False,
+    )
+
+    failures = agent.validate_draft(
+        plan_content=(
+            "# Plan\n\n## Summary\nShow export result.\n\n## Goals\n- x\n\n## Non-Goals\n- y\n\n"
+            "## Changes\n- Update the get_session endpoint response to include new fields `is_exporting` and "
+            "`last_export_result` and sync the UI with the backend's status.\n\n"
+            "## Files Changed\n- `src/prscope/web/frontend/src/pages/PlanningView.tsx`\n- `src/prscope/web/api.py`\n\n"
+            "## Architecture\nAdd backend session-state plumbing via PlanningSession fields so the UI can render export "
+            "status directly from the API contract.\n\n"
+            "## Open Questions\n- None.\n"
+        ),
+        repo_understanding=repo_understanding,
+        draft_phase="planner",
+        requirements_text=(
+            "Update the Planning UI to show the last export result and disable the export action while an export "
+            "is already in progress. Reuse the existing exportSession and downloadFile helpers, preserve current "
+            "PlanPanel behavior, and keep the change localized. Do not introduce new hooks, contexts, shared state "
+            "layers, or background polling. Include focused frontend tests and any minimal backend contract test only "
+            "if the response shape must change."
+        ),
+    )
+
+    assert (
+        "localized UI/API draft introduced backend contract or session-state changes not present in requirements; "
+        "do not invent new response fields or backend status plumbing unless the requirements explicitly require a payload/response change"
+    ) in failures
+
+
+def test_validate_draft_flags_export_state_ownership_ambiguity_for_localized_ui_requests(tmp_path: Path) -> None:
+    agent = _make_agent(tmp_path)
+    repo_understanding = RepoUnderstanding(
+        entrypoints=["src/prscope/web/frontend/src/pages/PlanningView.tsx"],
+        core_modules=[
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx",
+        ],
+        relevant_modules=[
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx",
+            "src/prscope/web/frontend/src/lib/api.ts",
+        ],
+        relevant_tests=["src/prscope/web/frontend/src/pages/PlanningView.test.ts"],
+        architecture_summary="localized export wiring in planning page and panel",
+        risks=[],
+        file_contents={
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx": "export function PlanningView() {}",
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx": "export function PlanPanel() {}",
+            "src/prscope/web/frontend/src/lib/api.ts": "export function exportSession() {}\nexport function downloadFile() {}",
+        },
+        from_mental_model=False,
+    )
+
+    failures = agent.validate_draft(
+        plan_content=(
+            "# Plan\n\n## Summary\nShow export result.\n\n## Goals\n- x\n\n## Non-Goals\n- y\n\n"
+            "## Changes\n- Update `PlanningView.tsx` to pass the necessary props to `PlanPanel`.\n\n"
+            "## Files Changed\n- `src/prscope/web/frontend/src/pages/PlanningView.tsx`\n"
+            "- `src/prscope/web/frontend/src/components/PlanPanel.tsx`\n"
+            "- `src/prscope/web/frontend/src/pages/PlanningView.test.ts`\n\n"
+            "## Architecture\nThe `PlanPanel` component will be updated to keep its internal state for export status, "
+            "reducing reliance on external props from `PlanningView`.\n\n"
+            "## Open Questions\n- None.\n"
+        ),
+        repo_understanding=repo_understanding,
+        draft_phase="planner",
+        requirements_text=(
+            "Update the Planning UI to show the last export result and disable the export action while an export "
+            "is already in progress. Reuse the existing exportSession and downloadFile helpers, preserve current "
+            "PlanPanel behavior, and keep the change localized. Do not introduce new hooks, contexts, shared state "
+            "layers, or background polling."
+        ),
+    )
+
+    assert (
+        "localized UI/API draft leaves export-state ownership ambiguous between `PlanningView.tsx` and `PlanPanel.tsx`; "
+        "choose one owner and keep Files Changed, Architecture, and Implementation Steps consistent about whether state is passed as props or managed inside PlanPanel"
+    ) in failures
+
+
+def test_validate_draft_flags_planpanel_ownership_shift_when_behavior_must_be_preserved(tmp_path: Path) -> None:
+    agent = _make_agent(tmp_path)
+    repo_understanding = RepoUnderstanding(
+        entrypoints=["src/prscope/web/frontend/src/pages/PlanningView.tsx"],
+        core_modules=[
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx",
+        ],
+        relevant_modules=[
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx",
+            "src/prscope/web/frontend/src/lib/api.ts",
+        ],
+        relevant_tests=["src/prscope/web/frontend/src/pages/PlanningView.test.ts"],
+        architecture_summary="localized export wiring in planning page and panel",
+        risks=[],
+        file_contents={
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx": "export function PlanningView() {}",
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx": "export function PlanPanel() {}",
+            "src/prscope/web/frontend/src/lib/api.ts": "export function exportSession() {}\nexport function downloadFile() {}",
+        },
+        from_mental_model=False,
+    )
+
+    failures = agent.validate_draft(
+        plan_content=(
+            "# Plan\n\n## Summary\nShow export result.\n\n## Goals\n- x\n\n## Non-Goals\n- y\n\n"
+            "## Files Changed\n- `src/prscope/web/frontend/src/pages/PlanningView.tsx`\n"
+            "- `src/prscope/web/frontend/src/components/PlanPanel.tsx`\n"
+            "- `src/prscope/web/frontend/src/pages/PlanningView.test.ts`\n\n"
+            "## Architecture\nThe `PlanPanel` will maintain its internal state for export status, thus reducing the dependency "
+            "on `PlanningView`. It will now be responsible for displaying the last export result, enabling or disabling the "
+            "export action, and managing error states internally.\n\n"
+            "## Implementation Steps\n"
+            "1. Update `src/prscope/web/frontend/src/pages/PlanningView.tsx`.\n"
+            "2. Update `src/prscope/web/frontend/src/components/PlanPanel.tsx`.\n"
+            "3. Add coverage in `src/prscope/web/frontend/src/pages/PlanningView.test.ts`.\n"
+        ),
+        repo_understanding=repo_understanding,
+        draft_phase="planner",
+        requirements_text=(
+            "Update the Planning UI to show the last export result and disable the export action while an export "
+            "is already in progress. Reuse the existing exportSession and downloadFile helpers, preserve current "
+            "PlanPanel behavior, and keep the change localized. Do not introduce new hooks, contexts, shared state "
+            "layers, or background polling."
+        ),
+    )
+
+    assert (
+        "localized UI/API draft shifts established export-state ownership into `PlanPanel.tsx` even though the request says to preserve current PlanPanel behavior; "
+        "keep the existing `PlanningView.tsx`-owned wiring and limit PlanPanel changes to localized rendering/button behavior"
+    ) in failures
+
+
+def test_validate_draft_flags_speculative_result_format_questions_for_localized_ui_requests(tmp_path: Path) -> None:
+    agent = _make_agent(tmp_path)
+    repo_understanding = RepoUnderstanding(
+        entrypoints=["src/prscope/web/frontend/src/pages/PlanningView.tsx"],
+        core_modules=[
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx",
+        ],
+        relevant_modules=[
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx",
+            "src/prscope/web/frontend/src/lib/api.ts",
+        ],
+        relevant_tests=["src/prscope/web/frontend/src/pages/PlanningView.test.ts"],
+        architecture_summary="localized export wiring in planning page and panel",
+        risks=[],
+        file_contents={
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx": "export function PlanningView() {}",
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx": "export function PlanPanel() {}",
+            "src/prscope/web/frontend/src/lib/api.ts": "export function exportSession() {}\nexport function downloadFile() {}",
+        },
+        from_mental_model=False,
+    )
+
+    failures = agent.validate_draft(
+        plan_content=(
+            "# Plan\n\n## Summary\nShow export result.\n\n## Goals\n- x\n\n## Non-Goals\n- y\n\n"
+            "## Files Changed\n- `src/prscope/web/frontend/src/pages/PlanningView.tsx`\n"
+            "- `src/prscope/web/frontend/src/components/PlanPanel.tsx`\n"
+            "- `src/prscope/web/frontend/src/pages/PlanningView.test.ts`\n\n"
+            "## Architecture\nKeep the change localized to the existing page/component wiring.\n\n"
+            "## Open Questions\n"
+            "- What specific format or details about the last export result should be shown in the UI?\n"
+            "- Are there any additional requirements for logging the export actions or results?\n"
+        ),
+        repo_understanding=repo_understanding,
+        draft_phase="planner",
+        requirements_text=(
+            "Update the Planning UI to show the last export result and disable the export action while an export "
+            "is already in progress. Reuse the existing exportSession and downloadFile helpers, preserve current "
+            "PlanPanel behavior, and keep the change localized. Do not introduce new hooks, contexts, shared state "
+            "layers, or background polling."
+        ),
+    )
+
+    assert (
+        "localized UI/API draft turned a simple result-display request into speculative formatting open questions; "
+        "default to a concise success/failure result presentation unless the requirements explicitly demand richer formatting"
+    ) in failures
+    assert (
+        "localized UI/API draft introduced observability or telemetry scope not present in requirements; "
+        "remove logging/telemetry/observability wording and keep the plan focused on existing UI wiring, "
+        "API helper reuse, and tests"
+    ) in failures
+
+
+def test_validate_draft_flags_conditional_backend_contract_test_drift_for_localized_ui_requests(tmp_path: Path) -> None:
+    agent = _make_agent(tmp_path)
+    repo_understanding = RepoUnderstanding(
+        entrypoints=["src/prscope/web/api.py"],
+        core_modules=[
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx",
+            "src/prscope/web/api.py",
+        ],
+        relevant_modules=[
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx",
+            "src/prscope/web/frontend/src/lib/api.ts",
+            "src/prscope/web/api.py",
+        ],
+        relevant_tests=["src/prscope/web/frontend/src/pages/PlanningView.test.ts", "tests/test_web_api_models.py"],
+        architecture_summary="frontend export wiring with existing API helpers",
+        risks=[],
+        file_contents={
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx": "export function PlanningView() {}",
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx": "export function PlanPanel() {}",
+            "src/prscope/web/frontend/src/lib/api.ts": "export function exportSession() {}\nexport function downloadFile() {}",
+            "src/prscope/web/api.py": "def get_session():\n    return {}\n",
+        },
+        from_mental_model=False,
+    )
+
+    result = agent.validate_draft_result(
+        plan_content=(
+            "# Plan\n\n## Summary\nShow export result.\n\n## Goals\n- x\n\n## Non-Goals\n- y\n\n"
+            "## Changes\n- Keep the UI wiring localized and only adjust backend behavior if required.\n\n"
+            "## Files Changed\n- `src/prscope/web/frontend/src/pages/PlanningView.tsx`\n"
+            "- `src/prscope/web/frontend/src/components/PlanPanel.tsx`\n"
+            "- `src/prscope/web/frontend/src/pages/PlanningView.test.ts`\n"
+            "- `tests/test_web_api_models.py`\n\n"
+            "## Architecture\nKeep the change localized to the existing component and verified helper wiring.\n\n"
+            "## Implementation Steps\n1. Update the existing localized UI/component flow.\n"
+            "2. Reuse `exportSession` and `downloadFile` exactly as already wired.\n\n"
+            "## Test Strategy\n- Assert the requested user-visible behavior in the focused frontend regression test.\n"
+            "- If the response shape changes, assert the localized backend contract through the existing API model regression test.\n\n"
+            "## Rollback Plan\n- If the localized export UI behavior regresses, restore the prior UI flow.\n"
+        ),
+        repo_understanding=repo_understanding,
+        draft_phase="refiner",
+        requirements_text=(
+            "Update the Planning UI to show the last export result and disable the export action while an export "
+            "is already in progress. Reuse the existing exportSession and downloadFile helpers, preserve current "
+            "PlanPanel behavior, and keep the change localized. Do not introduce new hooks, contexts, shared state "
+            "layers, or background polling. Include focused frontend tests and any minimal backend contract test only "
+            "if the response shape must change."
+        ),
+    )
+
+    assert not result.ok
+    assert "localized_scope_drift" in result.reason_codes
+    assert "missing_localized_backend_grounding" not in result.reason_codes
+
+
 def test_validate_draft_result_normalizes_reason_codes_and_retryability(tmp_path: Path) -> None:
     agent = _make_agent(tmp_path)
     repo_understanding = RepoUnderstanding(
@@ -540,6 +1037,302 @@ def test_validate_draft_result_normalizes_reason_codes_and_retryability(tmp_path
     assert "unknown_file_reference" in result.reason_codes
     assert result.normalized_signature == frozenset(result.reason_codes)
     assert result.failure_count >= 2
+
+
+def test_validate_refinement_result_flags_under_scoped_localized_refinement(tmp_path: Path) -> None:
+    agent = _make_agent(tmp_path)
+    repo_understanding = RepoUnderstanding(
+        entrypoints=["src/prscope/web/frontend/src/pages/PlanningView.tsx"],
+        core_modules=["src/prscope/web/frontend/src/pages/PlanningView.tsx"],
+        relevant_modules=[
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx",
+            "src/prscope/web/frontend/src/lib/api.ts",
+        ],
+        relevant_tests=["src/prscope/web/frontend/src/pages/PlanningView.test.ts"],
+        architecture_summary="localized export status UI",
+        risks=[],
+        file_contents={
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx": "export function PlanningView() {}",
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx": "export function PlanPanel() {}",
+            "src/prscope/web/frontend/src/lib/api.ts": "export function exportSession() {}\nexport function downloadFile() {}",
+        },
+        from_mental_model=False,
+    )
+
+    result = agent.validate_refinement_result(
+        plan_content=(
+            "# Plan\n\n## Goals\n- x\n\n## Non-Goals\n- y\n\n## Files Changed\n"
+            "- `src/prscope/web/frontend/src/components/PlanPanel.tsx`\n\n"
+            "## Architecture\nKeep the change localized.\n\n"
+            "## Implementation Steps\n"
+            "1. Update the existing localized UI/component flow.\n"
+            "2. Reuse `exportSession` and `downloadFile` exactly as already wired.\n\n"
+            "## Test Strategy\n"
+            "- Assert the requested user-visible behavior in `src/prscope/web/frontend/src/pages/PlanningView.test.ts`.\n\n"
+            "## Rollback Plan\n"
+            "- If the localized export UI behavior regresses, restore the prior UI flow.\n"
+        ),
+        repo_understanding=repo_understanding,
+        requirements_text=(
+            "Update the Planning UI to show the last export result and disable the export action while an export "
+            "is already in progress. Reuse the existing exportSession and downloadFile helpers, preserve current "
+            "PlanPanel behavior, and keep the change localized. Include focused frontend tests."
+        ),
+    )
+
+    assert not result.ok
+    assert "missing_sections" in result.reason_codes
+    assert "grounding_failure" in result.reason_codes
+    assert "under-scoped draft: one file in Files Changed but multiple referenced files" in result.failure_messages
+    assert (
+        "Files Changed entries missing from Implementation Steps: "
+        "src/prscope/web/frontend/src/components/PlanPanel.tsx"
+    ) in result.failure_messages
+
+
+def test_strip_localized_scope_drift_lines_removes_conditional_backend_contract_hedges() -> None:
+    repaired = AuthorPlannerPipeline._strip_localized_scope_drift_lines(
+        (
+            "# Plan\n\n"
+            "## Goals\n"
+            "- Display the last export result.\n"
+            "- Add `is_exporting` and `last_export_result` to `getSession`.\n\n"
+            "## Non-Goals\n"
+            "- Avoid broad backend changes beyond the `getSession` payload.\n\n"
+            "## Files Changed\n"
+            "- `src/prscope/web/frontend/src/pages/PlanningView.tsx`\n"
+            "- `tests/test_web_api_models.py`\n\n"
+            "## Architecture\n"
+            "Keep the change localized to the existing component wiring.\n"
+            "Only touch `src/prscope/web/api.py` if the response shape must change.\n\n"
+            "## Test Strategy\n"
+            "- Assert the requested user-visible behavior in the focused frontend regression test.\n"
+            "- If the response shape changes, assert the localized backend contract through the existing API model regression test.\n"
+        ),
+        (
+            "Update the Planning UI to show the last export result and disable the export action while an export is "
+            "already in progress. Reuse the existing exportSession and downloadFile helpers, preserve current PlanPanel "
+            "behavior, and keep the change localized. Include focused frontend tests and any minimal backend contract "
+            "test only if the response shape must change."
+        ),
+    )
+
+    assert "tests/test_web_api_models.py" not in repaired
+    assert "src/prscope/web/api.py" not in repaired
+    assert "backend contract through the existing API model regression test" not in repaired
+    assert "is_exporting" not in repaired
+    assert "getSession" not in repaired
+
+
+def test_repair_sanitizer_strips_conditional_backend_contract_updates() -> None:
+    current_plan = PlanDocument(
+        title="Plan",
+        summary="Keep it localized.",
+        goals="- x",
+        non_goals="- y",
+        files_changed="- `src/prscope/web/frontend/src/pages/PlanningView.tsx`\n- `src/prscope/web/frontend/src/components/PlanPanel.tsx`",
+        architecture="Keep the change localized to the existing UI flow and verified helper wiring.",
+        implementation_steps="1. Update the component.\n2. Reuse existing helpers.",
+        test_strategy="- Assert the requested user-visible behavior in the focused frontend regression test.",
+        rollback_plan="- Restore the prior UI flow if the behavior regresses.",
+        open_questions="- None.",
+    )
+
+    requirements = (
+        "Update the Planning UI to show the last export result and disable the export action while an export is already "
+        "in progress. Reuse the existing exportSession and downloadFile helpers, preserve current PlanPanel behavior, "
+        "and keep the change localized. Include focused frontend tests and any minimal backend contract test only if "
+        "the response shape must change."
+    )
+
+    sanitized_files = AuthorRepairService._sanitize_localized_ui_update(
+        section_id="files_changed",
+        content=(
+            "- `src/prscope/web/frontend/src/pages/PlanningView.tsx`\n"
+            "- `src/prscope/web/api.py`\n"
+            "- `tests/test_web_api_models.py`\n"
+        ),
+        requirements=requirements,
+        current_plan=current_plan,
+    )
+    sanitized_tests = AuthorRepairService._sanitize_localized_ui_update(
+        section_id="test_strategy",
+        content=(
+            "- Assert the requested user-visible behavior in the focused frontend regression test.\n"
+            "- If the response shape changes, assert the localized backend contract through the existing API model regression test.\n"
+        ),
+        requirements=requirements,
+        current_plan=current_plan,
+    )
+
+    assert "src/prscope/web/api.py" not in sanitized_files
+    assert "tests/test_web_api_models.py" not in sanitized_files
+    assert "API model regression test" not in sanitized_tests
+
+
+def test_repair_sanitizer_strips_conditional_backend_contract_goals() -> None:
+    current_plan = PlanDocument(
+        title="Plan",
+        summary="Keep it localized.",
+        goals="- Keep the change localized.\n- Reuse existing helpers.",
+        non_goals="- Do not add backend contract changes.",
+        files_changed="- `src/prscope/web/frontend/src/pages/PlanningView.tsx`",
+        architecture="Keep the change localized to the existing UI flow and verified helper wiring.",
+        implementation_steps="1. Update the component.\n2. Reuse existing helpers.",
+        test_strategy="- Assert the requested user-visible behavior in the focused frontend regression test.",
+        rollback_plan="- Restore the prior UI flow if the behavior regresses.",
+        open_questions="- None.",
+    )
+    requirements = (
+        "Update the Planning UI to show the last export result and disable the export action while an export is already "
+        "in progress. Reuse the existing exportSession and downloadFile helpers, preserve current PlanPanel behavior, "
+        "and keep the change localized. Include focused frontend tests and any minimal backend contract test only if "
+        "the response shape must change."
+    )
+
+    sanitized_goals = AuthorRepairService._sanitize_localized_ui_update(
+        section_id="goals",
+        content=(
+            "- Display the last export result.\n"
+            "- Introduce minimal backend contract changes to `getSession` to expose `is_exporting` and `last_export_at`.\n"
+        ),
+        requirements=requirements,
+        current_plan=current_plan,
+    )
+    sanitized_non_goals = AuthorRepairService._sanitize_localized_ui_update(
+        section_id="non_goals",
+        content="- Avoid broad backend changes beyond the `getSession` payload.",
+        requirements=requirements,
+        current_plan=current_plan,
+    )
+
+    assert "is_exporting" not in sanitized_goals
+    assert "last_export_at" not in sanitized_goals
+    assert "getSession" not in sanitized_non_goals
+
+
+def test_author_planner_pipeline_deterministically_replaces_unverified_paths() -> None:
+    pipeline = AuthorPlannerPipeline(
+        tool_executor=SimpleNamespace(memory_block_callback=None, read_history={}),
+        scan_repo_candidates=lambda **_: None,
+        explore_repo=lambda **_: None,
+        classify_complexity=lambda **_: "moderate",
+        draft_plan=lambda **_: None,
+        validate_draft=lambda **_: ValidationResult.success(),
+    )
+    repo_understanding = RepoUnderstanding(
+        entrypoints=["src/prscope/web/frontend/src/pages/PlanningView.tsx"],
+        core_modules=["src/prscope/web/frontend/src/pages/PlanningView.tsx"],
+        relevant_modules=["src/prscope/web/frontend/src/components/PlanPanel.tsx"],
+        relevant_tests=["src/prscope/web/frontend/src/pages/PlanningView.test.ts"],
+        architecture_summary="localized export UI",
+        risks=[],
+        file_contents={},
+        from_mental_model=False,
+    )
+    original_plan = (
+        "# Plan\n\n## Goals\n- x\n\n## Non-Goals\n- y\n\n## Files Changed\n"
+        "- `src/prscope/web/frontend/src/tests/PlanPanel.test.tsx`\n\n"
+        "## Architecture\nKeep the change localized.\n\n"
+        "## Implementation Steps\n1. Update the UI.\n\n"
+        "## Test Strategy\n- Cover the export state in `src/prscope/web/frontend/src/tests/PlanPanel.test.tsx`.\n"
+    )
+    repaired_plan, repaired_result = pipeline._deterministic_plan_repairs(
+        plan_content=original_plan,
+        validation_result=ValidationResult(
+            failure_messages=(
+                "replace unverified path `src/prscope/web/frontend/src/tests/PlanPanel.test.tsx` with `src/prscope/web/frontend/src/pages/PlanningView.test.ts`",
+            ),
+            reason_codes=("unknown_file_reference",),
+            retryable=True,
+            failure_count=1,
+        ),
+        repo_understanding=repo_understanding,
+        evidence_bundle=EvidenceBundle(
+            relevant_files=("src/prscope/web/frontend/src/pages/PlanningView.tsx",),
+            existing_components=(),
+            test_targets=("src/prscope/web/frontend/src/pages/PlanningView.test.ts",),
+            related_modules=(),
+            existing_routes_or_helpers=(),
+            evidence_notes=(),
+        ),
+        min_grounding_ratio=0.35,
+        grounding_paths=set(),
+        requirements="Keep the change localized and add focused frontend tests.",
+    )
+
+    assert repaired_result.ok
+    assert "src/prscope/web/frontend/src/tests/PlanPanel.test.tsx" not in repaired_plan
+    assert "src/prscope/web/frontend/src/pages/PlanningView.test.ts" in repaired_plan
+
+
+def test_author_planner_pipeline_keeps_localized_frontend_owner_paths_in_files_changed() -> None:
+    pipeline = AuthorPlannerPipeline(
+        tool_executor=SimpleNamespace(memory_block_callback=None, read_history={}),
+        scan_repo_candidates=lambda **_: None,
+        explore_repo=lambda **_: None,
+        classify_complexity=lambda **_: "moderate",
+        draft_plan=lambda **_: None,
+        validate_draft=lambda **_: ValidationResult.success(),
+    )
+    repo_understanding = RepoUnderstanding(
+        entrypoints=["src/prscope/web/frontend/src/pages/PlanningView.tsx"],
+        core_modules=["src/prscope/web/frontend/src/pages/PlanningView.tsx"],
+        relevant_modules=[
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx",
+            "src/prscope/web/frontend/src/lib/api.ts",
+        ],
+        relevant_tests=["src/prscope/web/frontend/src/pages/PlanningView.test.ts"],
+        architecture_summary="localized export UI",
+        risks=[],
+        file_contents={},
+        from_mental_model=False,
+    )
+    original_plan = (
+        "# Plan\n\n## Summary\nKeep the change localized.\n\n## Goals\n- x\n\n## Non-Goals\n- y\n\n## Files Changed\n"
+        "- `src/prscope/web/frontend/src/pages/PlanningView.test.ts`\n\n"
+        "## Architecture\nKeep the change localized.\n\n"
+        "## Implementation Steps\n1. Update the UI.\n\n"
+        "## Test Strategy\n- Cover the export state in `src/prscope/web/frontend/src/pages/PlanningView.test.ts`.\n"
+    )
+    repaired_plan, repaired_result = pipeline._deterministic_plan_repairs(
+        plan_content=original_plan,
+        validation_result=ValidationResult(
+            failure_messages=(
+                "localized frontend UI change should reference a frontend regression target; mention `src/prscope/web/frontend/src/pages/PlanningView.test.ts`",
+            ),
+            reason_codes=("missing_tests",),
+            retryable=True,
+            failure_count=1,
+        ),
+        repo_understanding=repo_understanding,
+        evidence_bundle=EvidenceBundle(
+            relevant_files=(
+                "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+                "src/prscope/web/frontend/src/components/PlanPanel.tsx",
+                "src/prscope/web/frontend/src/lib/api.ts",
+            ),
+            existing_components=(),
+            test_targets=("src/prscope/web/frontend/src/pages/PlanningView.test.ts",),
+            related_modules=(),
+            existing_routes_or_helpers=("exportSession", "downloadFile"),
+            evidence_notes=(),
+        ),
+        min_grounding_ratio=0.35,
+        grounding_paths=set(),
+        requirements=(
+            "Update the Planning UI to show the last export result and disable the export action while an export is already "
+            "in progress. Reuse the existing exportSession and downloadFile helpers, preserve current PlanPanel behavior, "
+            "and keep the change localized."
+        ),
+    )
+
+    assert repaired_result.ok
+    assert "src/prscope/web/frontend/src/pages/PlanningView.tsx" in repaired_plan
+    assert "src/prscope/web/frontend/src/components/PlanPanel.tsx" in repaired_plan
+    assert "src/prscope/web/frontend/src/lib/api.ts" in repaired_plan
 
 
 def test_validate_draft_result_requires_verified_test_target_when_tests_requested(tmp_path: Path) -> None:
@@ -581,6 +1374,56 @@ def test_validate_draft_result_requires_verified_test_target_when_tests_requeste
     assert not result.ok
     assert "missing_tests" in result.reason_codes
     assert any("PlanningView.test.ts" in failure for failure in result.failure_messages)
+
+
+def test_validate_draft_result_requires_frontend_regression_target_for_localized_ui_requests(tmp_path: Path) -> None:
+    agent = _make_agent(tmp_path)
+    repo_understanding = RepoUnderstanding(
+        entrypoints=["src/prscope/web/api.py"],
+        core_modules=[
+            "src/prscope/web/api.py",
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+        ],
+        relevant_modules=[
+            "src/prscope/web/api.py",
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx",
+            "src/prscope/web/frontend/src/lib/api.ts",
+        ],
+        relevant_tests=["tests/test_web_api_models.py", "src/prscope/web/frontend/src/pages/PlanningView.test.ts"],
+        architecture_summary="localized export status UI with small backend payload tweak",
+        risks=[],
+        file_contents={
+            "src/prscope/web/frontend/src/lib/api.ts": "export function exportSession() {}\nexport function downloadFile() {}",
+        },
+        from_mental_model=False,
+    )
+
+    result = agent.validate_draft_result(
+        plan_content=(
+            "# Draft\n\n## Goals\n- x\n\n## Non-Goals\n- y\n\n## Files Changed\n"
+            "- `src/prscope/web/frontend/src/components/PlanPanel.tsx`\n"
+            "- `src/prscope/web/api.py`\n"
+            "- `tests/test_web_api_models.py`\n\n"
+            "## Architecture\nReuse `exportSession` and `downloadFile` while keeping any response shape tweak localized.\n\n"
+            "## Open Questions\n- None.\n"
+        ),
+        repo_understanding=repo_understanding,
+        draft_phase="planner",
+        min_grounding_ratio=0.35,
+        requirements_text=(
+            "Update the Planning UI to show the last export result and disable the export action while an export is "
+            "already in progress. Reuse the existing exportSession and downloadFile helpers, preserve current "
+            "PlanPanel behavior, keep the change localized, and add focused frontend tests. Include a minimal backend "
+            "contract test only if the response shape must change."
+        ),
+    )
+
+    assert not result.ok
+    assert "missing_tests" in result.reason_codes
+    assert (
+        "localized frontend UI change should reference a frontend regression target; mention "
+        "`src/prscope/web/frontend/src/pages/PlanningView.test.ts`"
+    ) in result.failure_messages
 
 
 def test_validate_draft_result_suggests_closest_verified_path_for_unknown_reference(tmp_path: Path) -> None:
@@ -1579,8 +2422,119 @@ async def test_author_planner_pipeline_deterministically_repairs_localized_scope
         timeout_seconds_override=None,
     )
 
-    assert "observability" not in result.plan.lower()
-    assert "logging" not in result.plan.lower()
+    agent = _make_agent(Path("."))
+    architecture = agent._validation_service.extract_section(result.plan, "Architecture").lower()  # type: ignore[attr-defined]
+    changes = agent._validation_service.extract_section(result.plan, "Changes").lower()  # type: ignore[attr-defined]
+    assert "observability" not in architecture
+    assert "logging" not in architecture
+    assert "observability" not in changes
+    assert "logging" not in changes
+    assert result.draft_diagnostics["quality_gate_failures"] == []
+
+
+@pytest.mark.asyncio
+async def test_author_planner_pipeline_deterministically_repairs_frontend_state_scope_drift() -> None:
+    repo_understanding = RepoUnderstanding(
+        entrypoints=["src/prscope/web/frontend/src/components/PlanPanel.tsx"],
+        core_modules=["src/prscope/web/frontend/src/components/PlanPanel.tsx"],
+        relevant_modules=[
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx",
+            "src/prscope/web/frontend/src/lib/api.ts",
+        ],
+        relevant_tests=["src/prscope/web/frontend/src/pages/PlanningView.test.ts"],
+        architecture_summary="frontend export wiring",
+        risks=[],
+        file_contents={
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx": "export function PlanPanel() {}",
+            "src/prscope/web/frontend/src/lib/api.ts": "export function exportSession() {}\nexport function downloadFile() {}",
+        },
+        from_mental_model=False,
+    )
+    validations = [
+        ValidationResult(
+            failure_messages=(
+                "localized UI/API draft introduced frontend state or polling abstractions not present in requirements; "
+                "remove hooks/contexts/shared-state/state-management/polling wording and keep the plan focused on direct component wiring, "
+                "existing helper reuse, PlanPanel compatibility, and tests",
+            ),
+            reason_codes=("localized_scope_drift",),
+            retryable=True,
+            failure_count=1,
+        ),
+        ValidationResult(
+            failure_messages=(
+                "localized UI/API draft introduced frontend state or polling abstractions not present in requirements; "
+                "remove hooks/contexts/shared-state/state-management/polling wording and keep the plan focused on direct component wiring, "
+                "existing helper reuse, PlanPanel compatibility, and tests",
+            ),
+            reason_codes=("localized_scope_drift",),
+            retryable=True,
+            failure_count=1,
+        ),
+        ValidationResult.success(),
+    ]
+
+    async def _draft_plan(**_: object) -> str:
+        return (
+            "# Draft\n\n## Summary\nShow export result.\n\n## Goals\n- x\n\n## Non-Goals\n"
+            "- Do not introduce new hooks, contexts, shared state layers, or background polling.\n\n"
+            "## Changes\n- Tighten export UI with polling safeguards, a `lastExportResult` state object, and component-local state.\n\n"
+            "## Files Changed\n- `src/prscope/web/frontend/src/components/PlanPanel.tsx`\n"
+            "- `src/prscope/web/frontend/src/lib/api.ts`\n"
+            "- `src/prscope/web/frontend/src/pages/PlanningView.test.ts`\n\n"
+            "## Architecture\nUse `useState` with an `isExporting` boolean, `lastExportResult`, local state, hooks/contexts, and background polling around `exportSession`.\n\n"
+            "## Open Questions\n- None.\n"
+        )
+
+    pipeline = AuthorPlannerPipeline(
+        tool_executor=SimpleNamespace(memory_block_callback=None, read_history={}),
+        scan_repo_candidates=lambda **_: RepoCandidates(
+            entrypoints=["src/prscope/web/frontend/src/components/PlanPanel.tsx"],
+            source_modules=[
+                "src/prscope/web/frontend/src/components/PlanPanel.tsx",
+                "src/prscope/web/frontend/src/lib/api.ts",
+            ],
+            tests_and_config=["src/prscope/web/frontend/src/pages/PlanningView.test.ts"],
+            all_paths=[
+                "src/prscope/web/frontend/src/components/PlanPanel.tsx",
+                "src/prscope/web/frontend/src/lib/api.ts",
+                "src/prscope/web/frontend/src/pages/PlanningView.test.ts",
+            ],
+        ),
+        explore_repo=lambda **_: repo_understanding,
+        classify_complexity=lambda **_: "moderate",
+        draft_plan=_draft_plan,
+        validate_draft=lambda **_: validations.pop(0),
+    )
+
+    result = await pipeline.run(
+        requirements=(
+            "Update the Planning UI to show the last export result and disable the export action while an export "
+            "is already in progress. Reuse the existing exportSession and downloadFile helpers, preserve current "
+            "PlanPanel behavior, and keep the change localized. Do not introduce new hooks, contexts, shared state "
+            "layers, or background polling."
+        ),
+        min_grounding_ratio=0.45,
+        grounding_paths={"src/prscope/web/frontend/src/components/PlanPanel.tsx"},
+        model_override=None,
+        rejection_counts={},
+        rejection_reasons=[],
+        timeout_seconds_override=None,
+    )
+
+    agent = _make_agent(Path("."))
+    architecture = agent._validation_service.extract_section(result.plan, "Architecture").lower()  # type: ignore[attr-defined]
+    changes = agent._validation_service.extract_section(result.plan, "Changes").lower()  # type: ignore[attr-defined]
+    assert "state management" not in architecture
+    assert "hooks/contexts" not in architecture
+    assert "background polling" not in architecture
+    assert "usestate" not in architecture
+    assert "isexporting" not in architecture
+    assert "lastexportresult" not in architecture
+    assert "local state" not in architecture
+    assert "polling safeguards" not in changes
+    assert "lastexportresult" not in changes
+    assert "component-local state" not in changes
     assert result.draft_diagnostics["quality_gate_failures"] == []
 
 
@@ -2363,8 +3317,79 @@ async def test_draft_plan_prioritizes_relevant_verified_paths_and_existing_guida
     assert "mention those exact helper names in the plan instead of saying only 'existing helpers'" in user_prompt
     assert "name at least one of those exact test files in the plan" in user_prompt
     assert "localized UI/API work" in user_prompt
+    assert "do not prescribe hook APIs, state variable names, or explicit local-state object shapes" in user_prompt
+    assert "`useState`, `useEffect`, `isExporting`, `lastExportResult`" in user_prompt
     assert "Do not reference planning runtime or discovery modules for frontend wiring work" in user_prompt
     assert "compatibility constraint or test target" in user_prompt
     assert "do not add observability, logging, telemetry, rollout controls, or platform notes" in str(
         messages[0]["content"]
     )
+    assert "do not prescribe hook APIs, state variable names, or concrete local-state shapes" in str(messages[0]["content"])
+
+
+@pytest.mark.asyncio
+async def test_author_repair_service_falls_back_after_google_json_contract_failures() -> None:
+    calls: list[str | None] = []
+
+    async def fake_llm_call(messages, **kwargs):  # type: ignore[no-untyped-def]
+        del messages
+        model_override = kwargs.get("model_override")
+        calls.append(model_override)
+        if model_override == "gemini-2.5-flash":
+            response_text = '{"problem_understanding":"Need tighter scope"'
+        else:
+            response_text = json.dumps(
+                {
+                    "problem_understanding": "Need tighter scope",
+                    "accepted_issues": ["Clarify fallback handling"],
+                    "rejected_issues": [],
+                    "root_causes": ["Model-specific JSON truncation"],
+                    "repair_strategy": "Retry with a certified structured-output model.",
+                    "target_sections": ["architecture"],
+                    "revision_plan": "Update the architecture section with explicit fallback behavior.",
+                }
+            )
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=response_text))]
+        )
+        return response, str(model_override or "")
+
+    repair_service = AuthorRepairService(fake_llm_call)
+    repair = await repair_service.plan_repair(
+        review=ReviewResult(
+            strengths=[],
+            architectural_concerns=[],
+            risks=[],
+            simplification_opportunities=[],
+            blocking_issues=["Clarify fallback handling"],
+            reviewer_questions=[],
+            recommended_changes=[],
+            design_quality_score=6.5,
+            confidence="medium",
+            review_complete=False,
+            simplest_possible_design=None,
+            primary_issue="Clarify fallback handling",
+            resolved_issues=[],
+            constraint_violations=[],
+            issue_priority=["Clarify fallback handling"],
+            prose="",
+        ),
+        plan=PlanDocument(
+            title="Plan",
+            summary="Summary",
+            goals="Goals",
+            non_goals="Non-goals",
+            files_changed="`src/app.py`",
+            architecture="Architecture",
+            implementation_steps="1. Step",
+            test_strategy="Tests",
+            rollback_plan="Rollback",
+            open_questions="- None.",
+        ),
+        requirements="Clarify provider-aware fallback handling.",
+        model_override="gemini-2.5-flash",
+        fallback_model_override="gpt-4o-mini",
+    )
+
+    assert repair.problem_understanding == "Need tighter scope"
+    assert calls == ["gemini-2.5-flash", "gemini-2.5-flash", "gpt-4o-mini"]

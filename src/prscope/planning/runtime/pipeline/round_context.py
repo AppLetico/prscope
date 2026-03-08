@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from ...core import PlanningCore
+from ..model_policy import ResolvedModelPolicy
 from ..state import PlanningState
 
 
@@ -19,6 +20,7 @@ class PlanningRoundContext:
     requirements: str
     state: PlanningState
     issue_tracker: Any
-    selected_author_model: str
-    selected_critic_model: str
-    event_callback: Any | None
+    selected_author_model: str | None = None
+    selected_critic_model: str | None = None
+    model_policy: ResolvedModelPolicy | None = None
+    event_callback: Any | None = None

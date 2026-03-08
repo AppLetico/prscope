@@ -7,7 +7,9 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from ..tools import extract_file_references
+from .discovery import is_localized_frontend_request
 from .models import AttemptContext, AuthorResult, EvidenceBundle, ValidationResult
+from .validation import localized_request_explicit_payload_change
 
 logger = logging.getLogger(__name__)
 
@@ -312,6 +314,22 @@ class AuthorPlannerPipeline:
         return tuple(dict.fromkeys(repairs))
 
     @staticmethod
+    def _path_replacement_candidates(validation_result: ValidationResult) -> tuple[tuple[str, str], ...]:
+        replacements: list[tuple[str, str]] = []
+        for failure in validation_result.failure_messages:
+            match = re.match(
+                r"replace unverified path `([^`]+)` with `([^`]+)`",
+                str(failure or "").strip(),
+            )
+            if not match:
+                continue
+            original = match.group(1).strip()
+            replacement = match.group(2).strip()
+            if original and replacement and original != replacement:
+                replacements.append((original, replacement))
+        return tuple(dict.fromkeys(replacements))
+
+    @staticmethod
     def _backend_grounding_candidates(validation_result: ValidationResult) -> tuple[str, ...]:
         candidates: list[str] = []
         for failure in validation_result.failure_messages:
@@ -321,13 +339,124 @@ class AuthorPlannerPipeline:
         return tuple(dict.fromkeys(path for path in candidates if path))
 
     @staticmethod
-    def _strip_localized_scope_drift_lines(plan_content: str) -> str:
-        filtered_lines = [
-            line
-            for line in plan_content.splitlines()
-            if not any(token in line.lower() for token in ("observability", "telemetry", "logging", "monitoring"))
+    def _localized_frontend_owner_paths(
+        evidence_bundle: EvidenceBundle,
+        requirements: str,
+    ) -> tuple[str, ...]:
+        if not is_localized_frontend_request(requirements):
+            return ()
+        preferred: list[str] = []
+        relevant_files = [str(path).strip() for path in evidence_bundle.relevant_files if str(path).strip()]
+
+        def _append_if_present(path: str) -> None:
+            if path in relevant_files and path not in preferred:
+                preferred.append(path)
+
+        lower_requirements = str(requirements or "").lower()
+        if "planning" in lower_requirements:
+            _append_if_present("src/prscope/web/frontend/src/pages/PlanningView.tsx")
+        if "planpanel" in lower_requirements:
+            _append_if_present("src/prscope/web/frontend/src/components/PlanPanel.tsx")
+        if any(token in lower_requirements for token in ("export", "download", "snapshot")):
+            _append_if_present("src/prscope/web/frontend/src/lib/api.ts")
+
+        for path in relevant_files:
+            lowered = path.lower()
+            if "/frontend/" not in lowered or re.search(r"\.test\.(?:[jt]sx?)$", lowered):
+                continue
+            if path not in preferred:
+                preferred.append(path)
+            if len(preferred) >= 3:
+                break
+        return tuple(preferred[:3])
+
+    @staticmethod
+    def _strip_localized_scope_drift_lines(plan_content: str, requirements: str) -> str:
+        actionable_headings = {
+            "summary",
+            "goals",
+            "non-goals",
+            "non_goals",
+            "changes",
+            "files changed",
+            "architecture",
+            "implementation steps",
+            "test strategy",
+        }
+        lowered_requirements = str(requirements or "").lower()
+        drift_patterns = [
+            r"\bobservability\b",
+            r"\btelemetry\b",
+            r"\blogging\b",
+            r"\bmonitoring\b",
         ]
-        repaired = "\n".join(filtered_lines).strip()
+        if any(
+            phrase in lowered_requirements
+            for phrase in (
+                "do not introduce new hooks",
+                "do not introduce hooks",
+                "avoid new hooks",
+                "do not introduce new contexts",
+                "avoid new contexts",
+                "do not introduce shared state",
+                "shared state layers",
+                "do not introduce background polling",
+                "background polling",
+                "keep the change localized",
+            )
+        ):
+            drift_patterns.extend(
+                [
+                    r"\b(new|dedicated)\s+hooks?\b",
+                    r"\bhooks?/contexts?\b",
+                    r"\buseState\b",
+                    r"\buseEffect\b",
+                    r"\bisExporting\b",
+                    r"\blastExportResult\b",
+                    r"\bcontext\s+provider\b",
+                    r"\blocal state\b",
+                    r"\bcomponent-local state\b",
+                    r"\bshared state\b",
+                    r"\bcentralized state\b",
+                    r"\bstate management\b",
+                    r"\bbackground polling\b",
+                    r"\bpolling\b",
+                    r"\bself-contained state\b",
+                ]
+            )
+        if not localized_request_explicit_payload_change(requirements):
+            drift_patterns.extend(
+                [
+                    r"\bget_session\b",
+                    r"\bgetsession\b",
+                    r"\bplanningsession\b",
+                    r"\bis_exporting\b",
+                    r"\blast_export_result\b",
+                    r"\blast_export_at\b",
+                    r"\bsrc/prscope/web/api\.py\b",
+                    r"\btests/test_web_api_models\.py\b",
+                    r"\bapi model regression test\b",
+                    r"\bbackend payload\b",
+                    r"\bbackend contract\b",
+                    r"\bpayload/response\b",
+                    r"\bresponse shape\b",
+                    r"\bpayload shape\b",
+                ]
+            )
+        lines: list[str] = []
+        current_heading = ""
+        for line in plan_content.splitlines():
+            heading_match = re.match(r"^##\s+(.+?)\s*$", line.strip(), flags=re.IGNORECASE)
+            if heading_match:
+                current_heading = heading_match.group(1).strip().lower()
+                lines.append(line)
+                continue
+            if current_heading in actionable_headings and any(
+                re.search(pattern, line, flags=re.IGNORECASE) for pattern in drift_patterns
+            ):
+                continue
+            lines.append(line)
+        repaired = "\n".join(lines).strip()
         return repaired + "\n" if repaired else plan_content
 
     def _deterministic_plan_repairs(
@@ -344,8 +473,11 @@ class AuthorPlannerPipeline:
         repaired = plan_content
         if "missing_tests" in validation_result.reason_codes and evidence_bundle.test_targets:
             repaired = self._insert_test_target_into_files_changed(repaired, evidence_bundle.test_targets[0])
+        if "unknown_file_reference" in validation_result.reason_codes:
+            for original, replacement in self._path_replacement_candidates(validation_result):
+                repaired = repaired.replace(f"`{original}`", f"`{replacement}`")
         if "localized_scope_drift" in validation_result.reason_codes:
-            repaired = self._strip_localized_scope_drift_lines(repaired)
+            repaired = self._strip_localized_scope_drift_lines(repaired, requirements)
         if "missing_helper_reuse" in validation_result.reason_codes:
             for concept, helper_name in self._helper_reuse_candidates(validation_result):
                 repaired = self._insert_helper_reuse_note(
@@ -361,6 +493,23 @@ class AuthorPlannerPipeline:
                     else "Cover the localized backend payload/response adjustment with the existing API model regression test."
                 )
                 repaired = self._insert_path_into_files_changed(repaired, path, rationale)
+        localized_owner_rationales = {
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx": (
+                "Keep the localized export UI wiring in the existing planning page instead of introducing a new owner."
+            ),
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx": (
+                "Preserve existing PlanPanel export and health behavior while wiring the localized UI change."
+            ),
+            "src/prscope/web/frontend/src/lib/api.ts": (
+                "Preserve the existing frontend API helper wiring for the reused export/snapshot helpers."
+            ),
+        }
+        for path in self._localized_frontend_owner_paths(evidence_bundle, requirements):
+            repaired = self._insert_path_into_files_changed(
+                repaired,
+                path,
+                localized_owner_rationales.get(path, "Keep the localized UI change anchored to the verified existing frontend owner."),
+            )
         planpanel_path = "src/prscope/web/frontend/src/components/PlanPanel.tsx"
         if "planpanel" in requirements.lower() and "PlanPanel" in repaired and planpanel_path in evidence_bundle.relevant_files:
             repaired = self._insert_path_into_files_changed(

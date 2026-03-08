@@ -40,6 +40,7 @@ from .followups import (
     followups_to_json,
     merge_decision_graphs,
 )
+from .model_policy import ResolvedModelPolicy, RuntimeModelPolicyResolver
 from .orchestration_support import (
     RuntimeChatFlow,
     RuntimeEventRouter,
@@ -152,20 +153,47 @@ class PlanningRuntime:
         self._chat_flow = RuntimeChatFlow(self)
         self._round_entry = RuntimeRoundEntry(self)
         self._followup_engine = FollowupEngine()
+        self._model_policy_resolver = RuntimeModelPolicyResolver(self.planning_config)
 
     def _resolve_author_model(
         self,
         session: PlanningSession,
         author_model_override: str | None,
+        *,
+        stage: str = "author_refine",
     ) -> str:
-        return author_model_override or session.author_model or self.planning_config.author_model
+        return self._resolve_model_policy(
+            session,
+            author_model_override=author_model_override,
+            critic_model_override=None,
+        ).for_stage(stage).primary_model
 
     def _resolve_critic_model(
         self,
         session: PlanningSession,
         critic_model_override: str | None,
+        *,
+        stage: str = "critic_review",
     ) -> str:
-        return critic_model_override or session.critic_model or self.planning_config.critic_model
+        return self._resolve_model_policy(
+            session,
+            author_model_override=None,
+            critic_model_override=critic_model_override,
+        ).for_stage(stage).primary_model
+
+    def _resolve_model_policy(
+        self,
+        session: PlanningSession,
+        *,
+        author_model_override: str | None,
+        critic_model_override: str | None,
+    ) -> ResolvedModelPolicy:
+        return self._model_policy_resolver.resolve(
+            session_author_model=session.author_model,
+            session_critic_model=session.critic_model,
+            author_model_override=author_model_override,
+            critic_model_override=critic_model_override,
+        )
 
     def _core(self, session_id: str) -> PlanningCore:
         return PlanningCore(self.store, session_id, self.planning_config)

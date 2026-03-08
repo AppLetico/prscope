@@ -6,6 +6,8 @@ This document explains the core graph-shaped planning artifacts in prscope:
 - `issue_graph`: graph-backed review and validation state for a live planning session
 - `impact_view`: derived cross-graph reasoning output computed from the first two
 
+Prscope treats architecture planning as a deterministic graph system. Persisted artifacts store the canonical planning state, while runtime graphs and views are recomputable projections over that state.
+
 They are related, but they serve different purposes and live in different places.
 
 ## Why Two Graphs
@@ -59,6 +61,14 @@ flowchart TD
     issueIngestion --> issueGraphSnapshot
 ```
 
+Prscope treats architecture planning as a layered system:
+
+1. Canonical persisted artifacts store the authoritative planning state.
+2. Deterministic projections (read models) compute runtime views over that state.
+3. Agent-driven authoring and review update persisted artifacts through controlled ingestion.
+
+All projection layers above persistence must remain deterministic and recomputable from explicit inputs.
+
 This layering keeps the core invariant simple:
 
 - persisted artifacts are canonical state
@@ -80,6 +90,12 @@ All graph-derived read models should:
 - avoid model calls, timestamps, and randomness
 - produce identical output for identical inputs
 - remain safe to recompute after reload, retry, or crash recovery
+
+## Non-Hermetic Boundary
+
+Issue ingestion may use model-assisted similarity and linking, for example embedding-backed dedupe, before the final `issue_graph` snapshot is persisted.
+
+Once persisted, the snapshot becomes canonical input and all runtime projections remain deterministic.
 
 ## Decision Graph
 
@@ -248,13 +264,15 @@ Snapshot behavior:
 - `issue_graph` is the richer additive structure
 - adjacency indexes are runtime-derived and are not persisted
 
-Once persisted, the issue-graph payload is deterministic and replayable on reload. The non-hermetic boundary is earlier in ingestion: dedupe and linking can depend on embedding-backed similarity or other model-assisted logic before the final snapshot is written.
+Once persisted, the issue-graph payload is deterministic and replayable on reload.
 
 Session APIs expose `issue_graph` directly from the snapshot, and frontend screens render from it when present.
 
 ## Impact View
 
 ### Purpose
+
+`impact_view` is the architectural pressure model derived from `decision_graph` and `issue_graph`. It explains how review findings propagate into architectural decision risk without mutating decision state.
 
 `impact_view` is the derived reasoning layer that answers:
 
@@ -273,7 +291,7 @@ Primary code paths:
 - `src/prscope/planning/runtime/review/issue_types.py`
 - `src/prscope/web/api.py`
 
-The projector is intentionally separate from `decision_graph.py`. It depends on both persisted graphs, so it belongs with review/runtime projection logic rather than with canonical decision-state ownership.
+The projector is intentionally separate from `decision_graph.py`. It depends on both graph payloads, typically loaded from persisted state or a current session snapshot, so it belongs with review/runtime projection logic rather than with canonical decision-state ownership.
 
 ### Shape
 
@@ -360,6 +378,17 @@ The reverse is intentionally not true:
 - decision graph extraction and merge do not depend on review results
 
 This keeps architectural state deterministic and plan-version scoped, while letting review state add annotations about impact or missing decisions.
+
+## Example Lifecycle
+
+The end-to-end flow typically looks like this:
+
+1. Authoring produces plan content and decision state for a new plan version.
+2. `decision_graph_json` is persisted on the plan version as canonical architectural state.
+3. Review rounds raise, dedupe, link, and resolve issues against the current plan.
+4. The session `issue_graph` snapshot evolves across rounds and is persisted as review state.
+5. `impact_view` derives architectural pressure from the current decision and issue graph payloads.
+6. `reconsideration_candidates` may be surfaced during refinement when a decision remains under sustained pressure.
 
 ## Frontend Rendering
 

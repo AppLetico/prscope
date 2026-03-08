@@ -52,6 +52,24 @@ _SECTION_FAILURE_NAMES = frozenset(
 )
 
 
+def localized_request_explicit_payload_change(requirements_text: str | None) -> bool:
+    lowered_requirements = str(requirements_text or "").lower()
+    mentions_payload_terms = any(
+        token in lowered_requirements for token in ("payload", "response", "serialization", "serializer", "shape", "contract")
+    )
+    if not mentions_payload_terms:
+        return False
+    conditional_only_phrases = (
+        "only if the response shape must change",
+        "if the response shape must change",
+        "only if response shape must change",
+        "only if the payload must change",
+        "if the payload must change",
+        "only if payload must change",
+    )
+    return not any(phrase in lowered_requirements for phrase in conditional_only_phrases)
+
+
 class AuthorValidationService:
     def __init__(self, tool_executor: Any) -> None:
         self.tool_executor = tool_executor
@@ -275,21 +293,239 @@ class AuthorValidationService:
         return failures
 
     @staticmethod
+    def _prioritized_frontend_tests(paths: list[str]) -> list[str]:
+        def _score(path: str) -> tuple[int, str]:
+            normalized = str(path).strip()
+            if "/pages/" in normalized:
+                return (0, normalized)
+            if "/components/" in normalized:
+                return (1, normalized)
+            if "/lib/" in normalized:
+                return (3, normalized)
+            return (2, normalized)
+
+        return [path for _, path in sorted((_score(path) for path in paths), key=lambda item: item[0])]
+
+    @staticmethod
     def localized_ui_scope_failures(plan_content: str, requirements_text: str | None) -> list[str]:
         requirements = str(requirements_text or "")
         if not is_localized_frontend_request(requirements):
             return []
         lowered_requirements = requirements.lower()
-        if any(token in lowered_requirements for token in ("observability", "telemetry", "logging", "monitoring")):
-            return []
-        lowered_plan = plan_content.lower()
-        if any(token in lowered_plan for token in ("observability", "telemetry", "logging")):
-            return [
-                "localized UI/API draft introduced observability or telemetry scope not present in requirements; "
-                "remove logging/telemetry/observability wording and keep the plan focused on existing UI wiring, "
-                "API helper reuse, and tests"
-            ]
-        return []
+        actionable_sections = "\n".join(
+            section
+            for section in (
+                AuthorValidationService.extract_section(plan_content, "Summary"),
+                AuthorValidationService.extract_section(plan_content, "Changes"),
+                AuthorValidationService.extract_section(plan_content, "Files Changed"),
+                AuthorValidationService.extract_section(plan_content, "Architecture"),
+                AuthorValidationService.extract_section(plan_content, "Implementation Steps"),
+                AuthorValidationService.extract_section(plan_content, "Test Strategy"),
+            )
+            if section
+        ).lower()
+        failures: list[str] = []
+        open_questions_section = AuthorValidationService.extract_section(plan_content, "Open Questions").lower()
+        if not any(token in lowered_requirements for token in ("observability", "telemetry", "logging", "monitoring")):
+            if any(token in actionable_sections for token in ("observability", "telemetry", "logging")) or any(
+                token in open_questions_section
+                for token in (
+                    "logging",
+                    "telemetry",
+                    "observability",
+                    "monitoring",
+                    "log the export",
+                    "logging the export",
+                )
+            ):
+                failures.append(
+                    "localized UI/API draft introduced observability or telemetry scope not present in requirements; "
+                    "remove logging/telemetry/observability wording and keep the plan focused on existing UI wiring, "
+                    "API helper reuse, and tests"
+                )
+        forbids_frontend_state_abstractions = any(
+            phrase in lowered_requirements
+            for phrase in (
+                "do not introduce new hooks",
+                "do not introduce hooks",
+                "avoid new hooks",
+                "do not introduce new contexts",
+                "avoid new contexts",
+                "do not introduce shared state",
+                "shared state layers",
+                "do not introduce background polling",
+                "background polling",
+                "keep the change localized",
+            )
+        )
+        if forbids_frontend_state_abstractions:
+            forbidden_patterns = (
+                r"\b(new|dedicated)\s+hooks?\b",
+                r"\bhooks?/contexts?\b",
+                r"\buseState\b",
+                r"\buseEffect\b",
+                r"\buseRef\b",
+                r"\buseCallback\b",
+                r"\buseMemo\b",
+                r"\bisExporting\b",
+                r"\blastExportResult\b",
+                r"\bcontext\s+provider\b",
+                r"\blocal state\b",
+                r"\bshared state\b",
+                r"\bcentralized state\b",
+                r"\bsingle state object\b",
+                r"\bui state object\b",
+                r"\bstate management\b",
+                r"\bseparation of state and logic\b",
+                r"\bseparation of ui and business logic\b",
+                r"\bmanage concurrency\b",
+                r"\bconcurrency proactively\b",
+                r"\bconcurrent(?:ly)?\s+exports?\b",
+                r"\bbackground polling\b",
+                r"\bpolling\b",
+                r"\bself-contained state\b",
+                r"\breact hook patterns?\b",
+                r"\bstate initialization\b",
+                r"\bmount tracking\b",
+                r"\bunmount(?:ed)?\b",
+                r"\bunmount guard\b",
+                r"\bisMountedRef\b",
+                r"\bPromise\.race\b",
+                r"\bsetTimeout\b",
+                r"\btimeout recovery\b",
+                r"\bdouble-click prevention\b",
+                r"\btype\s+[A-Z][A-Za-z0-9_]*\s*=",
+            )
+            if any(re.search(pattern, actionable_sections, re.IGNORECASE) for pattern in forbidden_patterns):
+                failures.append(
+                    "localized UI/API draft introduced frontend state or polling abstractions not present in requirements; "
+                    "remove hooks/contexts/shared-state/state-management/polling wording and keep the plan focused on direct component wiring, "
+                    "existing helper reuse, PlanPanel compatibility, and tests"
+                )
+        explicit_payload_change_requested = localized_request_explicit_payload_change(requirements)
+        if not explicit_payload_change_requested:
+            backend_contract_patterns = (
+                r"\bget_session\b",
+                r"\bgetsession\b",
+                r"\bplanningsession\b",
+                r"\bis_exporting\b",
+                r"\blast_export_at\b",
+                r"\blast_export_result\b",
+                r"\bbackend api responses?\b",
+                r"\bbackend api contract\b",
+                r"\bapi contract changes?\b",
+                r"\bapi model regression test\b",
+                r"\bendpoint response\b.*\bnew fields?\b",
+                r"\binclude new fields?\b",
+                r"\bsync(?:ing)? with the backend'?s status\b",
+                r"\btests/test_web_api_models\.py\b",
+            )
+            if any(re.search(pattern, actionable_sections, re.IGNORECASE) for pattern in backend_contract_patterns):
+                failures.append(
+                    "localized UI/API draft introduced backend contract or session-state changes not present in requirements; "
+                    "do not invent new response fields or backend status plumbing unless the requirements explicitly require a payload/response change"
+                )
+        ownership_sections = "\n".join(
+            section
+            for section in (
+                AuthorValidationService.extract_section(plan_content, "Changes"),
+                AuthorValidationService.extract_section(plan_content, "Files Changed"),
+                AuthorValidationService.extract_section(plan_content, "Architecture"),
+                AuthorValidationService.extract_section(plan_content, "Implementation Steps"),
+            )
+            if section
+        ).lower()
+        mentions_planningview_owner = any(
+            phrase in ownership_sections
+            for phrase in (
+                "planningview maintains export state",
+                "planningview owns export state",
+                "state lives in planningview",
+                "planningview passes",
+                "passed to planpanel as props",
+                "pass the necessary props to `planpanel`",
+                "pass the necessary props to planpanel",
+                "props from planningview",
+            )
+        )
+        mentions_planpanel_internal_owner = any(
+            phrase in ownership_sections
+            for phrase in (
+                "planpanel wraps it internally",
+                "planpanel internal state",
+                "keep its internal state",
+                "state lives in planpanel",
+                "managed within planpanel",
+                "planpanel manages export state",
+                "planpanel component will be updated to keep its internal state",
+                "reducing reliance on external props",
+                "planpanel operates independently",
+                "maintain minimal external dependencies",
+                "internal state for visibility of the last export result",
+                "internal state for export status",
+                "maintain its internal state",
+                "only require essential props from planningview",
+                "responsible for displaying the last export result",
+                "responsible for displaying the last export result, enabling or disabling the export action",
+            )
+        ) or any(
+            re.search(pattern, ownership_sections, re.IGNORECASE)
+            for pattern in (
+                r"planpanel[^.]{0,120}\binternal state\b",
+                r"planpanel[^.]{0,120}\boperate(?:s)? independently\b",
+                r"planpanel[^.]{0,160}\bresponsible for\b",
+                r"planpanel[^.]{0,160}\breduc(?:e|ing) the dependency on planningview\b",
+            )
+        )
+        if mentions_planningview_owner and mentions_planpanel_internal_owner:
+            failures.append(
+                "localized UI/API draft leaves export-state ownership ambiguous between `PlanningView.tsx` and `PlanPanel.tsx`; "
+                "choose one owner and keep Files Changed, Architecture, and Implementation Steps consistent about whether state is passed as props or managed inside PlanPanel"
+            )
+        preserves_planpanel_behavior = (
+            "preserve current planpanel behavior" in lowered_requirements
+            or "preserve planpanel behavior" in lowered_requirements
+        )
+        if preserves_planpanel_behavior and mentions_planpanel_internal_owner:
+            failures.append(
+                "localized UI/API draft shifts established export-state ownership into `PlanPanel.tsx` even though the request says to preserve current PlanPanel behavior; "
+                "keep the existing `PlanningView.tsx`-owned wiring and limit PlanPanel changes to localized rendering/button behavior"
+            )
+        asks_for_latest_result = any(
+            phrase in lowered_requirements
+            for phrase in (
+                "show the last export result",
+                "show the latest export result",
+                "show the last result",
+                "show the latest result",
+            )
+        )
+        mentions_format_requirements = any(
+            phrase in lowered_requirements
+            for phrase in (
+                "format",
+                "formatted",
+                "plain text",
+                "success message",
+                "error detail",
+                "toast",
+                "banner",
+            )
+        )
+        speculative_result_display_patterns = (
+            r"(specific format|format or details|plain text sufficient)",
+            r"(what|which).{0,50}(details?|format).{0,80}(export result|latest result|last result)",
+            r"(success messages?|error details?)",
+        )
+        if asks_for_latest_result and not mentions_format_requirements and any(
+            re.search(pattern, open_questions_section, re.IGNORECASE)
+            for pattern in speculative_result_display_patterns
+        ):
+            failures.append(
+                "localized UI/API draft turned a simple result-display request into speculative formatting open questions; "
+                "default to a concise success/failure result presentation unless the requirements explicitly demand richer formatting"
+            )
+        return failures
 
     @staticmethod
     def missing_test_target_failures(
@@ -307,11 +543,27 @@ class AuthorValidationService:
         ]
         if not relevant_tests:
             return []
+        relevant_tests = sorted(relevant_tests)
         referenced = extract_file_references(plan_content)
         if any(path in referenced for path in relevant_tests):
-            return []
-        candidates = ", ".join(relevant_tests[:3])
-        return [f"missing test target reference; reference one of: {candidates}"]
+            failures: list[str] = []
+        else:
+            candidates = ", ".join(relevant_tests[:3])
+            failures = [f"missing test target reference; reference one of: {candidates}"]
+        if is_localized_frontend_request(requirements):
+            frontend_tests = AuthorValidationService._prioritized_frontend_tests(
+                [
+                    path
+                    for path in relevant_tests
+                    if "/frontend/" in path and re.search(r"\.test\.(?:[jt]sx?)$", path, re.IGNORECASE)
+                ]
+            )
+            if frontend_tests and not any(path in referenced for path in frontend_tests):
+                failures.append(
+                    "localized frontend UI change should reference a frontend regression target; "
+                    f"mention `{frontend_tests[0]}`"
+                )
+        return failures
 
     def missing_helper_reuse_failures(
         self,
@@ -350,7 +602,7 @@ class AuthorValidationService:
         requirements = str(requirements_text or "").lower()
         if not is_localized_frontend_request(requirements):
             return []
-        if not any(token in requirements for token in ("payload", "response", "serialization", "serializer", "shape")):
+        if not localized_request_explicit_payload_change(requirements_text):
             return []
         verified_backend_paths = {
             str(path).strip()
@@ -509,7 +761,13 @@ class AuthorValidationService:
             return "missing_sections"
         if "planner draft contains detailed implementation step list" in normalized:
             return "missing_sections"
+        if normalized.startswith("under-scoped draft:"):
+            return "missing_sections"
+        if normalized.startswith("files changed entries missing from implementation steps:"):
+            return "grounding_failure"
         if "test strategy" in normalized or "missing test" in normalized:
+            return "missing_tests"
+        if normalized.startswith("localized frontend ui change should reference a frontend regression target;"):
             return "missing_tests"
         if normalized.startswith("missing explicit helper reuse reference for "):
             return "missing_helper_reuse"
@@ -575,4 +833,58 @@ class AuthorValidationService:
                     suggested = self._suggest_verified_path(path, verified_paths)
                     if suggested and suggested != path:
                         failures.append(f"replace unverified path `{path}` with `{suggested}`")
+        return self.build_validation_result(failures)
+
+    def validate_refinement_result(
+        self,
+        *,
+        plan_content: str,
+        repo_understanding: Any,
+        verified_paths_extra: set[str] | None = None,
+        requirements_text: str | None = None,
+        min_grounding_ratio: float | None = None,
+    ) -> ValidationResult:
+        failures: list[str] = []
+        required_non_empty = [
+            "Goals",
+            "Non-Goals",
+            "Files Changed",
+            "Architecture",
+            "Implementation Steps",
+            "Test Strategy",
+            "Rollback Plan",
+        ]
+        for heading in required_non_empty:
+            if not self.extract_section(plan_content, heading):
+                failures.append(f"required section is empty: {heading}")
+        files_changed = extract_file_references(self.extract_section(plan_content, "Files Changed"))
+        if not files_changed:
+            failures.append("Files Changed section is empty")
+        total_references = extract_file_references(plan_content)
+        if len(files_changed) == 1 and len(total_references) > 1:
+            failures.append("under-scoped draft: one file in Files Changed but multiple referenced files")
+        implementation = extract_file_references(self.extract_section(plan_content, "Implementation Steps"))
+        missing_impl_refs = sorted(files_changed - implementation)
+        if missing_impl_refs:
+            failures.append("Files Changed entries missing from Implementation Steps: " + ", ".join(missing_impl_refs))
+        failures.extend(self.localized_ui_scope_failures(plan_content, requirements_text))
+        failures.extend(self.missing_test_target_failures(plan_content, repo_understanding, requirements_text))
+        failures.extend(self.missing_helper_reuse_failures(plan_content, repo_understanding, requirements_text))
+        failures.extend(self.localized_backend_grounding_failures(plan_content, repo_understanding, requirements_text))
+        if min_grounding_ratio is not None:
+            verified_paths = (
+                set(getattr(repo_understanding, "file_contents", {}).keys())
+                | set(getattr(repo_understanding, "entrypoints", []))
+                | set(getattr(repo_understanding, "core_modules", []))
+                | set(getattr(repo_understanding, "relevant_modules", []))
+                | set(getattr(repo_understanding, "relevant_tests", []))
+                | set(verified_paths_extra or set())
+            )
+            grounding, _, _ = self.grounding_failures(
+                plan_content=plan_content,
+                verified_paths=verified_paths,
+                min_grounding_ratio=min_grounding_ratio,
+                draft_phase="refiner",
+            )
+            failures.extend(grounding)
         return self.build_validation_result(failures)

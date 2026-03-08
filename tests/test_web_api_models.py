@@ -6,7 +6,12 @@ from types import SimpleNamespace
 from fastapi.testclient import TestClient
 
 from prscope.store import Store
-from prscope.web.api import RuntimeRegistry, _coerce_stale_processing_payload, create_app
+from prscope.web.api import (
+    RuntimeRegistry,
+    _coerce_stale_processing_payload,
+    _surface_background_session_failure,
+    create_app,
+)
 
 
 def _write_minimal_config(tmp_path):
@@ -36,7 +41,9 @@ def test_models_endpoint_returns_catalog(tmp_path, monkeypatch):
     assert any(item.get("model_id") == "gpt-4o-mini" for item in payload["items"])
     assert any(item.get("model_id") == "o3" for item in payload["items"])
     assert any(item.get("model_id") == "claude-opus-4-6" for item in payload["items"])
-    assert any(item.get("model_id") == "gemini-3.1-pro" for item in payload["items"])
+    assert any(item.get("model_id") == "claude-haiku-4-5" for item in payload["items"])
+    assert any(item.get("model_id") == "claude-haiku-4-5-20251001" for item in payload["items"])
+    assert any(item.get("model_id") == "gemini-3.1-pro-preview" for item in payload["items"])
 
 
 def test_repos_endpoint_returns_configured_profiles(tmp_path, monkeypatch):
@@ -145,6 +152,91 @@ def test_create_session_rejects_unavailable_model(tmp_path, monkeypatch):
     )
     assert response.status_code == 400
     assert "unavailable" in response.json().get("detail", "").lower()
+
+
+def test_create_session_rejects_invalid_configured_default_model(tmp_path, monkeypatch):
+    (tmp_path / "prscope.yml").write_text(
+        "\n".join(
+            [
+                "local_repo: .",
+                "planning:",
+                "  author_model: claude-haiku-4-5-20990101",
+                "  critic_model: claude-haiku-4-5-20990101",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("PRSCOPE_CONFIG_ROOT", str(tmp_path))
+    app = create_app()
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/sessions",
+        json={
+            "mode": "requirements",
+            "requirements": "Sanity check invalid configured defaults.",
+        },
+    )
+    assert response.status_code == 400
+    assert "invalid author model" in response.json().get("detail", "").lower()
+
+
+def test_background_failure_helper_surfaces_error_session_state(tmp_path, monkeypatch):
+    _write_minimal_config(tmp_path)
+    monkeypatch.setenv("PRSCOPE_CONFIG_ROOT", str(tmp_path))
+    store = Store()
+    session = store.create_planning_session(
+        repo_name=tmp_path.name,
+        title="Background failure",
+        requirements="r",
+        seed_type="requirements",
+        status="draft",
+    )
+
+    emitted_events: list[dict[str, object]] = []
+
+    async def _emit(session_id: str, event: dict[str, object]) -> None:
+        assert session_id == session.id
+        emitted_events.append(dict(event))
+
+    def _build_snapshot(session_id: str, selected_store: Store) -> dict[str, object]:
+        updated = selected_store.get_planning_session(session_id)
+        assert updated is not None
+        return {
+            "type": "session_state",
+            "status": updated.status,
+            "phase_message": updated.phase_message,
+            "is_processing": bool(updated.is_processing),
+        }
+
+    import asyncio
+
+    asyncio.run(
+        _surface_background_session_failure(
+            session_id=session.id,
+            store=store,
+            action="Initial draft",
+            exc=RuntimeError("Configured planning author model failed. Last error: quota exceeded"),
+            emit_event=_emit,
+            build_snapshot=_build_snapshot,
+        )
+    )
+
+    updated = store.get_planning_session(session.id)
+    assert updated is not None
+    assert updated.status == "error"
+    assert updated.is_processing == 0
+    assert updated.phase_message is not None
+    assert updated.phase_message.startswith("Initial draft failed:")
+    assert "quota exceeded" in updated.phase_message
+
+    session_events = [event for event in emitted_events if event.get("type") == "session_state"]
+    assert session_events
+    assert session_events[-1]["status"] == "error"
+
+    error_events = [event for event in emitted_events if event.get("type") == "error"]
+    assert error_events
+    assert error_events[-1]["message"] == updated.phase_message
 
 
 def test_list_snapshots_endpoint_returns_items(tmp_path, monkeypatch):
@@ -281,6 +373,71 @@ def test_runtime_registry_tracks_draft_diagnostics(tmp_path):
     assert timing["draft_redraft_reason_codes"] == ["missing_tests", "localized_scope_drift"]
     assert timing["quality_gate_failures"] == ["missing test target reference"]
     assert timing["draft_loop_budget_ms"] == 16000
+
+
+def test_runtime_registry_tracks_stage_model_and_contract_events(tmp_path):
+    store = Store(tmp_path / "test.db")
+    session = store.create_planning_session(
+        repo_name=tmp_path.name,
+        title="stage-diag",
+        requirements="r",
+        seed_type="requirements",
+        status="draft",
+    )
+    registry = RuntimeRegistry(emitter=SimpleNamespace())
+
+    registry.note_event(
+        session.id,
+        {
+            "type": "model_selection",
+            "model_stage": "initial_draft",
+            "model": "gemini-2.5-flash",
+            "provider": "google",
+        },
+        store=store,
+    )
+    registry.note_event(
+        session.id,
+        {
+            "type": "model_selection",
+            "model_stage": "critic_review",
+            "model": "gemini-2.5-flash",
+            "provider": "google",
+            "fallback_model": "gpt-4o-mini",
+        },
+        store=store,
+    )
+    registry.note_event(
+        session.id,
+        {
+            "type": "structured_output_retry",
+            "model_stage": "critic_review",
+            "model": "gemini-2.5-flash",
+            "failure_category": "json_contract",
+        },
+        store=store,
+    )
+    registry.note_event(
+        session.id,
+        {
+            "type": "structured_output_fallback",
+            "model_stage": "critic_review",
+            "model": "gemini-2.5-flash",
+            "fallback_model": "gpt-4o-mini",
+            "failure_category": "json_contract",
+        },
+        store=store,
+    )
+
+    timing = registry.get_session_timing(session.id, store=store)
+    assert timing is not None
+    assert timing["initial_draft_model"] == "gemini-2.5-flash"
+    assert timing["initial_draft_provider"] == "google"
+    assert timing["critic_review_model"] == "gemini-2.5-flash"
+    assert timing["critic_review_fallback_model"] == "gpt-4o-mini"
+    assert timing["critic_review_json_retries"] == 1
+    assert timing["critic_review_fallbacks"] == 1
+    assert timing["critic_review_last_failure_category"] == "json_contract"
 
 
 def test_get_session_parses_version_followups_payload(tmp_path, monkeypatch):

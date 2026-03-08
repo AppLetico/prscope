@@ -111,6 +111,11 @@ class PlanningConfig:
     author_model: str = "gpt-4o-mini"
     critic_model: str = "gpt-4o-mini"
     memory_model: str = "gpt-4o-mini"  # codebase memory build; defaults to author_model when omitted in YAML
+    discovery_model: str | None = None
+    initial_draft_model: str | None = None
+    author_refine_model: str | None = None
+    critic_review_model: str | None = None
+    structured_output_fallback_model: str = "gpt-4o-mini"
     author_call_timeout_seconds: int = 50
     memory_prep_timeout_seconds: int = 120
     initial_draft_timeout_seconds: int = 45
@@ -403,6 +408,14 @@ class PrscopeConfig:
             author_model=author_model,
             critic_model=planning_data.get("critic_model", "gpt-4o-mini"),
             memory_model=memory_model,
+            discovery_model=planning_data.get("discovery_model"),
+            initial_draft_model=planning_data.get("initial_draft_model"),
+            author_refine_model=planning_data.get("author_refine_model"),
+            critic_review_model=planning_data.get("critic_review_model"),
+            structured_output_fallback_model=str(
+                planning_data.get("structured_output_fallback_model", "gpt-4o-mini")
+            ).strip()
+            or "gpt-4o-mini",
             author_call_timeout_seconds=int(planning_data.get("author_call_timeout_seconds", 50)),
             memory_prep_timeout_seconds=int(planning_data.get("memory_prep_timeout_seconds", 120)),
             initial_draft_timeout_seconds=int(planning_data.get("initial_draft_timeout_seconds", 45)),

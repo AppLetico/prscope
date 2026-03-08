@@ -5,12 +5,14 @@ Stage implementations for adversarial planning rounds.
 from __future__ import annotations
 
 import json
+import re
 import time
 from collections.abc import Callable
 from typing import Any, Literal
 
 from ...core import ConvergenceResult
-from ..author import PlanDocument, RepairPlan, RevisionResult, apply_section_updates, render_markdown
+from ..author import PlanDocument, RepairPlan, RepoUnderstanding, RevisionResult, apply_section_updates, render_markdown
+from ..authoring.discovery import is_localized_frontend_request
 from ..critic import ImplementabilityResult, ReviewResult
 from ..followups import decision_graph_from_json, decision_graph_from_plan, merge_decision_graphs
 from ..reasoning import (
@@ -70,6 +72,18 @@ class PlanningStages:
         self._convergence_reasoner = ConvergenceReasoner()
 
     @staticmethod
+    def _critic_fallback_model(ctx: PlanningRoundContext) -> str | None:
+        if ctx.model_policy is None:
+            return None
+        return ctx.model_policy.critic_review.first_fallback_model
+
+    @staticmethod
+    def _author_fallback_model(ctx: PlanningRoundContext) -> str | None:
+        if ctx.model_policy is None:
+            return None
+        return ctx.model_policy.author_refine.first_fallback_model
+
+    @staticmethod
     def _load_graph_payload(raw: str | None) -> dict[str, Any] | None:
         if not raw:
             return None
@@ -78,6 +92,70 @@ class PlanningStages:
         except json.JSONDecodeError:
             return None
         return payload if isinstance(payload, dict) else None
+
+    @staticmethod
+    def _explicit_payload_change_requested(requirements: str) -> bool:
+        lowered = str(requirements or "").lower()
+        mentions_payload_terms = any(
+            token in lowered for token in ("payload", "response", "serialization", "serializer", "shape", "contract")
+        )
+        if not mentions_payload_terms:
+            return False
+        conditional_only_phrases = (
+            "only if the response shape must change",
+            "if the response shape must change",
+            "only if response shape must change",
+            "only if the payload must change",
+            "if the payload must change",
+            "only if payload must change",
+        )
+        return not any(phrase in lowered for phrase in conditional_only_phrases)
+
+    @staticmethod
+    def _source_of_truth_hint(requirements: str) -> str | None:
+        match = re.search(
+            r"(?:keep|preserve)\s+(.+?)\s+as the source of truth",
+            str(requirements),
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not match:
+            return None
+        subject = " ".join(match.group(1).split()).strip(" .,:;")
+        if not subject:
+            return None
+        return f"State explicitly that {subject} remains the source of truth; do not weaken or omit that decision."
+
+    @classmethod
+    def _pressure_revision_hints(
+        cls,
+        *,
+        requirements: str,
+        reconsideration_candidates: list[dict[str, Any]],
+    ) -> list[str]:
+        hints: list[str] = []
+        top_candidate = reconsideration_candidates[0] if reconsideration_candidates else {}
+        if isinstance(top_candidate, dict) and str(top_candidate.get("decision_id", "")).strip():
+            cluster = top_candidate.get("dominant_cluster")
+            cluster_payload = cluster if isinstance(cluster, dict) else {}
+            decision_id = str(top_candidate.get("decision_id", "")).strip()
+            suggested_action = str(top_candidate.get("suggested_action", "")).strip() or "clarify pressured decision"
+            root_issue = str(cluster_payload.get("root_issue", "")).strip() or "unspecified root issue"
+            hints.append(
+                f"For pressured decision `{decision_id}`, make a visible Architecture change that preserves, narrows, or replaces it with rationale. Root issue: {root_issue}. Suggested action: {suggested_action}."
+            )
+        source_of_truth_hint = cls._source_of_truth_hint(requirements)
+        if source_of_truth_hint:
+            hints.append(source_of_truth_hint)
+        normalized = " ".join(str(requirements).lower().split())
+        if "cache invalidation" in normalized or "invalidation" in normalized:
+            hints.append(
+                "Name only the concrete invalidation triggers already requested; do not add broad catch-all triggers like manual admin actions, expiration, or 'all related data changes' unless the requirements explicitly ask for them."
+            )
+        if "avoid broad architecture churn" in normalized or "avoid adding new subsystems" in normalized:
+            hints.append(
+                "Keep the design localized; do not introduce wrapper layers, new subsystems, broad cache-management abstractions, or speculative concurrency/synchronization language unless explicitly required."
+            )
+        return hints[:4]
 
     def _top_reconsideration_candidates(
         self,
@@ -213,6 +291,362 @@ class PlanningStages:
             return "- None."
         return "\n".join(f"- {item}" for item in unresolved)
 
+    @staticmethod
+    def _revision_repo_understanding(
+        *,
+        verified_paths: set[str],
+        previous_plan_content: str,
+    ) -> RepoUnderstanding:
+        referenced_paths = verified_paths | set(extract_file_references(previous_plan_content))
+        relevant_tests = sorted(
+            path for path in referenced_paths if path.startswith("tests/") or ".test." in path or path.endswith("_test.py")
+        )
+        relevant_modules = sorted(path for path in referenced_paths if path not in relevant_tests)
+        entrypoints = sorted(
+            path
+            for path in relevant_modules
+            if any(
+                token in path.lower()
+                for token in (
+                    "/web/api.py",
+                    "planningview",
+                    "planpanel",
+                    "actionbar",
+                    "/lib/api.ts",
+                )
+            )
+        )
+        return RepoUnderstanding(
+            entrypoints=entrypoints or relevant_modules[:4],
+            core_modules=relevant_modules[:8],
+            relevant_modules=relevant_modules[:12],
+            relevant_tests=relevant_tests[:6],
+            architecture_summary="",
+            risks=[],
+            file_contents={},
+            from_mental_model=False,
+        )
+
+    @staticmethod
+    def _append_files_changed_entry(files_changed: str, path: str, rationale: str) -> str:
+        normalized = str(files_changed or "").strip()
+        if not path:
+            return normalized
+        if path in normalized:
+            return normalized
+        entry = f"- `{path}`: {rationale}"
+        if not normalized:
+            return entry
+        return normalized.rstrip() + "\n" + entry
+
+    @staticmethod
+    def _prioritized_frontend_test_targets(paths: list[str]) -> list[str]:
+        def _score(path: str) -> tuple[int, str]:
+            normalized = str(path).strip()
+            if "/pages/" in normalized:
+                return (0, normalized)
+            if "/components/" in normalized:
+                return (1, normalized)
+            if "/lib/" in normalized:
+                return (3, normalized)
+            return (2, normalized)
+
+        return [path for _, path in sorted((_score(path) for path in paths), key=lambda item: item[0])]
+
+    @staticmethod
+    def _parse_files_changed_entries(files_changed: str) -> list[tuple[str, str]]:
+        entries: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for raw_line in str(files_changed or "").splitlines():
+            line = str(raw_line or "").strip()
+            if not line:
+                continue
+            match = re.search(r"`([^`]+)`", line)
+            if not match:
+                continue
+            path = match.group(1).strip()
+            if not path or ("/" not in path and "." not in path) or path in seen:
+                continue
+            seen.add(path)
+            remainder = line[match.end() :].strip()
+            remainder = re.sub(r"^[\s:.-]+", "", remainder).strip()
+            remainder = re.sub(r"^\*+\s*", "", remainder).strip()
+            remainder = re.sub(r"\s*\*+$", "", remainder).strip()
+            entries.append((path, remainder))
+        return entries
+
+    @classmethod
+    def _normalize_files_changed_entries(
+        cls,
+        *,
+        files_changed: str,
+        preferred_owner_paths: tuple[str, ...] = (),
+        preferred_test_targets: tuple[str, ...] = (),
+        rationale_overrides: dict[str, str] | None = None,
+    ) -> str:
+        parsed = cls._parse_files_changed_entries(files_changed)
+        if not parsed:
+            return str(files_changed or "").strip()
+
+        rationale_by_path: dict[str, str] = {}
+        original_order: list[str] = []
+        for path, rationale in parsed:
+            if path not in rationale_by_path:
+                original_order.append(path)
+            if rationale and not rationale_by_path.get(path):
+                rationale_by_path[path] = rationale
+            else:
+                rationale_by_path.setdefault(path, rationale)
+
+        ordered_paths: list[str] = []
+
+        def _append(path: str) -> None:
+            if path in rationale_by_path and path not in ordered_paths:
+                ordered_paths.append(path)
+
+        for path in preferred_owner_paths:
+            _append(path)
+        for path in original_order:
+            if re.search(r"\.test\.(?:[jt]sx?)$", path, flags=re.IGNORECASE):
+                continue
+            _append(path)
+        for path in preferred_test_targets:
+            _append(path)
+        for path in original_order:
+            _append(path)
+
+        lines = []
+        for path in ordered_paths:
+            rationale = str(rationale_by_path.get(path, "") or "").strip()
+            if not rationale:
+                rationale = str((rationale_overrides or {}).get(path, "") or "").strip()
+            lines.append(f"- `{path}`: {rationale}" if rationale else f"- `{path}`")
+        return "\n".join(lines).strip()
+
+    @staticmethod
+    def _localized_frontend_owner_paths_from_plan(plan: PlanDocument, requirements: str) -> tuple[str, ...]:
+        if not is_localized_frontend_request(requirements):
+            return ()
+        files_changed_refs = [str(path).strip() for path in extract_file_references(str(plan.files_changed or "")) if str(path).strip()]
+        preferred: list[str] = []
+
+        def _append_if_present(path: str) -> None:
+            if path in files_changed_refs and path not in preferred:
+                preferred.append(path)
+
+        lower_requirements = str(requirements or "").lower()
+        if "planning" in lower_requirements:
+            _append_if_present("src/prscope/web/frontend/src/pages/PlanningView.tsx")
+        if "planpanel" in lower_requirements:
+            _append_if_present("src/prscope/web/frontend/src/components/PlanPanel.tsx")
+        if any(token in lower_requirements for token in ("export", "download", "snapshot")):
+            _append_if_present("src/prscope/web/frontend/src/lib/api.ts")
+
+        for path in files_changed_refs:
+            lowered = path.lower()
+            if "/frontend/" not in lowered or re.search(r"\.test\.(?:[jt]sx?)$", lowered):
+                continue
+            if path not in preferred:
+                preferred.append(path)
+            if len(preferred) >= 3:
+                break
+        return tuple(preferred[:3])
+
+    def _preserve_localized_refinement_detail(
+        self,
+        *,
+        plan: PlanDocument,
+        current_plan: PlanDocument,
+        requirements: str,
+    ) -> PlanDocument:
+        if not is_localized_frontend_request(requirements):
+            return plan
+
+        updates: dict[str, str] = {}
+        files_changed = str(plan.files_changed or "")
+        localized_owner_rationales = {
+            "src/prscope/web/frontend/src/pages/PlanningView.tsx": (
+                "Keep the localized export UI wiring in the existing planning page instead of introducing a new owner."
+            ),
+            "src/prscope/web/frontend/src/components/PlanPanel.tsx": (
+                "Preserve existing PlanPanel export and health behavior while wiring the localized UI change."
+            ),
+            "src/prscope/web/frontend/src/lib/api.ts": (
+                "Preserve the existing frontend API helper wiring for the reused export/snapshot helpers."
+            ),
+        }
+        for path in self._localized_frontend_owner_paths_from_plan(current_plan, requirements):
+            files_changed = self._append_files_changed_entry(
+                files_changed,
+                path,
+                localized_owner_rationales.get(
+                    path,
+                    "Keep the localized UI change anchored to the verified existing frontend owner.",
+                ),
+            )
+
+        previous_test_targets = [
+            path
+            for path in {
+                *extract_file_references(str(current_plan.files_changed or "")),
+                *extract_file_references(str(current_plan.test_strategy or "")),
+            }
+            if re.search(r"\.test\.(?:[jt]sx?)$", str(path), flags=re.IGNORECASE)
+        ]
+        for path in self._prioritized_frontend_test_targets(previous_test_targets)[:1]:
+            files_changed = self._append_files_changed_entry(
+                files_changed,
+                path,
+                "Keep the localized UI behavior covered by the focused frontend regression test.",
+            )
+        files_changed = self._normalize_files_changed_entries(
+            files_changed=files_changed,
+            preferred_owner_paths=self._localized_frontend_owner_paths_from_plan(current_plan, requirements),
+            preferred_test_targets=tuple(self._prioritized_frontend_test_targets(previous_test_targets)[:1]),
+            rationale_overrides={
+                **localized_owner_rationales,
+                **{
+                    path: "Keep the localized UI behavior covered by the focused frontend regression test."
+                    for path in self._prioritized_frontend_test_targets(previous_test_targets)[:1]
+                },
+            },
+        )
+        if files_changed != str(plan.files_changed or ""):
+            updates["files_changed"] = files_changed
+
+        updated_impl = str(plan.implementation_steps or "").strip()
+        if not extract_file_references(updated_impl):
+            implementation_steps: list[str] = []
+            owner_paths = self._localized_frontend_owner_paths_from_plan(current_plan, requirements)
+            if "src/prscope/web/frontend/src/pages/PlanningView.tsx" in owner_paths:
+                implementation_steps.append(
+                    "1. Update `src/prscope/web/frontend/src/pages/PlanningView.tsx` to keep the localized export UI flow wired through the existing planning page."
+                )
+            if "src/prscope/web/frontend/src/components/PlanPanel.tsx" in owner_paths:
+                implementation_steps.append(
+                    "2. Update `src/prscope/web/frontend/src/components/PlanPanel.tsx` to render the requested export status while preserving existing PlanPanel behavior."
+                )
+            if "src/prscope/web/frontend/src/lib/api.ts" in owner_paths or any(
+                token in str(requirements or "").lower() for token in ("export", "download", "snapshot")
+            ):
+                implementation_steps.append(
+                    "3. Reuse `exportSession` and `downloadFile` from `src/prscope/web/frontend/src/lib/api.ts` exactly as already wired."
+                )
+            if previous_test_targets:
+                implementation_steps.append(
+                    f"4. Cover the localized export flow in `{previous_test_targets[0]}`."
+                )
+            if implementation_steps:
+                updates["implementation_steps"] = "\n".join(implementation_steps)
+
+        updated_tests = str(plan.test_strategy or "").strip()
+        if not extract_file_references(updated_tests) and previous_test_targets:
+            updates["test_strategy"] = (
+                f"- Assert the export action is disabled while work is in progress in `{previous_test_targets[0]}`.\n"
+                f"- Assert the last export result is rendered after success or failure in `{previous_test_targets[0]}`."
+            )
+
+        if updates:
+            return apply_section_updates(plan, updates)
+        return plan
+
+    @staticmethod
+    def _mentioned_validation_targets(failures: list[str], prefix: str) -> list[str]:
+        targets: list[str] = []
+        for failure in failures:
+            text = str(failure or "").strip()
+            if not text.startswith(prefix):
+                continue
+            match = re.search(r"mention `([^`]+)`", text)
+            if match:
+                target = match.group(1).strip()
+                if target and target not in targets:
+                    targets.append(target)
+        return targets
+
+    def _supplement_refinement_plan(
+        self,
+        *,
+        plan: PlanDocument,
+        failures: list[str],
+        requirements: str,
+    ) -> PlanDocument:
+        updates: dict[str, str] = {}
+        failure_text = "\n".join(str(item or "").strip() for item in failures)
+        lower_requirements = str(requirements or "").lower()
+        explicit_payload_change_requested = self._explicit_payload_change_requested(requirements)
+        helper_phrase = "Reuse the verified helper and API wiring already present in the codebase"
+        if "export" in lower_requirements and "download" in lower_requirements:
+            helper_phrase = "Reuse `exportSession` and `downloadFile` exactly as already wired"
+        elif "snapshot" in lower_requirements:
+            helper_phrase = "Reuse the existing snapshot helper wiring exactly as already implemented"
+        if "required section is empty: Implementation Steps" in failure_text:
+            implementation_steps = [
+                "1. Update the existing localized UI/component flow to implement the requested behavior.",
+                f"2. {helper_phrase} instead of introducing new abstractions.",
+            ]
+            if explicit_payload_change_requested:
+                implementation_steps.append(
+                    "3. Keep any backend contract adjustment scoped to the existing API path only if the response shape must change."
+                )
+            updates["implementation_steps"] = "\n".join(implementation_steps)
+        if "required section is empty: Architecture" in failure_text:
+            architecture = "Keep the change localized to the existing component and verified helper wiring."
+            if explicit_payload_change_requested:
+                architecture += " Only touch the existing API path if the response shape must change."
+            updates["architecture"] = architecture
+        if "required section is empty: Test Strategy" in failure_text:
+            backend_note = (
+                "\n- If the response shape changes, assert the localized backend contract through the existing API model regression test."
+                if explicit_payload_change_requested
+                else ""
+            )
+            updates["test_strategy"] = (
+                "- Assert the requested user-visible behavior in the focused frontend regression test.\n"
+                "- Assert the export action is disabled while work is in progress and the last export result is rendered after success."
+                + backend_note
+            )
+        if "required section is empty: Rollback Plan" in failure_text:
+            updates["rollback_plan"] = (
+                "- If the localized export UI behavior regresses, revert the touched UI/API wiring and restore the previous export flow."
+            )
+        files_changed = str(plan.files_changed or "")
+        for path in self._mentioned_validation_targets(
+            failures,
+            "localized backend payload/response change must reference the existing API path;",
+        ):
+            files_changed = self._append_files_changed_entry(
+                files_changed,
+                path,
+                "Keep the small backend payload/response adjustment localized to the existing web API path.",
+            )
+        for path in self._mentioned_validation_targets(
+            failures,
+            "localized backend payload/response change must reference the API model regression target;",
+        ):
+            files_changed = self._append_files_changed_entry(
+                files_changed,
+                path,
+                "Cover the localized backend payload/response adjustment with the existing API model regression test.",
+            )
+        for path in self._mentioned_validation_targets(
+            failures,
+            "localized frontend UI change should reference a frontend regression target;",
+        ):
+            files_changed = self._append_files_changed_entry(
+                files_changed,
+                path,
+                "Keep the localized UI behavior covered by the focused frontend regression test.",
+            )
+        if files_changed != str(plan.files_changed or ""):
+            updates["files_changed"] = files_changed
+        supplemented = apply_section_updates(plan, updates) if updates else plan
+        return self._preserve_localized_refinement_detail(
+            plan=supplemented,
+            current_plan=plan,
+            requirements=requirements,
+        )
+
     def _confirmed_constraint_violations(
         self,
         *,
@@ -262,6 +696,7 @@ class PlanningStages:
             constraints=ctx.state.constraints,
             prior_critique=ctx.issue_tracker.distilled_context(),
             model_override=ctx.selected_critic_model,
+            fallback_model_override=self._critic_fallback_model(ctx),
             session_id=ctx.session_id,
             round_number=ctx.round_number,
             mode=review_mode,
@@ -410,6 +845,7 @@ class PlanningStages:
                     review=review_result,
                     requirements=ctx.requirements,
                     model_override=ctx.selected_author_model,
+                    fallback_model_override=self._author_fallback_model(ctx),
                 )
                 ctx.state.design_record = self._design_record_from_payload(updated_record)
             except Exception as exc:  # noqa: BLE001
@@ -428,6 +864,7 @@ class PlanningStages:
             design_record=self._design_record_payload(ctx.state.design_record),
             reconsideration_candidates=reconsideration_candidates,
             model_override=ctx.selected_author_model,
+            fallback_model_override=self._author_fallback_model(ctx),
         )
         must_fix_count = 2
         must_fix_issues: list[str] = []
@@ -450,6 +887,7 @@ class PlanningStages:
                 design_record=self._design_record_payload(ctx.state.design_record),
                 reconsideration_candidates=reconsideration_candidates,
                 model_override=ctx.selected_author_model,
+                fallback_model_override=self._author_fallback_model(ctx),
             )
             accepted = {item.strip() for item in repair_plan.accepted_issues}
             rejected = {item.strip() for item in repair_plan.rejected_issues}
@@ -504,16 +942,38 @@ class PlanningStages:
         await self._emit_event(ctx.event_callback, snapshot, ctx.session_id)
         await emit_tool("apply_critique", "running", stage="author")
         open_issues = ctx.issue_tracker.open_issues()
-        revision_budget = 1 if review_result.primary_issue else min(3, max(1, len(open_issues)))
         revise_started = time.perf_counter()
-        revision_hints: list[str] | None = None
         previous_plan = ctx.core.get_current_plan()
         previous_plan_content = getattr(previous_plan, "plan_content", "") if previous_plan is not None else ""
         reconsideration_candidates = self._top_reconsideration_candidates(
             ctx=ctx,
             decision_graph_json=getattr(previous_plan, "decision_graph_json", None),
         )
+        base_revision_hints = self._pressure_revision_hints(
+            requirements=ctx.requirements,
+            reconsideration_candidates=reconsideration_candidates,
+        )
+        revision_hints: list[str] | None = list(base_revision_hints) if base_revision_hints else None
         verified_paths = set(ctx.state.accessed_paths) | set(extract_file_references(previous_plan_content))
+        revision_repo_understanding = self._revision_repo_understanding(
+            verified_paths=verified_paths,
+            previous_plan_content=previous_plan_content,
+        )
+        current_refinement_validation = self._author.validate_refinement_result(
+            plan_content=render_markdown(current_plan_doc),
+            repo_understanding=revision_repo_understanding,
+            verified_paths_extra=verified_paths,
+            requirements_text=ctx.requirements,
+        )
+        missing_section_failures = [
+            failure
+            for failure in current_refinement_validation.failure_messages
+            if str(failure).startswith("required section is empty:")
+        ]
+        base_budget = 1 if review_result.primary_issue else min(3, max(1, len(open_issues)))
+        revision_budget = max(base_budget, min(5, len(missing_section_failures) or 1))
+        if missing_section_failures:
+            revision_hints = [*base_revision_hints, *missing_section_failures]
         for attempt in range(2):
             revision_result = await self._author.revise_plan(
                 repair_plan=repair_plan,
@@ -522,25 +982,100 @@ class PlanningStages:
                 design_record=self._design_record_payload(ctx.state.design_record),
                 revision_budget=revision_budget,
                 model_override=ctx.selected_author_model,
+                fallback_model_override=self._author_fallback_model(ctx),
                 simplest_possible_design=review_result.simplest_possible_design,
                 revision_hints=revision_hints,
                 reconsideration_candidates=reconsideration_candidates,
             )
             updated_plan = apply_section_updates(current_plan_doc, revision_result.updates)
+            updated_plan = self._preserve_localized_refinement_detail(
+                plan=updated_plan,
+                current_plan=current_plan_doc,
+                requirements=ctx.requirements,
+            )
             preliminary_markdown = render_markdown(updated_plan)
             grounding_failures = self._author.incremental_grounding_failures(
                 previous_plan_content=previous_plan_content,
                 updated_plan_content=preliminary_markdown,
                 verified_paths=verified_paths,
             )
-            if not grounding_failures:
+            revision_validation = self._author.validate_refinement_result(
+                plan_content=preliminary_markdown,
+                repo_understanding=revision_repo_understanding,
+                verified_paths_extra=verified_paths,
+                requirements_text=ctx.requirements,
+            )
+            retryable_failures = [*grounding_failures, *list(revision_validation.failure_messages)]
+            if retryable_failures:
+                original_updated_plan = updated_plan
+                supplemented_plan = self._supplement_refinement_plan(
+                    plan=updated_plan,
+                    failures=retryable_failures,
+                    requirements=ctx.requirements,
+                )
+                supplemented_markdown = render_markdown(supplemented_plan)
+                supplemented_validation = self._author.validate_refinement_result(
+                    plan_content=supplemented_markdown,
+                    repo_understanding=revision_repo_understanding,
+                    verified_paths_extra=verified_paths,
+                    requirements_text=ctx.requirements,
+                )
+                if supplemented_validation.failure_messages:
+                    supplemented_plan = self._supplement_refinement_plan(
+                        plan=supplemented_plan,
+                        failures=[*retryable_failures, *list(supplemented_validation.failure_messages)],
+                        requirements=ctx.requirements,
+                    )
+                    supplemented_markdown = render_markdown(supplemented_plan)
+                    supplemented_validation = self._author.validate_refinement_result(
+                        plan_content=supplemented_markdown,
+                        repo_understanding=revision_repo_understanding,
+                        verified_paths_extra=verified_paths,
+                        requirements_text=ctx.requirements,
+                    )
+                if not supplemented_validation.failure_messages:
+                    revision_result = RevisionResult(
+                        problem_understanding=revision_result.problem_understanding,
+                        updates=revision_result.updates
+                        | {
+                            section: str(getattr(supplemented_plan, section, ""))
+                            for section in (
+                                "architecture",
+                                "files_changed",
+                                "implementation_steps",
+                                "test_strategy",
+                                "rollback_plan",
+                            )
+                            if str(getattr(original_updated_plan, section, ""))
+                            != str(getattr(supplemented_plan, section, ""))
+                        },
+                        justification=dict(revision_result.justification),
+                        review_prediction=revision_result.review_prediction,
+                    )
+                    updated_plan = supplemented_plan
+                    preliminary_markdown = supplemented_markdown
+                    retryable_failures = []
+            if not retryable_failures:
                 break
             if attempt == 1:
-                raise ValueError("; ".join(grounding_failures))
-            revision_hints = grounding_failures
+                raise ValueError("; ".join(retryable_failures))
+            revision_hints = [*base_revision_hints, *retryable_failures]
         previous_version = ctx.core.get_current_plan()
         updated_plan = apply_section_updates(current_plan_doc, revision_result.updates)
+        updated_plan = self._preserve_localized_refinement_detail(
+            plan=updated_plan,
+            current_plan=current_plan_doc,
+            requirements=ctx.requirements,
+        )
         preliminary_markdown = render_markdown(updated_plan)
+        final_validation = self._author.validate_refinement_result(
+            plan_content=preliminary_markdown,
+            repo_understanding=revision_repo_understanding,
+            verified_paths_extra=verified_paths,
+            requirements_text=ctx.requirements,
+        )
+        if final_validation.retryable:
+            raise ValueError("; ".join(final_validation.failure_messages))
         previous_graph = decision_graph_from_json(getattr(previous_version, "decision_graph_json", None))
         candidate_graph = decision_graph_from_plan(
             open_questions=updated_plan.open_questions,
@@ -640,6 +1175,7 @@ class PlanningStages:
             constraints=ctx.state.constraints,
             prior_critique=ctx.issue_tracker.distilled_context(),
             model_override=ctx.selected_critic_model,
+            fallback_model_override=self._critic_fallback_model(ctx),
             session_id=ctx.session_id,
             round_number=ctx.round_number,
             mode="validation",
@@ -765,6 +1301,7 @@ class PlanningStages:
                 constraints=ctx.state.constraints,
                 prior_critique=ctx.issue_tracker.distilled_context(),
                 model_override=ctx.selected_critic_model,
+                fallback_model_override=self._critic_fallback_model(ctx),
                 session_id=ctx.session_id,
                 round_number=ctx.round_number,
                 mode="implementability",

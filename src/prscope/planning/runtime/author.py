@@ -220,6 +220,9 @@ Non-negotiable rules:
 9. For localized UI or API-wiring requests, prefer the owning page/component and existing client/helper files already shown in repository evidence. Do not pull in planning runtime, discovery, or unrelated backend modules unless the evidence directly links them to the requested behavior.
 10. When tests are requested for a localized UI change, prefer an existing adjacent page/container test over an unrelated component test. If no verified test file is clearly related, do not invent a new path; surface the missing test target as a risk or open question instead.
 11. For localized UI or API-wiring requests, do not add observability, logging, telemetry, rollout controls, or platform notes unless the requirements or verified repository evidence explicitly require them.
+12. For localized UI or API-wiring requests, do not invent new backend response fields, session-state plumbing, or API contract changes unless the requirements explicitly ask for a payload/response change.
+13. For localized UI or API-wiring requests, do not prescribe hook APIs, state variable names, or concrete local-state shapes (for example `useState`, `useEffect`, `isExporting`, `lastExportResult`, or typed state objects) unless verified repository evidence already uses those exact constructs and the request explicitly depends on them.
+14. For localized UI requests that only ask to show the latest result/status without specifying formatting, assume a simple success/failure presentation and do not add open questions asking what format/details to show unless repository evidence proves multiple incompatible existing patterns.
 
 Required markdown sections and order:
 - # <Relevant plan title>
@@ -260,6 +263,8 @@ Non-negotiable rules:
 7. For localized UI or API-wiring requests, keep the plan anchored to the owning page/component and existing client/helper files already shown in repository evidence. Do not introduce planning runtime modules, new service layers, or state-management machinery unless the requirements or verified evidence explicitly require them.
 8. When tests are requested for a localized UI change, prefer an existing adjacent page/container test over an unrelated component test. If no verified test file is clearly related, call that out explicitly instead of inventing a new test path.
 9. For localized UI or API-wiring requests, keep observability, logging, telemetry, rollout controls, and platform hardening proportional. Do not add them as workstreams or architecture notes unless the requirements explicitly ask for them.
+10. For localized UI or API-wiring requests, do not prescribe hook APIs, state variable names, typed state objects, timeout/unmount guards, or code-level React patterns (for example `useState`, `useEffect`, `useRef`, `useCallback`, `Promise.race`, `setTimeout`, or `type ExportStatus = ...`) unless verified repository evidence already uses those exact constructs and the request explicitly depends on them.
+11. For localized UI requests that only ask to show the latest result/status without specifying formatting, assume a simple success/failure presentation and do not add open questions or architecture churn about display format/details unless repository evidence proves the choice is genuinely ambiguous.
 
 Required markdown sections and order:
 - # <Relevant plan title>
@@ -579,6 +584,8 @@ class AuthorAgent:
                     "- When Structured Evidence lists existing helper names for export, download, snapshot, or diagnostics flows, mention those exact helper names in the plan instead of saying only 'existing helpers'.\n"
                     "- When Structured Evidence lists existing test_targets for a localized UI/API change, name at least one of those exact test files in the plan unless the requirements explicitly exclude tests.\n"
                     "- For localized UI/API work, do not add observability, logging, telemetry, rollout controls, or platform notes unless the requirements explicitly ask for them.\n"
+                    "- For localized UI/API work, do not invent new backend response fields, export-status session fields, or get_session payload changes unless the requirements explicitly ask for a payload/response change.\n"
+                    "- For localized UI/API work, do not prescribe hook APIs, state variable names, or explicit local-state object shapes (for example `useState`, `useEffect`, `isExporting`, `lastExportResult`, or `{ success: boolean; ... }`) unless verified evidence already shows those exact constructs and the request explicitly depends on them.\n"
                     "- If the requirements only say to keep an existing component behavior intact during rollout, treat that component as a compatibility constraint or test target unless verified evidence shows it must be edited.\n"
                     "- For localized UI/API work, keep file references focused on the owning component/page and existing client helpers already present in Verified File Paths.\n"
                     "- Do not reference planning runtime or discovery modules for frontend wiring work unless those modules are explicitly part of the verified evidence for the requested behavior.\n\n"
@@ -639,6 +646,23 @@ class AuthorAgent:
             min_grounding_ratio=min_grounding_ratio,
             verified_paths_extra=verified_paths_extra,
             requirements_text=requirements_text,
+        )
+
+    def validate_refinement_result(
+        self,
+        *,
+        plan_content: str,
+        repo_understanding: RepoUnderstanding,
+        verified_paths_extra: set[str] | None = None,
+        requirements_text: str | None = None,
+        min_grounding_ratio: float | None = None,
+    ) -> ValidationResult:
+        return self._validation_service.validate_refinement_result(
+            plan_content=plan_content,
+            repo_understanding=repo_understanding,
+            verified_paths_extra=verified_paths_extra,
+            requirements_text=requirements_text,
+            min_grounding_ratio=min_grounding_ratio,
         )
 
     @staticmethod
@@ -783,14 +807,16 @@ class AuthorAgent:
         design_record: dict[str, Any] | None = None,
         reconsideration_candidates: list[dict[str, Any]] | None = None,
         model_override: str | None = None,
+        fallback_model_override: str | None = None,
     ) -> RepairPlan:
-        return await AuthorRepairService(self._llm_call).plan_repair(
+        return await AuthorRepairService(self._llm_call, self._emit).plan_repair(
             review=review,
             plan=plan,
             requirements=requirements,
             design_record=design_record,
             reconsideration_candidates=reconsideration_candidates,
             model_override=model_override,
+            fallback_model_override=fallback_model_override,
         )
 
     async def update_design_record(
@@ -800,12 +826,14 @@ class AuthorAgent:
         review: ReviewResult,
         requirements: str,
         model_override: str | None = None,
+        fallback_model_override: str | None = None,
     ) -> dict[str, Any]:
-        return await AuthorRepairService(self._llm_call).update_design_record(
+        return await AuthorRepairService(self._llm_call, self._emit).update_design_record(
             design_record=design_record,
             review=review,
             requirements=requirements,
             model_override=model_override,
+            fallback_model_override=fallback_model_override,
         )
 
     async def revise_plan(
@@ -816,17 +844,19 @@ class AuthorAgent:
         design_record: dict[str, Any] | None = None,
         revision_budget: int = 3,
         model_override: str | None = None,
+        fallback_model_override: str | None = None,
         simplest_possible_design: str | None = None,
         revision_hints: list[str] | None = None,
         reconsideration_candidates: list[dict[str, Any]] | None = None,
     ) -> RevisionResult:
-        return await AuthorRepairService(self._llm_call).revise_plan(
+        return await AuthorRepairService(self._llm_call, self._emit).revise_plan(
             repair_plan=repair_plan,
             current_plan=current_plan,
             requirements=requirements,
             design_record=design_record,
             revision_budget=revision_budget,
             model_override=model_override,
+            fallback_model_override=fallback_model_override,
             simplest_possible_design=simplest_possible_design,
             revision_hints=revision_hints,
             reconsideration_candidates=reconsideration_candidates,

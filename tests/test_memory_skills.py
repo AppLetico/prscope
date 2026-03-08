@@ -45,14 +45,19 @@ def test_load_skills_truncates_at_boundaries(tmp_path):
 
 @pytest.mark.asyncio
 async def test_memory_complete_emits_usage_without_logging_format_error(monkeypatch):
+    calls: list[dict[str, object]] = []
     fake_response = SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content="summary block"))],
         usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
     )
-    fake_litellm = SimpleNamespace(completion=lambda **_: fake_response)
+    def _completion(**kwargs):
+        calls.append(kwargs)
+        return fake_response
+
+    fake_litellm = SimpleNamespace(completion=_completion)
     monkeypatch.setitem(sys.modules, "litellm", fake_litellm)
 
-    fake_store = SimpleNamespace(config=SimpleNamespace(memory_model="gpt-4o-mini"))
+    fake_store = SimpleNamespace(config=SimpleNamespace(memory_model="gemini-2.5-flash"))
     events: list[dict[str, object]] = []
 
     async def _capture(event: dict[str, object]) -> None:
@@ -66,7 +71,8 @@ async def test_memory_complete_emits_usage_without_logging_format_error(monkeypa
     )
 
     assert result == "summary block"
+    assert calls[0]["model"] == "gemini/gemini-2.5-flash"
     assert len(events) == 1
     assert events[0]["type"] == "token_usage"
     assert events[0]["memory_block"] == "modules"
-    assert events[0]["model"] == "gpt-4o-mini"
+    assert events[0]["model"] == "gemini-2.5-flash"

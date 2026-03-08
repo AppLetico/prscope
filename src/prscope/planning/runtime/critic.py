@@ -16,6 +16,12 @@ from typing import Any, Callable, Literal
 
 from ...config import PlanningConfig, RepoProfile
 from ...memory import ParsedConstraint
+from ...model_catalog import (
+    litellm_model_name,
+    model_has_elevated_json_contract_risk,
+    model_prefers_compact_json,
+    model_provider,
+)
 from ...pricing import MODEL_CONTEXT_WINDOWS
 from .telemetry import completion_telemetry
 
@@ -164,6 +170,7 @@ Scope discipline rules:
 - If the user narrows scope further with guidance like "keep the response simple", "keep it public", or "limit tests to the happy-path 200 response", do not criticize the plan for lacking dependency-failure, timeout, partial-failure, or overall-system-health semantics.
 - For a lightweight `/health` request, avoid treating the absence of "detailed health checks" as a blocking flaw when the plan already returns a simple public 200 response and explicitly excludes dependency checks.
 - For localized UI or API-wiring requests that explicitly say to reuse existing helpers/endpoints and avoid new endpoints, do not escalate into new service layers, shared utility modules, state-management rewrites, or broad page-action redesigns unless verified repository evidence shows the current structure cannot support the request.
+- For localized UI requests that simply say to show the latest result/status, do not treat unspecified display formatting as a blocking flaw; a simple success/failure presentation is acceptable unless the requirements or verified repository evidence call for richer formatting.
 
 First perform structured analysis using these headings:
 
@@ -303,6 +310,7 @@ class CriticAgent:
                 "type": "token_usage",
                 "session_stage": "reviewer",
                 "model": model,
+                "model_provider": model_provider(model),
                 "prompt_tokens": telemetry.usage.prompt_tokens,
                 "completion_tokens": telemetry.usage.completion_tokens,
                 "call_cost_usd": telemetry.cost.total_cost_usd,
@@ -433,6 +441,7 @@ class CriticAgent:
 
         last_error: Exception | None = None
         for idx, model in enumerate(models_to_try):
+            litellm_model = litellm_model_name(model)
             try:
                 if self._prefer_responses_api(model):
                     from openai import OpenAI
@@ -448,7 +457,7 @@ class CriticAgent:
                         return text, response, model
                     raise RuntimeError("Empty response text from OpenAI Responses API")
                 response = litellm.completion(
-                    model=model,
+                    model=litellm_model,
                     messages=messages,
                     max_tokens=3000,
                     temperature=temperature,
@@ -752,6 +761,7 @@ class CriticAgent:
         temperature: float | None = None,
         strict_mode: bool = False,
         model_override: str | None = None,
+        fallback_model_override: str | None = None,
         session_id: str = "",
         round_number: int = 0,
         mode: Literal["initial", "validation", "stabilization", "implementability"] = "initial",
@@ -867,35 +877,84 @@ class CriticAgent:
                 )
 
         temp = 0.0 if temperature is None else temperature
-        for attempt in range(max_retries + 1):
-            try:
-                raw, _ = await self._call_with_telemetry(
-                    messages=messages,
-                    temperature=temp,
-                    model_override=model_override,
-                )
-            except Exception as exc:
-                raise CriticContractError(f"Reviewer call failed: {exc}") from exc
-            try:
-                if mode == "implementability":
-                    return self._parse_implementability_response(raw)
-                parsed = self._parse_review_response(raw)
-                return self._apply_scope_discipline(requirements, parsed)
-            except CriticParseError as exc:
-                if strict_mode and attempt >= max_retries:
-                    raise CriticContractError(f"Reviewer contract parse failure: {exc}") from exc
-                if attempt < max_retries:
-                    messages.append(
+        models_to_try = [model_override]
+        if (
+            fallback_model_override
+            and fallback_model_override != model_override
+            and model_override
+            and model_has_elevated_json_contract_risk(model_override)
+        ):
+            models_to_try.append(fallback_model_override)
+
+        last_parse_error: CriticParseError | None = None
+        for model_index, active_model in enumerate(models_to_try):
+            active_messages = list(messages)
+            for attempt in range(max_retries + 1):
+                try:
+                    raw, _ = await self._call_with_telemetry(
+                        messages=active_messages,
+                        temperature=temp,
+                        model_override=active_model,
+                    )
+                except Exception as exc:
+                    raise CriticContractError(f"Reviewer call failed: {exc}") from exc
+                try:
+                    if mode == "implementability":
+                        return self._parse_implementability_response(raw)
+                    parsed = self._parse_review_response(raw)
+                    return self._apply_scope_discipline(requirements, parsed)
+                except CriticParseError as exc:
+                    last_parse_error = exc
+                    await self._emit(
                         {
-                            "role": "user",
-                            "content": (
-                                f"Formatting error: {exc}. Respond again with valid JSON first, then prose analysis."
-                            ),
+                            "type": "structured_output_retry",
+                            "model_stage": "critic_review",
+                            "model": active_model,
+                            "failure_category": "json_contract",
                         }
                     )
-                    continue
-                raise CriticContractError(f"Reviewer parse failed after {max_retries + 1} attempts: {exc}") from exc
+                    if strict_mode and attempt >= max_retries:
+                        raise CriticContractError(f"Reviewer contract parse failure: {exc}") from exc
+                    if attempt < max_retries:
+                        retry_instruction = "Respond again with valid JSON first, then prose analysis."
+                        if active_model and model_prefers_compact_json(active_model):
+                            retry_instruction = (
+                                "Respond with exactly one compact JSON object first. "
+                                "No markdown fences, no prose before the JSON, and no trailing text after the closing brace."
+                            )
+                        active_messages.append(
+                            {
+                                "role": "user",
+                                "content": f"Formatting error: {exc}. {retry_instruction}",
+                            }
+                        )
+                        continue
+                    if model_index < len(models_to_try) - 1:
+                        await self._emit(
+                            {
+                                "type": "structured_output_fallback",
+                                "model_stage": "critic_review",
+                                "model": active_model,
+                                "fallback_model": models_to_try[model_index + 1],
+                                "failure_category": "json_contract",
+                            }
+                        )
+                        await self._emit(
+                            {
+                                "type": "warning",
+                                "message": (
+                                    f"Reviewer JSON contract failed on {active_model}; "
+                                    f"retrying stage with fallback model {models_to_try[model_index + 1]}."
+                                ),
+                            }
+                        )
+                        break
+                    raise CriticContractError(
+                        f"Reviewer parse failed after {max_retries + 1} attempts: {exc}"
+                    ) from exc
 
+        if last_parse_error is not None:
+            raise CriticContractError("Reviewer exhausted retries without producing a valid contract") from last_parse_error
         raise CriticContractError("Reviewer exhausted retries without producing a valid contract")
 
     async def run_critic(
@@ -911,6 +970,7 @@ class CriticAgent:
         temperature: float | None = None,
         strict_mode: bool = False,
         model_override: str | None = None,
+        fallback_model_override: str | None = None,
         session_id: str = "",
         round_number: int = 0,
     ) -> ReviewResult:
@@ -925,6 +985,7 @@ class CriticAgent:
             temperature=temperature,
             strict_mode=strict_mode,
             model_override=model_override,
+            fallback_model_override=fallback_model_override,
             session_id=session_id,
             round_number=round_number,
             mode="initial",

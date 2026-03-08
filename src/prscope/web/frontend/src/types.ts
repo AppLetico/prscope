@@ -30,6 +30,25 @@ export interface PlanningSession {
 export interface DraftTimingDiagnostics {
   warnings_total?: number;
   errors_total?: number;
+  initial_draft_model?: string | null;
+  initial_draft_provider?: string | null;
+  initial_draft_fallback_model?: string | null;
+  author_refine_model?: string | null;
+  author_refine_provider?: string | null;
+  author_refine_fallback_model?: string | null;
+  author_refine_json_retries?: number;
+  author_refine_fallbacks?: number;
+  author_refine_last_failure_category?: string | null;
+  critic_review_model?: string | null;
+  critic_review_provider?: string | null;
+  critic_review_fallback_model?: string | null;
+  critic_review_json_retries?: number;
+  critic_review_fallbacks?: number;
+  critic_review_last_failure_category?: string | null;
+  discovery_model?: string | null;
+  discovery_provider?: string | null;
+  memory_model?: string | null;
+  memory_provider?: string | null;
   routing_decisions_total?: number;
   routing_heuristic_decisions?: number;
   routing_model_decisions?: number;

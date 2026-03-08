@@ -7,7 +7,9 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sqlite3
 import time
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
@@ -45,6 +47,57 @@ def _to_int(value: Any, fallback: int = 0) -> int:
         return int(value)
     except (TypeError, ValueError):
         return fallback
+
+
+def _summarize_background_failure(action: str, exc: Exception) -> str:
+    detail = " ".join(str(exc).split()).strip() or exc.__class__.__name__
+    detail = detail[:237].rstrip() + "..." if len(detail) > 240 else detail
+    return f"{action} failed: {detail}"
+
+
+async def _surface_background_session_failure(
+    *,
+    session_id: str,
+    store: Store,
+    action: str,
+    exc: Exception,
+    emit_event: Callable[[str, dict[str, Any]], Awaitable[None]],
+    build_snapshot: Callable[[str, Store], dict[str, Any]],
+) -> None:
+    phase_message = _summarize_background_failure(action, exc)
+    persist_error: Exception | None = None
+    for attempt in range(5):
+        try:
+            store.update_planning_session(
+                session_id,
+                _bypass_protection=True,
+                status="error",
+                phase_message=phase_message,
+                is_processing=0,
+                processing_started_at=None,
+                pending_questions_json=None,
+                active_tool_calls_json=json.dumps([]),
+            )
+            persist_error = None
+            break
+        except sqlite3.OperationalError as locked_exc:
+            persist_error = locked_exc
+            if "locked" not in str(locked_exc).lower() or attempt == 4:
+                break
+            await asyncio.sleep(0.05)
+        except Exception as unexpected_exc:  # noqa: BLE001
+            persist_error = unexpected_exc
+            break
+    if persist_error is not None:
+        logger.error(
+            "api.sessions failed surfacing background error state session_id={} action={} error={}",
+            session_id,
+            action,
+            persist_error,
+        )
+        return
+    await emit_event(session_id, build_snapshot(session_id, store))
+    await emit_event(session_id, {"type": "error", "message": phase_message})
 
 
 class StartSessionRequest(BaseModel):
@@ -162,6 +215,25 @@ class RuntimeRegistry:
             "draft_loop_budget_ms": None,
             "stability_stop": False,
             "stability_reason_codes": [],
+            "initial_draft_model": None,
+            "initial_draft_provider": None,
+            "initial_draft_fallback_model": None,
+            "author_refine_model": None,
+            "author_refine_provider": None,
+            "author_refine_fallback_model": None,
+            "critic_review_model": None,
+            "critic_review_provider": None,
+            "critic_review_fallback_model": None,
+            "memory_model": None,
+            "memory_provider": None,
+            "discovery_model": None,
+            "discovery_provider": None,
+            "author_refine_json_retries": 0,
+            "author_refine_fallbacks": 0,
+            "author_refine_last_failure_category": None,
+            "critic_review_json_retries": 0,
+            "critic_review_fallbacks": 0,
+            "critic_review_last_failure_category": None,
             "warnings_total": 0,
             "errors_total": 0,
             "author_call_timeouts": 0,
@@ -284,6 +356,10 @@ class RuntimeRegistry:
                     latency,
                 )
             elif session_stage == "discovery":
+                timing["discovery_model"] = str(event.get("model", "")).strip() or timing.get("discovery_model")
+                timing["discovery_provider"] = (
+                    str(event.get("model_provider", "")).strip() or timing.get("discovery_provider")
+                )
                 timing["discovery_llm_calls"] = int(timing.get("discovery_llm_calls", 0)) + 1
                 timing["discovery_llm_latency_ms_total"] = (
                     float(timing.get("discovery_llm_latency_ms_total", 0.0)) + latency
@@ -291,6 +367,11 @@ class RuntimeRegistry:
                 timing["discovery_llm_latency_ms_max"] = max(
                     float(timing.get("discovery_llm_latency_ms_max", 0.0)),
                     latency,
+                )
+            elif session_stage == "memory":
+                timing["memory_model"] = str(event.get("model", "")).strip() or timing.get("memory_model")
+                timing["memory_provider"] = str(event.get("model_provider", "")).strip() or timing.get(
+                    "memory_provider"
                 )
             changed = True
         elif etype == "setup_progress":
@@ -540,6 +621,36 @@ class RuntimeRegistry:
                 if not isinstance(raw_items, list):
                     continue
                 timing[field_name] = [str(item).strip() for item in raw_items if str(item).strip()]
+                changed = True
+        elif etype == "model_selection":
+            stage = str(event.get("model_stage", "")).strip().lower()
+            if stage in {"initial_draft", "author_refine", "critic_review", "memory", "discovery"}:
+                timing[f"{stage}_model"] = str(event.get("model", "")).strip() or None
+                timing[f"{stage}_provider"] = str(event.get("provider", "")).strip() or None
+                fallback_model = str(event.get("fallback_model", "")).strip()
+                if fallback_model:
+                    timing[f"{stage}_fallback_model"] = fallback_model
+                changed = True
+        elif etype == "structured_output_retry":
+            stage = str(event.get("model_stage", "")).strip().lower()
+            if stage in {"author_refine", "critic_review"}:
+                retry_key = f"{stage}_json_retries"
+                timing[retry_key] = int(timing.get(retry_key, 0)) + 1
+                failure_category = str(event.get("failure_category", "")).strip()
+                if failure_category:
+                    timing[f"{stage}_last_failure_category"] = failure_category
+                changed = True
+        elif etype == "structured_output_fallback":
+            stage = str(event.get("model_stage", "")).strip().lower()
+            if stage in {"author_refine", "critic_review"}:
+                fallback_key = f"{stage}_fallbacks"
+                timing[fallback_key] = int(timing.get(fallback_key, 0)) + 1
+                fallback_model = str(event.get("fallback_model", "")).strip()
+                if fallback_model:
+                    timing[f"{stage}_fallback_model"] = fallback_model
+                failure_category = str(event.get("failure_category", "")).strip()
+                if failure_category:
+                    timing[f"{stage}_last_failure_category"] = failure_category
                 changed = True
 
         if changed:
@@ -1105,6 +1216,21 @@ def create_app() -> FastAPI:
                     }
                 )
             raise HTTPException(status_code=409, detail=detail) from exc
+        except ValueError as exc:
+            message = str(exc)
+            if message == "session not found":
+                raise HTTPException(status_code=404, detail="session not found") from exc
+            session = store.get_planning_session(session_id)
+            detail: dict[str, Any] = {"reason": "command_failed", "detail": message}
+            if session is not None:
+                detail.update(
+                    {
+                        "status": session.status,
+                        "phase_message": session.phase_message,
+                        "allowed_commands": _allowed_commands_for(session, store),
+                    }
+                )
+            raise HTTPException(status_code=409, detail=detail) from exc
 
     app.add_middleware(
         CORSMiddleware,
@@ -1162,8 +1288,14 @@ def create_app() -> FastAPI:
             runtime_started = time.perf_counter()
             _, store, runtime = _runtime_for(repo_name=payload.repo)
             runtime_elapsed = time.perf_counter() - runtime_started
-            author_model = _validated_model_or_400(payload.author_model, "author")
-            critic_model = _validated_model_or_400(payload.critic_model, "critic")
+            author_model = _validated_model_or_400(
+                payload.author_model or runtime.planning_config.author_model,
+                "author",
+            )
+            critic_model = _validated_model_or_400(
+                payload.critic_model or runtime.planning_config.critic_model,
+                "critic",
+            )
             if payload.mode == "requirements":
                 if not payload.requirements:
                     raise HTTPException(status_code=400, detail="requirements is required for mode=requirements")
@@ -1227,14 +1359,29 @@ def create_app() -> FastAPI:
                             time.perf_counter() - draft_started,
                             exc,
                         )
-                        timing = registry._ensure_session_timing(session.id, store=store)
-                        timing.update(
-                            {
-                                "timing_updated_at_unix_s": time.time(),
-                            }
+                        await _surface_background_session_failure(
+                            session_id=session.id,
+                            store=store,
+                            action="Initial draft",
+                            exc=exc,
+                            emit_event=_emit_session_event,
+                            build_snapshot=_build_session_snapshot,
                         )
-                        registry._persist_session_timing(session.id, timing, store=store)
-                        raise
+                        try:
+                            timing = registry._ensure_session_timing(session.id, store=store)
+                            timing.update(
+                                {
+                                    "initial_draft_failed": True,
+                                    "timing_updated_at_unix_s": time.time(),
+                                }
+                            )
+                            registry._persist_session_timing(session.id, timing, store=store)
+                        except Exception as timing_exc:  # noqa: BLE001
+                            logger.warning(
+                                "api.sessions draft failure timing persistence skipped session_id={} error={}",
+                                session.id,
+                                timing_exc,
+                            )
 
                 task = asyncio.create_task(_run_initial_draft_task())
                 task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
@@ -1310,7 +1457,14 @@ def create_app() -> FastAPI:
                     )
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("api.sessions chat setup failed session_id={}", session.id)
-                    await emit_setup_event({"type": "error", "message": str(exc)})
+                    await _surface_background_session_failure(
+                        session_id=session.id,
+                        store=store,
+                        action="Chat setup",
+                        exc=exc,
+                        emit_event=_emit_session_event,
+                        build_snapshot=_build_session_snapshot,
+                    )
 
             asyncio.create_task(run_chat_setup())
             logger.info(
