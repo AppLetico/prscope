@@ -28,6 +28,32 @@ SCOPE_EXPANSION_PATTERNS = (
     re.compile(r"\bconcurrency\b|\bhigh[- ]load\b|\brace conditions?\b", re.IGNORECASE),
     re.compile(r"\blogging\b|\bmonitoring\b|\btelemetry\b|\bobservability\b", re.IGNORECASE),
     re.compile(r"\bstartup/shutdown\b|\bdocument(?:ation)?\b", re.IGNORECASE),
+    re.compile(r"\bpartial failures?\b|\bdependency failures?\b|\btimeouts?\b", re.IGNORECASE),
+    re.compile(r"\baccurate health status\b|\bactual service health\b|\boverall system health\b", re.IGNORECASE),
+    re.compile(r"\bother services?\b|\bcritical service\b|\bservice health\b", re.IGNORECASE),
+    re.compile(r"\bdetailed health checks?\b|\bhealth check logic\b", re.IGNORECASE),
+    re.compile(r"\bmislead users about (?:application|service) status\b", re.IGNORECASE),
+)
+
+LOCALIZED_REUSE_SCOPE_PATTERNS = (
+    re.compile(
+        r"\bservice layer\b|\bshared utility module\b|\bstate management\b|\bcentralized state management\b",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\brefactor common .* logic\b|\breduce coupling\b|\btight integration\b|\bcoupling between .* may increase complexity\b|"
+        r"\bcoupling between .* may hinder reusability\b|\bdry principles\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bpage actions\b|\bsession management controls\b", re.IGNORECASE),
+    re.compile(r"\bextensible for future formats\b|\bfuture formats\b|\bextensib(?:le|ility)\b", re.IGNORECASE),
+    re.compile(r"\blogging\b|\btelemetry\b|\bobservability\b|\buat\b|\buser acceptance testing\b", re.IGNORECASE),
+    re.compile(
+        r"\bdedicated export (?:handler|service)\b|\babstract api calls\b|\bversioning for the frontend components\b",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bfeature flags?\b|\broll out changes incrementally\b", re.IGNORECASE),
+    re.compile(r"\bdedicated .* context\b|\bdedicated .* hook\b|\bcentralized state management solution\b", re.IGNORECASE),
 )
 
 
@@ -135,6 +161,9 @@ Scope discipline rules:
 - Prefer tightening observability and failure handling within the stated scope over inventing new platform/security requirements.
 - Example: if the request is "Add a lightweight /health endpoint and tests for it", do not escalate to database checks, external-service checks, authentication, or concurrency-control work unless the request or verified evidence explicitly requires that broader behavior.
 - For that same lightweight `/health` example, do not turn the plan into logging, monitoring, telemetry, or documentation work unless the user explicitly asks for those deliverables.
+- If the user narrows scope further with guidance like "keep the response simple", "keep it public", or "limit tests to the happy-path 200 response", do not criticize the plan for lacking dependency-failure, timeout, partial-failure, or overall-system-health semantics.
+- For a lightweight `/health` request, avoid treating the absence of "detailed health checks" as a blocking flaw when the plan already returns a simple public 200 response and explicitly excludes dependency checks.
+- For localized UI or API-wiring requests that explicitly say to reuse existing helpers/endpoints and avoid new endpoints, do not escalate into new service layers, shared utility modules, state-management rewrites, or broad page-action redesigns unless verified repository evidence shows the current structure cannot support the request.
 
 First perform structured analysis using these headings:
 
@@ -559,18 +588,46 @@ class CriticAgent:
         return any(token in lowered for token in ("lightweight", "simple", "basic"))
 
     @staticmethod
+    def _is_localized_reuse_request(requirements: str) -> bool:
+        lowered = str(requirements or "").lower()
+        if not any(token in lowered for token in ("reuse", "existing", "keep the current", "during rollout")):
+            return False
+        if not any(token in lowered for token in ("actionbar", "planpanel", "planningview", "frontend", "react", "component", "ui")):
+            return False
+        return any(
+            token in lowered
+            for token in ("instead of creating new endpoints", "do not add new endpoints", "without adding backend endpoints")
+        )
+
+    @staticmethod
     def _is_scope_expansion_feedback(text: str) -> bool:
         normalized = str(text or "").strip()
         if not normalized:
             return False
         return any(pattern.search(normalized) for pattern in SCOPE_EXPANSION_PATTERNS)
 
+    @staticmethod
+    def _is_localized_reuse_scope_expansion_feedback(text: str) -> bool:
+        normalized = str(text or "").strip()
+        if not normalized:
+            return False
+        return any(pattern.search(normalized) for pattern in LOCALIZED_REUSE_SCOPE_PATTERNS)
+
     def _apply_scope_discipline(self, requirements: str, review: ReviewResult) -> ReviewResult:
-        if not self._is_lightweight_health_request(requirements):
+        apply_health_filter = self._is_lightweight_health_request(requirements)
+        apply_localized_filter = self._is_localized_reuse_request(requirements)
+        if not apply_health_filter and not apply_localized_filter:
             return review
 
         def _filter(items: list[str]) -> list[str]:
-            return [item for item in items if not self._is_scope_expansion_feedback(item)]
+            filtered: list[str] = []
+            for item in items:
+                if apply_health_filter and self._is_scope_expansion_feedback(item):
+                    continue
+                if apply_localized_filter and self._is_localized_reuse_scope_expansion_feedback(item):
+                    continue
+                filtered.append(item)
+            return filtered
 
         blocking_issues = _filter(review.blocking_issues)
         recommended_changes = _filter(review.recommended_changes)
@@ -579,7 +636,10 @@ class CriticAgent:
         reviewer_questions = _filter(review.reviewer_questions)
         issue_priority = _filter(review.issue_priority)
         primary_issue = review.primary_issue
-        if primary_issue and self._is_scope_expansion_feedback(primary_issue):
+        if primary_issue and (
+            (apply_health_filter and self._is_scope_expansion_feedback(primary_issue))
+            or (apply_localized_filter and self._is_localized_reuse_scope_expansion_feedback(primary_issue))
+        ):
             primary_issue = issue_priority[0] if issue_priority else None
 
         return ReviewResult(

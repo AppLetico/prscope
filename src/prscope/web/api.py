@@ -151,6 +151,16 @@ class RuntimeRegistry:
             "draft_author_latency_ms_max": 0.0,
             "draft_redraft_count": 0,
             "draft_complexity": None,
+            "evidence_bundle_files_count": 0,
+            "evidence_bundle_test_targets_count": 0,
+            "author_internal_attempts": 0,
+            "author_self_review_used": False,
+            "draft_redraft_reason_codes": [],
+            "quality_gate_failures": [],
+            "initial_draft_total_ms": None,
+            "draft_loop_budget_ms": None,
+            "stability_stop": False,
+            "stability_reason_codes": [],
             "warnings_total": 0,
             "errors_total": 0,
             "author_call_timeouts": 0,
@@ -499,6 +509,37 @@ class RuntimeRegistry:
                         timing["initial_draft_elapsed_s"] = timing.get("initial_draft_elapsed_s")
                 timing["initial_draft_failed"] = True
             changed = True
+        elif etype == "draft_diagnostics":
+            int_fields = (
+                "evidence_bundle_files_count",
+                "evidence_bundle_test_targets_count",
+                "author_internal_attempts",
+                "initial_draft_total_ms",
+                "draft_loop_budget_ms",
+            )
+            bool_fields = ("author_self_review_used", "stability_stop")
+            list_fields = ("draft_redraft_reason_codes", "quality_gate_failures", "stability_reason_codes")
+            for field_name in int_fields:
+                raw_value = event.get(field_name)
+                if raw_value is None:
+                    continue
+                try:
+                    timing[field_name] = int(raw_value)
+                    changed = True
+                except (TypeError, ValueError):
+                    continue
+            for field_name in bool_fields:
+                raw_value = event.get(field_name)
+                if raw_value is None:
+                    continue
+                timing[field_name] = bool(raw_value)
+                changed = True
+            for field_name in list_fields:
+                raw_items = event.get(field_name)
+                if not isinstance(raw_items, list):
+                    continue
+                timing[field_name] = [str(item).strip() for item in raw_items if str(item).strip()]
+                changed = True
 
         if changed:
             timing["timing_updated_at_unix_s"] = time.time()

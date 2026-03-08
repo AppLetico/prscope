@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from typing import Any
 
 from ..pipeline import PlanningRoundContext
@@ -8,6 +9,32 @@ from ..pipeline import PlanningRoundContext
 class RuntimeRoundEntry:
     def __init__(self, runtime: Any):
         self._runtime = runtime
+
+    @staticmethod
+    def _effective_requirements(core: Any, session: Any, user_input: str | None) -> str:
+        base = str(session.requirements or "")
+        if user_input:
+            return base + f"\n\nUser input:\n{user_input}"
+
+        recent_guidance: deque[str] = deque(maxlen=3)
+        seen: set[str] = set()
+        for turn in reversed(core.get_conversation()):
+            if str(getattr(turn, "role", "")).strip() != "user":
+                continue
+            round_number = int(getattr(turn, "round", 0) or 0)
+            if round_number <= 0:
+                continue
+            content = str(getattr(turn, "content", "") or "").strip()
+            if not content or content in seen:
+                continue
+            seen.add(content)
+            recent_guidance.appendleft(content)
+            if len(recent_guidance) >= 3:
+                break
+        if not recent_guidance:
+            return base
+        guidance_block = "\n".join(f"- {item}" for item in recent_guidance)
+        return base + f"\n\nLatest user guidance:\n{guidance_block}"
 
     async def run_adversarial_round(
         self,
@@ -34,7 +61,7 @@ class RuntimeRoundEntry:
                 raise ValueError("Cannot run adversarial round without initial plan")
 
             round_number = session.current_round + 1
-            requirements = (session.requirements or "") + (f"\n\nUser input:\n{user_input}" if user_input else "")
+            requirements = self._effective_requirements(core, session, user_input)
             state = self._runtime._state(session_id, session)
             state.requirements = requirements
             state.revision_round = round_number

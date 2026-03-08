@@ -25,9 +25,15 @@ import {
   submitClarification,
 } from "../lib/api";
 import { cleanPlanTitle } from "../lib/planTitle";
-import type { ClarificationPrompt, PlanningSession, UIEvent } from "../types";
+import type { ClarificationPrompt, LiveActivityEntry, PlanningSession, UIEvent } from "../types";
 import { AlertCircle, Check, Loader2 } from "lucide-react";
-import { INITIAL_TIMELINE_STATE, timelineReducer } from "../components/chatPanelUtils";
+import {
+  formatPhaseTimingLabel,
+  formatToolActivityLabel,
+  INITIAL_TIMELINE_STATE,
+  timelineReducer,
+  upsertLiveActivity,
+} from "../components/chatPanelUtils";
 
 function normalizeActivityText(value: string): string {
   return value.replace(/\.{3,}\s*$/u, "").trim();
@@ -53,6 +59,7 @@ export function PlanningViewPage() {
   const [setupSteps, setSetupSteps] = useState<string[]>([]);
   const [initialSetupDone, setInitialSetupDone] = useState(false);
   const [deletingOrphan, setDeletingOrphan] = useState(false);
+  const [liveActivities, setLiveActivities] = useState<LiveActivityEntry[]>([]);
   const [sessionState, setSessionState] = useState<{
     status: PlanningSession["status"];
     current_round: number;
@@ -78,8 +85,13 @@ export function PlanningViewPage() {
     // Session route changed: clear transient setup UI so old events/steps cannot bleed through.
     setSetupSteps([]);
     setInitialSetupDone(false);
+    setLiveActivities([]);
     lastVersionSeen.current = 0;
   }, [id]);
+
+  const appendLiveActivity = useCallback((activity: LiveActivityEntry) => {
+    setLiveActivities((prev) => upsertLiveActivity(prev, activity));
+  }, []);
 
   const isSessionNotFoundError = useCallback((err: unknown) => {
     return String(err).toLowerCase().includes("session not found");
@@ -240,10 +252,25 @@ export function PlanningViewPage() {
     }
     if (event.type === "thinking") {
       setThinkingMessage(event.message);
+      appendLiveActivity({
+        id: `thought:${normalizeActivityText(event.message).toLowerCase()}`,
+        kind: "thought",
+        message: normalizeActivityText(event.message) || "Thinking",
+        created_at: new Date().toISOString(),
+        status: "running",
+      });
       return;
     }
     if (event.type === "tool_update") {
       dispatchTl({ type: "tool_update", tool: event.tool });
+      appendLiveActivity({
+        id: `tool:${String(event.tool.call_id ?? event.tool.id)}`,
+        kind: "tool",
+        message: formatToolActivityLabel(event.tool),
+        stage: event.tool.sessionStage,
+        status: event.tool.status,
+        created_at: event.tool.created_at ?? new Date().toISOString(),
+      });
       return;
     }
     if (event.type === "complete") {
@@ -333,9 +360,28 @@ export function PlanningViewPage() {
     }
     if (event.type === "setup_progress") {
       setSetupSteps((prev) => [...prev, event.step]);
+      appendLiveActivity({
+        id: `setup:${event.session_stage ?? "setup"}:${event.draft_stage ?? normalizeActivityText(event.step).toLowerCase()}`,
+        kind: "update",
+        message: normalizeActivityText(event.step),
+        stage: event.draft_stage ?? event.session_stage,
+        status: "running",
+        created_at: new Date().toISOString(),
+      });
       if ((sessionState?.pending_questions?.length ?? 0) === 0 && !pendingClarification) {
         setThinkingMessage(normalizeActivityText(event.step));
       }
+      return;
+    }
+    if (event.type === "phase_timing") {
+      appendLiveActivity({
+        id: `phase:${event.session_stage ?? "activity"}:${event.state ?? "update"}`,
+        kind: "update",
+        message: formatPhaseTimingLabel(event.session_stage, event.state, event.elapsed_ms),
+        stage: event.session_stage,
+        status: event.state,
+        created_at: new Date().toISOString(),
+      });
       return;
     }
     if (event.type === "discovery_ready") {
@@ -344,7 +390,7 @@ export function PlanningViewPage() {
       void refetchSession();
       return;
     }
-  }, [id, maxPromptTokens, pendingClarification, queryClient, refetchSession, sessionCostUsd, sessionState?.pending_questions]);
+  }, [appendLiveActivity, id, maxPromptTokens, pendingClarification, queryClient, refetchSession, sessionCostUsd, sessionState?.pending_questions]);
 
   const handleReconnect = useCallback(() => {
     lastRefetchAtMs.current = Date.now();
@@ -360,6 +406,7 @@ export function PlanningViewPage() {
     try {
       setError(null);
       setThinkingMessage("Thinking...");
+      setLiveActivities([]);
       const status = effectiveStatus;
       const models = {
         author_model: selectedAuthorModel || undefined,
@@ -407,6 +454,7 @@ export function PlanningViewPage() {
     try {
       setError(null);
       setThinkingMessage("Applying follow-up answer...");
+      setLiveActivities([]);
       await answerPlanFollowup(id, {
         plan_version_id: currentPlan.id,
         followup_id: followupId,
@@ -444,6 +492,7 @@ export function PlanningViewPage() {
     try {
       setError(null);
       setShowCritiquePrompt(false);
+      setLiveActivities([]);
       await runRound(id, undefined, {
         author_model: selectedAuthorModel || undefined,
         critic_model: selectedCriticModel || undefined,
@@ -698,6 +747,7 @@ export function PlanningViewPage() {
                   timeline={tl.timeline}
                   questions={questions}
                   activeToolCalls={tl.activeTools}
+                  liveActivities={liveActivities}
                   thinkingMessage={thinkingMessage}
                   phaseMessage={phaseMessage}
                   warnings={warnings}

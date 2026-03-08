@@ -158,6 +158,16 @@ export interface ToolCallGroup {
   tools: ToolCallEntry[];
 }
 
+export interface LiveActivityEntry {
+  id: string;
+  kind: "thought" | "update" | "tool";
+  message: string;
+  stage?: string;
+  status?: "running" | "done" | "start" | "complete" | "failed";
+  created_at: string;
+  count?: number;
+}
+
 export interface RoundMetric {
   round: number;
   major_issues?: number | null;
@@ -296,6 +306,12 @@ export type UIEvent = UIEventBase & (
       planner_elapsed_s?: number;
       cache_hit?: boolean;
       complexity?: string;
+    }
+  | {
+      type: "phase_timing";
+      session_stage?: string;
+      state?: "start" | "complete" | "failed";
+      elapsed_ms?: number;
     }
   | { type: "discovery_ready"; opening: string }
 );

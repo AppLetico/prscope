@@ -249,6 +249,40 @@ def test_runtime_registry_tracks_routing_decisions(tmp_path):
     assert timing["route_existing_feature_total"] == 1
 
 
+def test_runtime_registry_tracks_draft_diagnostics(tmp_path):
+    store = Store(tmp_path / "test.db")
+    session = store.create_planning_session(
+        repo_name=tmp_path.name,
+        title="draft-diag",
+        requirements="r",
+        seed_type="requirements",
+        status="draft",
+    )
+    registry = RuntimeRegistry(emitter=SimpleNamespace())
+
+    registry.note_event(
+        session.id,
+        {
+            "type": "draft_diagnostics",
+            "author_internal_attempts": 2,
+            "author_self_review_used": True,
+            "draft_redraft_reason_codes": ["missing_tests", "localized_scope_drift"],
+            "quality_gate_failures": ["missing test target reference"],
+            "draft_loop_budget_ms": 16000,
+            "stability_stop": False,
+        },
+        store=store,
+    )
+
+    timing = registry.get_session_timing(session.id, store=store)
+    assert timing is not None
+    assert timing["author_internal_attempts"] == 2
+    assert timing["author_self_review_used"] is True
+    assert timing["draft_redraft_reason_codes"] == ["missing_tests", "localized_scope_drift"]
+    assert timing["quality_gate_failures"] == ["missing test target reference"]
+    assert timing["draft_loop_budget_ms"] == 16000
+
+
 def test_get_session_parses_version_followups_payload(tmp_path, monkeypatch):
     _write_minimal_config(tmp_path)
     monkeypatch.setenv("PRSCOPE_CONFIG_ROOT", str(tmp_path))

@@ -105,6 +105,9 @@ class AuthorRepairService:
             "Reject reviewer issues that materially expand scope beyond the user requirements, the current plan's non-goals, "
             "or verified repository evidence.\n"
             "For lightweight endpoint work, prefer minimal changes over broader platform features unless they are explicitly required.\n\n"
+            "For localized UI or API-wiring work that explicitly reuses existing helpers/endpoints, reject feedback that introduces "
+            "service layers, dedicated hooks/contexts, centralized state/error handling, observability/telemetry work, or broad architecture refactors unless the requirements or verified "
+            "repository evidence explicitly require those structures.\n\n"
             "Example: for a request to add or verify a lightweight `/health` endpoint, reject suggestions to add database "
             "checks, external-service checks, authentication, or concurrency-control machinery unless the requirements explicitly ask for them.\n\n"
             "Return JSON with fields:\n"
@@ -207,6 +210,7 @@ class AuthorRepairService:
         revision_budget: int = 3,
         model_override: str | None = None,
         simplest_possible_design: str | None = None,
+        revision_hints: list[str] | None = None,
     ) -> RevisionResult:
         simplification_hint = (
             "\nIf a simplification proposal is provided and sound, prefer it over incremental fixes."
@@ -226,6 +230,13 @@ class AuthorRepairService:
                     "Keep lightweight requests lightweight.\n"
                     "For a lightweight `/health` endpoint request, that means preserving a simple status response and focused tests "
                     "unless the requirements explicitly ask for broader checks.\n"
+                    "For localized UI or API-wiring requests that reuse existing helpers/endpoints, do not add dedicated handler layers, "
+                    "dedicated hooks/contexts, centralized state/error handling, observability/telemetry work, or broad component architecture changes unless the accepted issues explicitly "
+                    "require them and the repository evidence supports that added structure.\n"
+                    "Preserve exact grounded file paths, helper names, and endpoint names already present in the current plan "
+                    "unless the requirements or accepted issues explicitly replace them with another verified spelling.\n"
+                    "Do not shorten, normalize, or rename existing paths or symbols "
+                    "(for example, keep `src/prscope/web/frontend/src/lib/api.ts` and `exportSession` exactly as written).\n"
                     "Before generating updates:\n"
                     "Step 1: Restate the primary concern.\n"
                     "Step 2: Explain how revisions resolve it.\n"
@@ -245,7 +256,8 @@ class AuthorRepairService:
                     f"## Repair Plan\n{json.dumps(repair_plan.__dict__, indent=2)}\n\n"
                     f"## Current Plan JSON\n{json.dumps(current_plan.__dict__, indent=2)}\n\n"
                     f"## Design Record\n{json.dumps(design_record or {}, indent=2)}\n\n"
-                    f"## Simplest Possible Design\n{simplest_possible_design or '(none)'}"
+                    f"## Simplest Possible Design\n{simplest_possible_design or '(none)'}\n\n"
+                    f"## Revision Hints\n{json.dumps(revision_hints or [], indent=2)}"
                 ),
             },
         ]

@@ -22,14 +22,17 @@ from .authoring.discovery import (
     requirements_keywords,
 )
 from .authoring.models import (
+    AttemptContext,
     ArchitectureDesign,
     AuthorResult,
     DesignRecord,
+    EvidenceBundle,
     PlanDocument,
     RepairPlan,
     RepoCandidates,
     RepoUnderstanding,
     RevisionResult,
+    ValidationResult,
 )
 from .authoring.models import (
     apply_section_updates as _apply_section_updates,
@@ -214,6 +217,9 @@ Non-negotiable rules:
 6. If the repository evidence shows the requested route, feature, or integration point already exists, plan to modify the existing implementation instead of creating a parallel one.
 7. For endpoint or route changes, mention both the expected success response and minimal failure/error handling, but do not broaden the design into dependency checks, authentication, or platform work unless the requirements require that.
 8. For lightweight endpoint requests, keep observability, logging, and documentation notes proportional; do not turn them into explicit workstreams unless the user asked for them.
+9. For localized UI or API-wiring requests, prefer the owning page/component and existing client/helper files already shown in repository evidence. Do not pull in planning runtime, discovery, or unrelated backend modules unless the evidence directly links them to the requested behavior.
+10. When tests are requested for a localized UI change, prefer an existing adjacent page/container test over an unrelated component test. If no verified test file is clearly related, do not invent a new path; surface the missing test target as a risk or open question instead.
+11. For localized UI or API-wiring requests, do not add observability, logging, telemetry, rollout controls, or platform notes unless the requirements or verified repository evidence explicitly require them.
 
 Required markdown sections and order:
 - # <Relevant plan title>
@@ -251,6 +257,9 @@ Non-negotiable rules:
 4. Prefer specific, actionable steps over abstract guidance.
 5. Think 6-12 months ahead: call out lock-in risks, migration impacts, and maintenance cost.
 6. If the repository evidence shows the requested route, feature, or integration point already exists, revise the existing implementation instead of creating a duplicate one unless the requirements explicitly demand a new parallel path.
+7. For localized UI or API-wiring requests, keep the plan anchored to the owning page/component and existing client/helper files already shown in repository evidence. Do not introduce planning runtime modules, new service layers, or state-management machinery unless the requirements or verified evidence explicitly require them.
+8. When tests are requested for a localized UI change, prefer an existing adjacent page/container test over an unrelated component test. If no verified test file is clearly related, call that out explicitly instead of inventing a new test path.
+9. For localized UI or API-wiring requests, keep observability, logging, telemetry, rollout controls, and platform hardening proportional. Do not add them as workstreams or architecture notes unless the requirements explicitly ask for them.
 
 Required markdown sections and order:
 - # <Relevant plan title>
@@ -307,7 +316,8 @@ class AuthorAgent:
             explore_repo=self.explore_repo,
             classify_complexity=self.classify_complexity,
             draft_plan=self.draft_plan,
-            validate_draft=self.validate_draft,
+            validate_draft=self.validate_draft_result,
+            self_review_draft=self.self_review_draft,
             event_emitter=self._emit,
         )
 
@@ -417,6 +427,7 @@ class AuthorAgent:
             grounding_paths=grounding_paths,
             model_override=model_override,
             timeout_seconds_override=timeout_seconds_override,
+            requirements_text_override=requirements,
             reset_tool_history=False,
         )
 
@@ -507,6 +518,8 @@ class AuthorAgent:
         *,
         requirements: str,
         repo_understanding: RepoUnderstanding,
+        evidence_bundle: EvidenceBundle | None = None,
+        attempt_context: AttemptContext | None = None,
         architecture: ArchitectureDesign | None = None,
         draft_phase: Literal["planner", "refiner"] = "refiner",
         model_override: str | None = None,
@@ -529,6 +542,20 @@ class AuthorAgent:
         verified_paths_block = (
             "\n".join(f"- `{path}`" for path in prioritized_verified_paths[:40]) or "- (none captured)"
         )
+        evidence_payload = {
+            "relevant_files": list((evidence_bundle.relevant_files if evidence_bundle else ())[:12]),
+            "existing_components": list((evidence_bundle.existing_components if evidence_bundle else ())[:12]),
+            "test_targets": list((evidence_bundle.test_targets if evidence_bundle else ())[:8]),
+            "related_modules": list((evidence_bundle.related_modules if evidence_bundle else ())[:8]),
+            "existing_routes_or_helpers": list((evidence_bundle.existing_routes_or_helpers if evidence_bundle else ())[:10]),
+            "evidence_notes": list((evidence_bundle.evidence_notes if evidence_bundle else ())[:8]),
+        }
+        attempt_payload = {
+            "attempt_number": attempt_context.attempt_number if attempt_context else 1,
+            "previous_failures": list(attempt_context.previous_failures if attempt_context else ()),
+            "revision_hints": list(attempt_context.revision_hints if attempt_context else tuple(revision_hints or [])),
+            "elapsed_ms": attempt_context.elapsed_ms if attempt_context else 0,
+        }
         messages = [
             {"role": "system", "content": system_prompt},
             {
@@ -536,6 +563,8 @@ class AuthorAgent:
                 "content": (
                     f"## Requirements\n{requirements}\n\n"
                     f"## Verified File Paths\n{verified_paths_block}\n\n"
+                    f"## Structured Evidence\n{json.dumps(evidence_payload, indent=2)}\n\n"
+                    f"## Attempt Context\n{json.dumps(attempt_payload, indent=2)}\n\n"
                     f"## Repository Understanding\n{json.dumps(repo_understanding.__dict__, indent=2)}\n\n"
                     f"## Architecture Design\n{json.dumps(architecture.__dict__, indent=2) if architecture else '(none)'}\n\n"
                     f"## Revision Hints\n{json.dumps(revision_hints or [], indent=2)}\n\n"
@@ -543,7 +572,16 @@ class AuthorAgent:
                     "- Use only exact spellings from Verified File Paths when naming files.\n"
                     "- Do not invent new test filenames or modules.\n"
                     "- If the provided evidence already shows the requested behavior exists, plan to extend that implementation rather than adding a duplicate.\n"
-                    "- If existing evidence names the same route, endpoint, handler, or test target, do not describe the change as introducing a brand-new feature.\n\n"
+                    "- If existing evidence names the same route, endpoint, handler, or test target, do not describe the change as introducing a brand-new feature.\n"
+                    "- Treat Structured Evidence as the authoritative summary of relevant files, helpers, and tests for this draft attempt.\n"
+                    "- Reuse the same Structured Evidence across retries instead of inventing new repository facts.\n"
+                    "- When Structured Evidence lists existing routes or helpers, reference those exact reuse points explicitly instead of describing generic API access.\n"
+                    "- When Structured Evidence lists existing helper names for export, download, snapshot, or diagnostics flows, mention those exact helper names in the plan instead of saying only 'existing helpers'.\n"
+                    "- When Structured Evidence lists existing test_targets for a localized UI/API change, name at least one of those exact test files in the plan unless the requirements explicitly exclude tests.\n"
+                    "- For localized UI/API work, do not add observability, logging, telemetry, rollout controls, or platform notes unless the requirements explicitly ask for them.\n"
+                    "- If the requirements only say to keep an existing component behavior intact during rollout, treat that component as a compatibility constraint or test target unless verified evidence shows it must be edited.\n"
+                    "- For localized UI/API work, keep file references focused on the owning component/page and existing client helpers already present in Verified File Paths.\n"
+                    "- Do not reference planning runtime or discovery modules for frontend wiring work unless those modules are explicitly part of the verified evidence for the requested behavior.\n\n"
                     + (
                         "Produce a concise grounded planner draft that satisfies the planner-phase constraints. "
                         "When you reference files, use the exact spellings from Verified File Paths."
@@ -571,14 +609,109 @@ class AuthorAgent:
         draft_phase: Literal["planner", "refiner"] = "refiner",
         min_grounding_ratio: float | None = None,
         verified_paths_extra: set[str] | None = None,
+        requirements_text: str | None = None,
     ) -> list[str]:
-        return self._validation_service.validate_draft(
+        return list(
+            self.validate_draft_result(
+                plan_content=plan_content,
+                repo_understanding=repo_understanding,
+                draft_phase=draft_phase,
+                min_grounding_ratio=min_grounding_ratio,
+                verified_paths_extra=verified_paths_extra,
+                requirements_text=requirements_text,
+            ).failure_messages
+        )
+
+    def validate_draft_result(
+        self,
+        *,
+        plan_content: str,
+        repo_understanding: RepoUnderstanding,
+        draft_phase: Literal["planner", "refiner"] = "refiner",
+        min_grounding_ratio: float | None = None,
+        verified_paths_extra: set[str] | None = None,
+        requirements_text: str | None = None,
+    ) -> ValidationResult:
+        return self._validation_service.validate_draft_result(
             plan_content=plan_content,
             repo_understanding=repo_understanding,
             draft_phase=draft_phase,
             min_grounding_ratio=min_grounding_ratio,
             verified_paths_extra=verified_paths_extra,
+            requirements_text=requirements_text,
         )
+
+    @staticmethod
+    def _parse_revision_hints(raw: str) -> list[str]:
+        text = str(raw or "").strip()
+        if not text:
+            return []
+        try:
+            json_block, _ = extract_first_json_object(text)
+            payload = json.loads(json_block)
+            if isinstance(payload, dict):
+                items = payload.get("revision_hints", [])
+            elif isinstance(payload, list):
+                items = payload
+            else:
+                items = []
+            hints = [str(item).strip() for item in items if str(item).strip()]
+            if hints:
+                return hints[:4]
+        except Exception:  # noqa: BLE001
+            pass
+        parsed = [
+            line.lstrip("-*0123456789. ").strip()
+            for line in text.splitlines()
+            if line.strip().startswith(("-", "*")) or re.match(r"^\s*\d+\.\s+", line)
+        ]
+        return [hint for hint in parsed if hint][:4]
+
+    async def self_review_draft(
+        self,
+        *,
+        requirements: str,
+        plan_content: str,
+        evidence_bundle: EvidenceBundle,
+        validation_result: ValidationResult,
+        attempt_context: AttemptContext,
+        model_override: str | None = None,
+        timeout_seconds_override: int | Callable[[], int] | None = None,
+    ) -> list[str]:
+        if validation_result.ok:
+            return []
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "You are reviewing a draft implementation plan.\n"
+                    "Return JSON with one key: revision_hints.\n"
+                    "revision_hints must be a list of at most 4 concise strings.\n"
+                    "Focus only on these defect classes: grounding errors, missing sections, missing test targets, "
+                    "failure to reuse verified implementation, and overspecified architecture for localized changes.\n"
+                    "Do not rewrite the plan. Do not introduce new architecture. Do not invent new repository facts."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"## Requirements\n{requirements}\n\n"
+                    f"## Draft Plan\n{plan_content}\n\n"
+                    f"## Validation Failures\n{json.dumps(list(validation_result.failure_messages), indent=2)}\n\n"
+                    f"## Structured Evidence\n{json.dumps(evidence_bundle.__dict__, indent=2)}\n\n"
+                    f"## Attempt Context\n{json.dumps(attempt_context.__dict__, indent=2)}"
+                ),
+            },
+        ]
+        raw = await self.stage_runner.run_stage(
+            "self_review_draft",
+            messages,
+            allow_tools=False,
+            max_output_tokens=400,
+            model_override=model_override,
+            timeout_seconds_override=timeout_seconds_override,
+        )
+        return self._parse_revision_hints(raw)
 
     def _explorer_gate_failures(self, requirements_text: str) -> list[str]:
         return self._validation_service.explorer_gate_failures(requirements_text)
@@ -682,6 +815,7 @@ class AuthorAgent:
         revision_budget: int = 3,
         model_override: str | None = None,
         simplest_possible_design: str | None = None,
+        revision_hints: list[str] | None = None,
     ) -> RevisionResult:
         return await AuthorRepairService(self._llm_call).revise_plan(
             repair_plan=repair_plan,
@@ -691,6 +825,20 @@ class AuthorAgent:
             revision_budget=revision_budget,
             model_override=model_override,
             simplest_possible_design=simplest_possible_design,
+            revision_hints=revision_hints,
+        )
+
+    def incremental_grounding_failures(
+        self,
+        *,
+        previous_plan_content: str,
+        updated_plan_content: str,
+        verified_paths: set[str],
+    ) -> list[str]:
+        return self._validation_service.incremental_grounding_failures(
+            previous_plan_content=previous_plan_content,
+            updated_plan_content=updated_plan_content,
+            verified_paths=verified_paths,
         )
 
     async def _run_planner_pipeline(
@@ -727,6 +875,7 @@ class AuthorAgent:
         max_output_tokens: int | None = None,
         model_override: str | None = None,
         timeout_seconds_override: int | Callable[[], int] | None = None,
+        requirements_text_override: str | None = None,
         reset_tool_history: bool = True,
     ) -> AuthorResult:
         if reset_tool_history:
@@ -739,7 +888,7 @@ class AuthorAgent:
             "rejected_for_budget": 0,
         }
         rejection_reasons: list[dict[str, str]] = []
-        requirements_text = "\n".join(
+        requirements_text = str(requirements_text_override or "").strip() or "\n".join(
             str(message.get("content", "")) for message in messages if str(message.get("role", "")) == "user"
         )
 

@@ -43,6 +43,8 @@ def test_reviewer_prompt_preserves_scope_for_simple_health_endpoints() -> None:
     assert "A public `/health` endpoint is acceptable by default" in REVIEWER_SYSTEM_PROMPT
     assert 'Add a lightweight /health endpoint and tests for it' in REVIEWER_SYSTEM_PROMPT
     assert "logging, monitoring, telemetry, or documentation work" in REVIEWER_SYSTEM_PROMPT
+    assert "limit tests to the happy-path 200 response" in REVIEWER_SYSTEM_PROMPT
+    assert "reuse existing helpers/endpoints and avoid new endpoints" in REVIEWER_SYSTEM_PROMPT
 
 
 def _review_json(
@@ -183,31 +185,46 @@ async def test_run_critic_filters_scope_creep_for_lightweight_health_requests(tm
         payload["blocking_issues"] = [
             "Lack of error handling for the /health endpoint.",
             "Lack of dependency checks for the /health endpoint.",
+            "Partial failures could mislead users about overall system health.",
+            "Lack of detailed health checks could mislead users about application status.",
         ]
         payload["recommended_changes"] = [
             "Implement graceful error handling for unexpected failures.",
             "Add database and external-service dependency checks.",
             "Add authentication to the /health endpoint.",
             "Add logging and monitoring for every health request.",
+            "Handle timeouts and partial failures from other services.",
+            "Add more detailed health check logic so users are not misled about application status.",
         ]
         payload["architectural_concerns"] = [
             "Endpoint may raise an unhandled exception.",
             "Missing authentication for the /health endpoint.",
+            "Static response may not reflect actual service health.",
+            "Current health check logic is too limited for accurate health reporting.",
         ]
         payload["risks"] = [
             "Unhandled exceptions may return 500 responses.",
             "Missing dependency checks may misreport service health.",
+            "Timeouts in critical services could lead to inaccurate health status.",
+            "Users could be misled about application status without detailed health checks.",
         ]
         payload["issue_priority"] = [
             "Lack of dependency checks for the /health endpoint.",
+            "Static response may not reflect actual service health.",
+            "Lack of detailed health checks could mislead users about application status.",
             "Lack of error handling for the /health endpoint.",
         ]
-        payload["primary_issue"] = "Lack of dependency checks for the /health endpoint."
+        payload["primary_issue"] = "Lack of detailed health checks could mislead users about application status."
         return json.dumps(payload), SimpleNamespace(usage=None), "gpt-4o-mini"
 
     agent._llm_call = fake_llm_call  # type: ignore[method-assign]
     result = await agent.run_critic(
-        requirements="Add a lightweight /health endpoint and tests for it.",
+        requirements=(
+            "Add a lightweight /health endpoint and tests for it.\n\n"
+            "Latest user guidance:\n"
+            "- keep the response simple\n"
+            "- limit tests to the happy-path 200 response\n"
+        ),
         plan_content="Add `/health` to `src/prscope/web/api.py` and tests in `tests/test_web_api_models.py`.",
         manifesto="M",
         architecture="A",
@@ -220,6 +237,80 @@ async def test_run_critic_filters_scope_creep_for_lightweight_health_requests(tm
     assert result.recommended_changes == ["Implement graceful error handling for unexpected failures."]
     assert result.architectural_concerns == ["Endpoint may raise an unhandled exception."]
     assert result.risks == ["Unhandled exceptions may return 500 responses."]
+    assert result.issue_priority == ["Lack of error handling for the /health endpoint."]
+
+
+@pytest.mark.asyncio
+async def test_run_critic_filters_overengineering_for_localized_reuse_requests(tmp_path):
+    agent = _make_agent(tmp_path)
+
+    def fake_llm_call(messages, temperature, model_override=None):
+        del messages, temperature, model_override
+        payload = json.loads(_review_json())
+        payload["blocking_issues"] = [
+            "ActionBar export button lacks a loading/error state.",
+            "Coupling between ActionBar and existing export functionality may lead to tight integration.",
+            "Absence of versioning for the frontend components may hinder rollback capabilities.",
+            "Coupling between ActionBar and export functionality may increase complexity.",
+            "Coupling between ActionBar and PlanningView may hinder reusability and flexibility.",
+        ]
+        payload["recommended_changes"] = [
+            "Add button state feedback for export progress and failures.",
+            "Implement a service layer that abstracts the export functionality to reduce coupling.",
+            "Refactor common export logic into a shared utility module to ensure DRY principles.",
+            "Utilize a state management solution to manage export state and actions for clearer data flow.",
+            "Implement centralized state management for export actions.",
+            "Design the export functionality to be extensible for future formats.",
+            "Add logging and telemetry for export actions to improve observability.",
+            "Implement a dedicated export handler to abstract API calls and reduce complexity in PlanningView.",
+            "Decouple export logic from the ActionBar by creating a dedicated export service.",
+            "Use feature flags to roll out changes incrementally, allowing for easier rollback if issues arise.",
+            "Decouple the data fetching logic by introducing a dedicated diagnostics context or hook.",
+            "Implement a centralized state management solution to manage diagnostics data.",
+        ]
+        payload["architectural_concerns"] = [
+            "ActionBar may not communicate export failures clearly.",
+            "Current design creates tight integration between ActionBar and export logic.",
+        ]
+        payload["risks"] = [
+            "Users may click export repeatedly without feedback.",
+            "Tight integration could make future page-action changes harder.",
+            "Missing UAT could leave UI regressions unnoticed.",
+        ]
+        payload["issue_priority"] = [
+            "Coupling between ActionBar and existing export functionality may lead to tight integration.",
+            "ActionBar export button lacks a loading/error state.",
+        ]
+        payload["primary_issue"] = (
+            "Coupling between ActionBar and existing export functionality may lead to tight integration."
+        )
+        return json.dumps(payload), SimpleNamespace(usage=None), "gpt-4o-mini"
+
+    agent._llm_call = fake_llm_call  # type: ignore[method-assign]
+    result = await agent.run_critic(
+        requirements=(
+            "Move export controls into the top ActionBar so users can download PRD and conversation markdown "
+            "from anywhere on the planning page. Reuse the existing backend export/download endpoints and "
+            "frontend export helpers instead of creating new endpoints. Keep the current PlanPanel export "
+            "behavior working during rollout."
+        ),
+        plan_content=(
+            "Reuse `exportSession()` and `downloadFile()` from `src/prscope/web/frontend/src/lib/api.ts` "
+            "from `src/prscope/web/frontend/src/pages/PlanningView.tsx` and wire the control into "
+            "`src/prscope/web/frontend/src/components/ActionBar.tsx`."
+        ),
+        manifesto="M",
+        architecture="A",
+        constraints=[_HC001],
+        max_retries=0,
+    )
+
+    assert result.primary_issue == "ActionBar export button lacks a loading/error state."
+    assert result.blocking_issues == ["ActionBar export button lacks a loading/error state."]
+    assert result.recommended_changes == ["Add button state feedback for export progress and failures."]
+    assert result.architectural_concerns == ["ActionBar may not communicate export failures clearly."]
+    assert result.risks == ["Users may click export repeatedly without feedback."]
+    assert result.issue_priority == ["ActionBar export button lacks a loading/error state."]
 
 
 @pytest.mark.asyncio

@@ -169,7 +169,9 @@ class RuntimeSessionStarts:
         )
         core.add_turn("author", self._runtime._author_chat_summary(author_result.plan, 0), round_number=0)
         plan_document = self._runtime._plan_document_from_version(author_result.plan, None)
-        version = core.save_plan_version(author_result.plan, round_number=0, plan_document=plan_document)
+        # Preserve the exact validated planner markdown for round 0; parsing to PlanDocument is
+        # still used for artifact extraction, but should not rewrite the saved initial draft.
+        version = core.save_plan_version(author_result.plan, round_number=0)
         self._runtime._attach_plan_version_artifacts(
             version_id=version.id,
             plan_document=plan_document,

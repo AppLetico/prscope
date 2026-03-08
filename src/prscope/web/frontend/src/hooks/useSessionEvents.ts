@@ -161,6 +161,20 @@ function normalizeEvent(rawType: string, rawPayload: Record<string, unknown>): U
         rawPayload.complexity !== undefined ? String(rawPayload.complexity) : undefined,
     };
   }
+  if (rawType === "phase_timing") {
+    const rawState = rawPayload.state;
+    return {
+      type: "phase_timing",
+      session_stage:
+        rawPayload.session_stage !== undefined ? String(rawPayload.session_stage) : undefined,
+      state:
+        rawState === "start" || rawState === "complete" || rawState === "failed"
+          ? rawState
+          : undefined,
+      elapsed_ms:
+        rawPayload.elapsed_ms !== undefined ? Number(rawPayload.elapsed_ms) : undefined,
+    };
+  }
   if (rawType === "discovery_ready") {
     return { type: "discovery_ready", opening: String(rawPayload.opening ?? "") };
   }
@@ -220,6 +234,7 @@ export function useSessionEvents(
     bind("token_usage");
     bind("clarification_needed");
     bind("setup_progress");
+    bind("phase_timing");
     bind("discovery_ready");
 
     eventSource.onmessage = (event) => {

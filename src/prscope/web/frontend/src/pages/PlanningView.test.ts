@@ -1,6 +1,14 @@
 import { describe, expect, it } from "vitest";
-import { buildTimeline, upsertToolCall, timelineReducer, INITIAL_TIMELINE_STATE } from "../components/chatPanelUtils";
-import type { PlanningTurn, ToolCallEntry, ToolCallGroup } from "../types";
+import {
+  buildTimeline,
+  formatPhaseTimingLabel,
+  formatToolActivityLabel,
+  upsertLiveActivity,
+  upsertToolCall,
+  timelineReducer,
+  INITIAL_TIMELINE_STATE,
+} from "../components/chatPanelUtils";
+import type { LiveActivityEntry, PlanningTurn, ToolCallEntry, ToolCallGroup } from "../types";
 
 function makeTurn(overrides: Partial<PlanningTurn> & { sequence: number }): PlanningTurn {
   return {
@@ -84,7 +92,7 @@ describe("timelineReducer", () => {
     const turns = [makeTurn({ sequence: 2 })];
     const result = timelineReducer(withGroups, { type: "sync_turns", turns });
     expect(result.timeline.map((t) => t.kind)).toEqual(["tool_group", "turn"]);
-    expect(result.turns).toBe(turns);
+    expect(result.turns).toStrictEqual(turns);
   });
 
   it("session_state rebuilds timeline from stored turns", () => {
@@ -93,7 +101,7 @@ describe("timelineReducer", () => {
     const groups = [makeGroup(2)];
     const active: ToolCallEntry[] = [{ id: "x", call_id: "x1", name: "grep", status: "running" }];
     const result = timelineReducer(withTurns, { type: "session_state", groups, activeTools: active });
-    expect(result.timeline.map((t) => t.kind)).toEqual(["turn", "tool_group"]);
+    expect(result.timeline.map((t) => t.kind)).toEqual(["tool_group", "turn"]);
     expect(result.activeTools).toBe(active);
   });
 
@@ -118,6 +126,58 @@ describe("timelineReducer", () => {
     const turns = [makeTurn({ sequence: 1 })];
     const s1 = timelineReducer(INITIAL_TIMELINE_STATE, { type: "sync_turns", turns });
     const s2 = timelineReducer(s1, { type: "sync_turns", turns });
-    expect(s2).toBe(s1);
+    expect(s2).toStrictEqual(s1);
+  });
+});
+
+describe("live activity helpers", () => {
+  it("formats phase timing labels with elapsed seconds", () => {
+    expect(formatPhaseTimingLabel("initial_draft", "start")).toBe("Initial draft started");
+    expect(formatPhaseTimingLabel("discovery", "complete", 3400)).toBe("Discovery completed in 3.4s");
+    expect(formatPhaseTimingLabel("planner_redraft", "failed", 12000)).toBe("Planner redraft failed after 12s");
+  });
+
+  it("formats tool activity labels for running and completed tools", () => {
+    expect(formatToolActivityLabel({ id: "1", name: "draft_plan", status: "running" })).toBe("Draft plan running");
+    expect(
+      formatToolActivityLabel({ id: "2", name: "read_file", status: "done", durationMs: 41 }),
+    ).toBe("Read file completed in 41ms");
+  });
+
+  it("upserts activity by id and collapses repeated notes", () => {
+    const running: LiveActivityEntry = {
+      id: "tool:1",
+      kind: "tool",
+      message: "Draft plan running",
+      stage: "planner",
+      status: "running",
+      created_at: "2026-01-01T00:00:00.000Z",
+    };
+    const done: LiveActivityEntry = {
+      ...running,
+      message: "Draft plan completed in 900ms",
+      status: "done",
+    };
+    const first = upsertLiveActivity([], running);
+    const second = upsertLiveActivity(first, done);
+    expect(second).toHaveLength(1);
+    expect(second[0]?.status).toBe("done");
+
+    const repeated = upsertLiveActivity(second, {
+      id: "thought:scanning",
+      kind: "thought",
+      message: "Scanning context",
+      status: "running",
+      created_at: "2026-01-01T00:00:01.000Z",
+    });
+    const collapsed = upsertLiveActivity(repeated, {
+      id: "thought:scanning:2",
+      kind: "thought",
+      message: "Scanning context",
+      status: "running",
+      created_at: "2026-01-01T00:00:02.000Z",
+    });
+    expect(collapsed).toHaveLength(2);
+    expect(collapsed[1]?.count).toBe(2);
   });
 });

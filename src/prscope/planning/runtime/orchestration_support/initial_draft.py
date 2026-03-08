@@ -292,7 +292,9 @@ class RuntimeInitialDraftFlow:
             )
             core.add_turn("author", self._runtime._author_chat_summary(plan_content, 0), round_number=0)
             plan_document = self._runtime._plan_document_from_version(plan_content, None)
-            version = core.save_plan_version(plan_content, round_number=0, plan_document=plan_document)
+            # Preserve the exact validated planner markdown for round 0; parsing to PlanDocument is
+            # still used for artifact extraction, but should not rewrite the saved initial draft.
+            version = core.save_plan_version(plan_content, round_number=0)
             self._runtime._attach_plan_version_artifacts(
                 version_id=version.id,
                 plan_document=plan_document,
@@ -310,6 +312,16 @@ class RuntimeInitialDraftFlow:
                 planner_elapsed,
                 time.perf_counter() - draft_started,
             )
+            if author_result.draft_diagnostics:
+                await self._runtime._emit_event(
+                    event_callback,
+                    {
+                        "type": "draft_diagnostics",
+                        "session_stage": "initial_draft",
+                        **author_result.draft_diagnostics,
+                    },
+                    session_id,
+                )
             await self._runtime._emit_event(
                 event_callback,
                 {

@@ -1,4 +1,4 @@
-import type { PlanningTurn, ToolCallEntry, ToolCallGroup } from "../types";
+import type { LiveActivityEntry, PlanningTurn, ToolCallEntry, ToolCallGroup } from "../types";
 
 export type TimelineItem =
   | { kind: "turn"; turn: PlanningTurn; key: string }
@@ -113,6 +113,90 @@ export function upsertToolCall(tools: ToolCallEntry[], tool: ToolCallEntry): Too
     }
   }
   return [...tools, tool];
+}
+
+function humanizeIdentifier(value: string): string {
+  const normalized = value.replace(/[_-]+/g, " ").trim();
+  if (!normalized) return "Activity";
+  return normalized.charAt(0).toUpperCase() + normalized.slice(1);
+}
+
+export function formatPhaseTimingLabel(
+  sessionStage?: string,
+  state?: "start" | "complete" | "failed",
+  elapsedMs?: number,
+): string {
+  const stageLabel = humanizeIdentifier(sessionStage ?? "activity");
+  if (state === "start") return `${stageLabel} started`;
+  if (state === "complete") {
+    if (typeof elapsedMs === "number" && Number.isFinite(elapsedMs) && elapsedMs > 0) {
+      return `${stageLabel} completed in ${(elapsedMs / 1000).toFixed(elapsedMs >= 10_000 ? 0 : 1)}s`;
+    }
+    return `${stageLabel} completed`;
+  }
+  if (state === "failed") {
+    if (typeof elapsedMs === "number" && Number.isFinite(elapsedMs) && elapsedMs > 0) {
+      return `${stageLabel} failed after ${(elapsedMs / 1000).toFixed(elapsedMs >= 10_000 ? 0 : 1)}s`;
+    }
+    return `${stageLabel} failed`;
+  }
+  return stageLabel;
+}
+
+export function formatToolActivityLabel(tool: ToolCallEntry): string {
+  const toolLabel = humanizeIdentifier(tool.name || "tool");
+  if (tool.status === "done") {
+    if (typeof tool.durationMs === "number" && Number.isFinite(tool.durationMs) && tool.durationMs > 0) {
+      return `${toolLabel} completed in ${Math.round(tool.durationMs)}ms`;
+    }
+    return `${toolLabel} completed`;
+  }
+  return `${toolLabel} running`;
+}
+
+export function upsertLiveActivity(
+  activities: LiveActivityEntry[],
+  activity: LiveActivityEntry,
+  maxItems = 8,
+): LiveActivityEntry[] {
+  const nextMessage = activity.message.trim();
+  if (!nextMessage) return activities;
+
+  const normalizedActivity: LiveActivityEntry = {
+    ...activity,
+    message: nextMessage,
+    count: activity.count ?? 1,
+  };
+
+  const existingIdx = activities.findIndex((item) => item.id === normalizedActivity.id);
+  if (existingIdx !== -1) {
+    const next = [...activities];
+    next[existingIdx] = {
+      ...next[existingIdx],
+      ...normalizedActivity,
+      count: normalizedActivity.count ?? next[existingIdx]!.count ?? 1,
+    };
+    return next.slice(-maxItems);
+  }
+
+  const latest = activities[activities.length - 1];
+  if (
+    latest
+    && latest.kind === normalizedActivity.kind
+    && latest.message === normalizedActivity.message
+    && latest.stage === normalizedActivity.stage
+    && latest.status === normalizedActivity.status
+  ) {
+    const next = [...activities];
+    next[next.length - 1] = {
+      ...latest,
+      created_at: normalizedActivity.created_at,
+      count: (latest.count ?? 1) + 1,
+    };
+    return next.slice(-maxItems);
+  }
+
+  return [...activities, normalizedActivity].slice(-maxItems);
 }
 
 export function hasRunningToolCalls(toolCalls: ToolCallEntry[]): boolean {

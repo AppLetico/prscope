@@ -20,6 +20,7 @@ from ..reasoning import (
     ReviewReasoner,
 )
 from ..review import ManifestoCheckResult
+from ..tools import extract_file_references
 from .round_context import PlanningRoundContext
 
 
@@ -365,15 +366,33 @@ class PlanningStages:
         open_issues = ctx.issue_tracker.open_issues()
         revision_budget = 1 if review_result.primary_issue else min(3, max(1, len(open_issues)))
         revise_started = time.perf_counter()
-        revision_result = await self._author.revise_plan(
-            repair_plan=repair_plan,
-            current_plan=current_plan_doc,
-            requirements=ctx.requirements,
-            design_record=self._design_record_payload(ctx.state.design_record),
-            revision_budget=revision_budget,
-            model_override=ctx.selected_author_model,
-            simplest_possible_design=review_result.simplest_possible_design,
-        )
+        revision_hints: list[str] | None = None
+        previous_plan = ctx.core.get_current_plan()
+        previous_plan_content = getattr(previous_plan, "plan_content", "") if previous_plan is not None else ""
+        verified_paths = set(ctx.state.accessed_paths) | set(extract_file_references(previous_plan_content))
+        for attempt in range(2):
+            revision_result = await self._author.revise_plan(
+                repair_plan=repair_plan,
+                current_plan=current_plan_doc,
+                requirements=ctx.requirements,
+                design_record=self._design_record_payload(ctx.state.design_record),
+                revision_budget=revision_budget,
+                model_override=ctx.selected_author_model,
+                simplest_possible_design=review_result.simplest_possible_design,
+                revision_hints=revision_hints,
+            )
+            updated_plan = apply_section_updates(current_plan_doc, revision_result.updates)
+            preliminary_markdown = render_markdown(updated_plan)
+            grounding_failures = self._author.incremental_grounding_failures(
+                previous_plan_content=previous_plan_content,
+                updated_plan_content=preliminary_markdown,
+                verified_paths=verified_paths,
+            )
+            if not grounding_failures:
+                break
+            if attempt == 1:
+                raise ValueError("; ".join(grounding_failures))
+            revision_hints = grounding_failures
         previous_version = ctx.core.get_current_plan()
         updated_plan = apply_section_updates(current_plan_doc, revision_result.updates)
         preliminary_markdown = render_markdown(updated_plan)

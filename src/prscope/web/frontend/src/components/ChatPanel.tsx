@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import type { ClarificationPrompt, DiscoveryQuestion, PlanFollowups, PlanningTurn, ToolCallEntry } from "../types";
+import type { ClarificationPrompt, DiscoveryQuestion, LiveActivityEntry, PlanFollowups, PlanningTurn, ToolCallEntry } from "../types";
 import { OptionButtons } from "./OptionButtons";
 import { ToolCallStream } from "./ToolCallStream";
 import { ModelSelector } from "./ModelSelector";
@@ -54,6 +54,7 @@ interface ChatPanelProps {
   timeline: TimelineItem[];
   questions: DiscoveryQuestion[];
   activeToolCalls: ToolCallEntry[];
+  liveActivities: LiveActivityEntry[];
   thinkingMessage: string | null;
   phaseMessage?: string | null;
   warnings: string[];
@@ -93,6 +94,7 @@ export function ChatPanel({
   timeline,
   questions,
   activeToolCalls,
+  liveActivities,
   thinkingMessage,
   phaseMessage = null,
   warnings,
@@ -151,12 +153,13 @@ export function ChatPanel({
     if (autoScroll && scrollRef.current) {
       scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
     }
-  }, [timeline, activeToolCalls, thinkingMessage, questions, autoScroll]);
+  }, [timeline, activeToolCalls, liveActivities, thinkingMessage, questions, autoScroll]);
 
   useEffect(() => {
     const signature = [
       timeline.length,
       activeToolCalls.length,
+      liveActivities.length,
       warnings.length,
       Boolean(thinkingMessage),
       questions.length,
@@ -167,6 +170,7 @@ export function ChatPanel({
     autoScroll,
     timeline.length,
     activeToolCalls.length,
+    liveActivities.length,
     warnings.length,
     thinkingMessage,
     questions.length,
@@ -517,6 +521,10 @@ export function ChatPanel({
     if (isProcessing) return "Working...";
     return null;
   }, [questions.length, pendingClarification, phaseMessage, animatedThinkingMessage, activeToolCalls, isProcessing, hasVisibleActiveToolStream]);
+  const visibleLiveActivities = useMemo(
+    () => liveActivities.slice(-6).reverse(),
+    [liveActivities],
+  );
 
   return (
     <div className="h-full flex flex-col bg-zinc-950 relative">
@@ -692,6 +700,56 @@ export function ChatPanel({
                       <ReactMarkdown remarkPlugins={[remarkGfm]} components={chatMarkdownComponents}>{optimisticUserMessage}</ReactMarkdown>
                     </div>
                   </div>
+                </div>
+              </div>
+            </div>
+          )}
+          {visibleLiveActivities.length > 0 && (
+            <div className="flex justify-start w-full animate-in slide-in-from-bottom-2 fade-in duration-200 ease-out">
+              <div className="ml-12 w-full max-w-2xl rounded-xl border border-zinc-800/80 bg-zinc-900/40 px-4 py-3 shadow-sm">
+                <div className="mb-3 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-zinc-400">
+                  <Sparkles className="h-3.5 w-3.5 text-indigo-300" />
+                  Live Activity
+                </div>
+                <div className="space-y-2">
+                  {visibleLiveActivities.map((activity) => {
+                    const isDone = activity.status === "done" || activity.status === "complete";
+                    const isFailed = activity.status === "failed";
+                    const isThought = activity.kind === "thought";
+                    const isTool = activity.kind === "tool";
+                    return (
+                      <div key={activity.id} className="flex items-start gap-3 text-sm text-zinc-200">
+                        <div className="mt-0.5 shrink-0">
+                          {isFailed ? (
+                            <X className="h-3.5 w-3.5 text-rose-400" />
+                          ) : isDone ? (
+                            <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
+                          ) : isThought ? (
+                            <MessageSquare className="h-3.5 w-3.5 text-violet-300" />
+                          ) : isTool ? (
+                            <Microscope className="h-3.5 w-3.5 text-sky-300" />
+                          ) : (
+                            <ArrowRight className="h-3.5 w-3.5 text-amber-300" />
+                          )}
+                        </div>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <span className="leading-5 text-zinc-100">{activity.message}</span>
+                            {activity.count && activity.count > 1 && (
+                              <span className="rounded-full border border-zinc-700 bg-zinc-800 px-1.5 py-0.5 text-[10px] text-zinc-400">
+                                x{activity.count}
+                              </span>
+                            )}
+                            {activity.stage && (
+                              <span className="rounded-full border border-zinc-700/80 bg-zinc-800/70 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-zinc-400">
+                                {activity.stage.replace(/[_-]+/g, " ")}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
             </div>

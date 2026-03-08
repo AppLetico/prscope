@@ -15,6 +15,45 @@ class AuthorResult:
     rejection_reasons: list[dict[str, str]] = field(default_factory=list)
     average_read_depth: float | None = None
     average_time_between_tool_calls: float | None = None
+    draft_diagnostics: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class ValidationResult:
+    failure_messages: tuple[str, ...]
+    reason_codes: tuple[str, ...]
+    retryable: bool
+    failure_count: int
+
+    @property
+    def ok(self) -> bool:
+        return self.failure_count == 0
+
+    @property
+    def normalized_signature(self) -> frozenset[str]:
+        return frozenset(self.reason_codes)
+
+    @classmethod
+    def success(cls) -> "ValidationResult":
+        return cls(failure_messages=(), reason_codes=(), retryable=False, failure_count=0)
+
+
+@dataclass(frozen=True)
+class EvidenceBundle:
+    relevant_files: tuple[str, ...] = ()
+    existing_components: tuple[str, ...] = ()
+    test_targets: tuple[str, ...] = ()
+    related_modules: tuple[str, ...] = ()
+    existing_routes_or_helpers: tuple[str, ...] = ()
+    evidence_notes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class AttemptContext:
+    attempt_number: int
+    previous_failures: tuple[str, ...] = ()
+    revision_hints: tuple[str, ...] = ()
+    elapsed_ms: int = 0
 
 
 @dataclass

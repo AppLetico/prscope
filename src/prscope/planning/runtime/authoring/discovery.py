@@ -81,6 +81,22 @@ def requirements_keywords(text: str) -> set[str]:
     return {token for token in tokens if len(token) >= 3 and token not in REQUIREMENT_STOPWORDS}
 
 
+def is_localized_frontend_request(text: str) -> bool:
+    lowered = str(text or "").lower()
+    frontend_markers = (
+        "frontend",
+        "react",
+        "ui",
+        "component",
+        "button",
+        "actionbar",
+        "planpanel",
+        "planningview",
+        "planning page",
+    )
+    return any(marker in lowered for marker in frontend_markers)
+
+
 def path_tokens(path: str) -> set[str]:
     return {token for token in re.split(r"[^a-z0-9]+", path.lower()) if token}
 
@@ -242,6 +258,9 @@ class AuthorDiscoveryService:
     ) -> RepoUnderstanding:
         seeded_paths = extract_paths_from_mental_model(mental_model or "")
         req_keywords = requirements_keywords(requirements)
+        localized_frontend = is_localized_frontend_request(requirements)
+        if localized_frontend and max_file_reads < 6:
+            max_file_reads = 6
         search_roots: list[str | None] = []
         top_level_roots = []
         for path in [*candidates.source_modules, *candidates.tests_and_config]:
@@ -274,8 +293,14 @@ class AuthorDiscoveryService:
                         grep_hits_by_path[path].append((line_number, str(match.get("text", ""))))
         score_by_path: dict[str, int] = {}
         scored_paths: list[tuple[int, str]] = []
+
+        def _skip_for_localized_frontend(path: str) -> bool:
+            lower_path = path.lower()
+            return localized_frontend and ("/planning/runtime/" in lower_path or "/authoring/" in lower_path)
+
         for path in candidates.all_paths:
             tokens = path_tokens(path)
+            lower_path = path.lower()
             overlap = len(tokens & req_keywords)
             score = overlap
             if path in candidates.entrypoints:
@@ -288,11 +313,58 @@ class AuthorDiscoveryService:
                 score += 5 + min(3, len(grep_hits_by_path[path]))
             if ("test" in req_keywords or "tests" in req_keywords) and path in candidates.tests_and_config:
                 score += 2
+            if localized_frontend:
+                if "/web/frontend/" in lower_path:
+                    score += 4
+                elif not lower_path.endswith("/web/api.py"):
+                    score -= 3
+                if any(marker in lower_path for marker in ("actionbar", "planningview", "planpanel")):
+                    score += 3
+                if lower_path.endswith("/lib/api.ts"):
+                    score += 3
+                if "actionbar" in req_keywords and "actionbar" in tokens:
+                    score += 6
+                if "planningview" in req_keywords and "planningview" in lower_path:
+                    score += 8
+                if "planpanel" in req_keywords and "planpanel" in lower_path:
+                    score += 6
+                if "planning" in req_keywords and "page" in req_keywords and "planningview" in lower_path:
+                    score += 6
+                if any(token in req_keywords for token in ("diagnostics", "snapshot", "health")) and any(
+                    marker in lower_path for marker in ("planningview", "planpanel")
+                ):
+                    score += 6
+                if "export" in req_keywords and lower_path.endswith("/lib/api.ts"):
+                    score += 5
+                if "endpoint" in req_keywords and lower_path.endswith("/web/api.py"):
+                    score += 4
+                if path in candidates.tests_and_config and "planningview" in lower_path:
+                    score += 4
+                if path in candidates.tests_and_config and "decisiongraphrender" in lower_path and not (
+                    {"decision", "graph"} & req_keywords
+                ):
+                    score -= 6
+                if "sessionlist" in lower_path and "sessionlist" not in req_keywords:
+                    score -= 8
+                if lower_path.endswith("/lib/markdown.ts") and not (
+                    {"render", "renderer", "preview", "format"} & req_keywords
+                ):
+                    score -= 6
+                if "chatpanel" in lower_path and "chat" not in req_keywords:
+                    score -= 8
+                if "/planning/runtime/" in lower_path or "/authoring/" in lower_path:
+                    score -= 15
             score_by_path[path] = score
             scored_paths.append((score, path))
         scored_paths.sort(key=lambda item: (-item[0], item[1]))
         wants_tests = "test" in req_keywords or "tests" in req_keywords
-        source_candidates = [path for _, path in scored_paths if path in candidates.source_modules]
+        source_candidates = [
+            path
+            for _, path in scored_paths
+            if path in candidates.source_modules
+            and not _skip_for_localized_frontend(path)
+            and (not localized_frontend or score_by_path.get(path, 0) > 0)
+        ]
         test_candidates = [path for _, path in scored_paths if path in candidates.tests_and_config]
         selected: list[str] = []
         if source_candidates:
@@ -317,6 +389,10 @@ class AuthorDiscoveryService:
                 if len(selected) >= max(1, max_file_reads):
                     break
         for _, path in scored_paths:
+            if _skip_for_localized_frontend(path):
+                continue
+            if localized_frontend and score_by_path.get(path, 0) <= 0:
+                continue
             if path not in selected:
                 selected.append(path)
             if len(selected) >= max(1, max_file_reads):

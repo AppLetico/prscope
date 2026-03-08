@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import difflib
 import re
 from typing import Any, Literal
 
 from ..tools import extract_file_references
+from .models import ValidationResult
 from .discovery import (
+    is_localized_frontend_request,
     is_entrypoint_like,
     is_non_trivial_source,
     is_test_or_config,
@@ -12,10 +15,100 @@ from .discovery import (
     requirements_keywords,
 )
 
+_RETRYABLE_REASON_CODES = frozenset(
+    {
+        "grounding_failure",
+        "unknown_file_reference",
+        "missing_sections",
+        "missing_tests",
+        "missing_helper_reuse",
+        "localized_scope_drift",
+    }
+)
+
+_SECTION_FAILURE_NAMES = frozenset(
+    {
+        "title",
+        "summary",
+        "goals",
+        "non_goals",
+        "changes",
+        "files_changed",
+        "todos_in_order",
+        "architecture",
+        "mermaid_diagram",
+        "implementation_steps",
+        "test_strategy",
+        "rollback_plan",
+        "example_code_snippets",
+        "open_questions",
+        "design_decision_records",
+        "user_stories",
+        "mermaid_content",
+        "example_code_fence",
+        "ordered_todos",
+    }
+)
+
 
 class AuthorValidationService:
     def __init__(self, tool_executor: Any) -> None:
         self.tool_executor = tool_executor
+
+    @staticmethod
+    def _suggest_verified_path(unverified_path: str, verified_paths: set[str]) -> str | None:
+        normalized = str(unverified_path).strip()
+        if not normalized:
+            return None
+        candidates = difflib.get_close_matches(normalized, sorted(verified_paths), n=1, cutoff=0.55)
+        if candidates:
+            return candidates[0]
+        target_name = normalized.rsplit("/", 1)[-1]
+        for candidate in sorted(verified_paths):
+            if candidate.endswith(target_name):
+                return candidate
+        return None
+
+    def _helper_mentions_from_repo(self, repo_understanding: Any) -> list[str]:
+        file_contents = dict(getattr(repo_understanding, "file_contents", {}) or {})
+        candidate_paths = [
+            str(path).strip()
+            for path in (
+                list(getattr(repo_understanding, "relevant_modules", []))
+                + list(getattr(repo_understanding, "entrypoints", []))
+            )
+            if str(path).strip()
+        ]
+        for path in candidate_paths[:6]:
+            lowered = path.lower()
+            should_read = lowered.endswith(("planningview.tsx", "actionbar.tsx", "planpanel.tsx", "/lib/api.ts"))
+            if not should_read:
+                continue
+            existing = str(file_contents.get(path, "") or "").strip()
+            if existing and any(
+                token in existing.lower() for token in ("getsessionsnapshot", "exportsession", "downloadfile")
+            ):
+                continue
+            try:
+                payload = self.tool_executor.read_file(path, max_lines=320 if lowered.endswith("/lib/api.ts") else 120)
+            except Exception:  # noqa: BLE001
+                continue
+            enriched = str(payload.get("content", "") or "").strip()
+            if enriched:
+                file_contents[path] = enriched
+        names: list[str] = []
+        seen: set[str] = set()
+        for content in file_contents.values():
+            text = str(content or "")
+            for match in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]*)\b", text):
+                lowered = match.lower()
+                if not any(token in lowered for token in ("snapshot", "diagnostic", "export", "download")):
+                    continue
+                if lowered in seen:
+                    continue
+                seen.add(lowered)
+                names.append(match)
+        return names
 
     @staticmethod
     def extract_section(content: str, heading: str) -> str:
@@ -78,6 +171,22 @@ class AuthorValidationService:
                     "Files Changed entries missing from Implementation Steps: " + ", ".join(missing_impl_refs)
                 )
         return failures, unverified, grounding_ratio
+
+    @staticmethod
+    def incremental_grounding_failures(
+        previous_plan_content: str,
+        updated_plan_content: str,
+        verified_paths: set[str],
+    ) -> list[str]:
+        previous_refs = extract_file_references(previous_plan_content)
+        updated_refs = extract_file_references(updated_plan_content)
+        new_refs = updated_refs - previous_refs
+        unverified_new_refs = sorted(new_refs - verified_paths)
+        if not unverified_new_refs:
+            return []
+        return [
+            "revision introduced unverified file references: " + ", ".join(unverified_new_refs),
+        ]
 
     @staticmethod
     def phase_failures(plan_content: str, draft_phase: Literal["planner", "refiner"]) -> list[str]:
@@ -149,6 +258,70 @@ class AuthorValidationService:
         return failures
 
     @staticmethod
+    def localized_ui_scope_failures(plan_content: str, requirements_text: str | None) -> list[str]:
+        requirements = str(requirements_text or "")
+        if not is_localized_frontend_request(requirements):
+            return []
+        lowered_requirements = requirements.lower()
+        if any(token in lowered_requirements for token in ("observability", "telemetry", "logging", "monitoring")):
+            return []
+        lowered_plan = plan_content.lower()
+        if any(token in lowered_plan for token in ("observability", "telemetry", "logging")):
+            return [
+                "localized UI/API draft introduced observability or telemetry scope not present in requirements; "
+                "remove logging/telemetry/observability wording and keep the plan focused on existing UI wiring, "
+                "API helper reuse, and tests"
+            ]
+        return []
+
+    @staticmethod
+    def missing_test_target_failures(
+        plan_content: str,
+        repo_understanding: Any,
+        requirements_text: str | None,
+    ) -> list[str]:
+        requirements = str(requirements_text or "").lower()
+        if not any(token in requirements for token in ("test", "tests", "coverage", "regression")):
+            return []
+        relevant_tests = [
+            str(path).strip()
+            for path in getattr(repo_understanding, "relevant_tests", [])
+            if str(path).strip()
+        ]
+        if not relevant_tests:
+            return []
+        referenced = extract_file_references(plan_content)
+        if any(path in referenced for path in relevant_tests):
+            return []
+        candidates = ", ".join(relevant_tests[:3])
+        return [f"missing test target reference; reference one of: {candidates}"]
+
+    def missing_helper_reuse_failures(
+        self,
+        plan_content: str,
+        repo_understanding: Any,
+        requirements_text: str | None,
+    ) -> list[str]:
+        requirements = str(requirements_text or "").lower()
+        if not is_localized_frontend_request(requirements):
+            return []
+        desired_tokens = tuple(token for token in ("snapshot", "export", "download") if token in requirements)
+        if not desired_tokens:
+            return []
+        lowered_plan = str(plan_content or "").lower()
+        failures: list[str] = []
+        helper_names = self._helper_mentions_from_repo(repo_understanding)
+        for token in desired_tokens:
+            matching_helpers = [name for name in helper_names if token in name.lower()]
+            if not matching_helpers:
+                continue
+            if any(name.lower() in lowered_plan for name in matching_helpers):
+                continue
+            candidates = ", ".join(matching_helpers[:3])
+            failures.append(f"missing explicit helper reuse reference for {token}; mention one of: {candidates}")
+        return failures
+
+    @staticmethod
     def missing_required_sections(plan_content: str, draft_phase: Literal["planner", "refiner"]) -> list[str]:
         missing: list[str] = []
         section_patterns = {
@@ -205,12 +378,96 @@ class AuthorValidationService:
         draft_phase: Literal["planner", "refiner"] = "refiner",
         min_grounding_ratio: float | None = None,
         verified_paths_extra: set[str] | None = None,
+        requirements_text: str | None = None,
     ) -> list[str]:
+        return list(
+            self.validate_draft_result(
+                plan_content=plan_content,
+                repo_understanding=repo_understanding,
+                draft_phase=draft_phase,
+                min_grounding_ratio=min_grounding_ratio,
+                verified_paths_extra=verified_paths_extra,
+                requirements_text=requirements_text,
+            ).failure_messages
+        )
+
+    @staticmethod
+    def _normalize_failure_messages(failures: list[str]) -> tuple[str, ...]:
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for failure in failures:
+            text = str(failure or "").strip()
+            if not text:
+                continue
+            key = text.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            normalized.append(text)
+        return tuple(normalized)
+
+    @staticmethod
+    def _reason_code_for_failure(failure: str) -> str:
+        normalized = str(failure or "").strip().lower()
+        if not normalized:
+            return "validation_failure"
+        if normalized in _SECTION_FAILURE_NAMES:
+            return "missing_sections"
+        if normalized.startswith("grounding ratio"):
+            return "grounding_failure"
+        if normalized.startswith("unknown file references:"):
+            return "unknown_file_reference"
+        if normalized.startswith("replace unverified path "):
+            return "unknown_file_reference"
+        if normalized.startswith("required section is empty:"):
+            return "missing_sections"
+        if "files changed section is empty" in normalized:
+            return "missing_sections"
+        if "planner draft must not include" in normalized:
+            return "missing_sections"
+        if "planner draft has too many code fences" in normalized:
+            return "missing_sections"
+        if "planner draft contains detailed implementation step list" in normalized:
+            return "missing_sections"
+        if "test strategy" in normalized or "missing test" in normalized:
+            return "missing_tests"
+        if normalized.startswith("missing explicit helper reuse reference for "):
+            return "missing_helper_reuse"
+        if "localized ui/api draft introduced" in normalized:
+            return "localized_scope_drift"
+        return "validation_failure"
+
+    @classmethod
+    def build_validation_result(cls, failures: list[str]) -> ValidationResult:
+        normalized_failures = cls._normalize_failure_messages(failures)
+        if not normalized_failures:
+            return ValidationResult.success()
+        reason_codes = tuple(sorted({cls._reason_code_for_failure(failure) for failure in normalized_failures}))
+        return ValidationResult(
+            failure_messages=normalized_failures,
+            reason_codes=reason_codes,
+            retryable=any(code in _RETRYABLE_REASON_CODES for code in reason_codes),
+            failure_count=len(normalized_failures),
+        )
+
+    def validate_draft_result(
+        self,
+        *,
+        plan_content: str,
+        repo_understanding: Any,
+        draft_phase: Literal["planner", "refiner"] = "refiner",
+        min_grounding_ratio: float | None = None,
+        verified_paths_extra: set[str] | None = None,
+        requirements_text: str | None = None,
+    ) -> ValidationResult:
         failures: list[str] = []
         failures.extend(self.phase_failures(plan_content, draft_phase=draft_phase))
         failures.extend(self.missing_required_sections(plan_content, draft_phase=draft_phase))
         if draft_phase == "refiner":
             failures.extend(self.completion_failures(plan_content))
+        failures.extend(self.localized_ui_scope_failures(plan_content, requirements_text))
+        failures.extend(self.missing_test_target_failures(plan_content, repo_understanding, requirements_text))
+        failures.extend(self.missing_helper_reuse_failures(plan_content, repo_understanding, requirements_text))
         if min_grounding_ratio is not None:
             verified_paths = (
                 set(repo_understanding.file_contents.keys())
@@ -227,4 +484,12 @@ class AuthorValidationService:
                 draft_phase=draft_phase,
             )
             failures.extend(grounding)
-        return failures
+            referenced = extract_file_references(plan_content)
+            unverified = sorted(referenced - verified_paths)
+            if unverified:
+                failures.append("unknown file references: " + ", ".join(unverified[:6]))
+                for path in unverified[:4]:
+                    suggested = self._suggest_verified_path(path, verified_paths)
+                    if suggested and suggested != path:
+                        failures.append(f"replace unverified path `{path}` with `{suggested}`")
+        return self.build_validation_result(failures)
