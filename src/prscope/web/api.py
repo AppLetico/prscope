@@ -32,6 +32,7 @@ from ..planning.core import (
 )
 from ..planning.executor import CommandConflictError, CommandContext, HandlerResult, execute_command
 from ..planning.runtime import PlanningRuntime
+from ..planning.runtime.review import build_impact_view
 from ..store import Store
 from .events import SessionEventEmitter
 
@@ -1348,11 +1349,13 @@ def create_app() -> FastAPI:
         )
         versions = store.get_plan_versions(session_id, limit=200)
         current_plan = versions[0] if versions else None
+        current_plan_payload = _version_to_dict(current_plan) if current_plan else None
+        previous_plan_payload = _version_to_dict(versions[1]) if len(versions) > 1 else None
         timing, timing_source = registry.get_session_timing_with_source(session_id, store=store)
         if lightweight:
             return {
                 "session": session_payload,
-                "current_plan": _version_to_dict(current_plan) if current_plan else None,
+                "current_plan": current_plan_payload,
                 "draft_timing": timing,
                 "draft_timing_source": timing_source,
             }
@@ -1360,6 +1363,7 @@ def create_app() -> FastAPI:
         round_metrics_rows = store.get_round_metrics(session_id)
         score_by_round = {v.round: v.convergence_score for v in versions}  # O(n) lookup
         issue_graph_summary: dict[str, Any] | None = None
+        impact_view: dict[str, Any] | None = None
         try:
             _, _, runtime = _runtime_for(repo_name=session.repo_name)
             snapshot_payload = runtime.read_state_snapshot(session_id)
@@ -1369,13 +1373,28 @@ def create_app() -> FastAPI:
                     summary = graph.get("summary")
                     if isinstance(summary, dict):
                         issue_graph_summary = summary
+                    impact_view = build_impact_view(
+                        decision_graph=(
+                            current_plan_payload.get("decision_graph")
+                            if isinstance(current_plan_payload, dict)
+                            else None
+                        ),
+                        issue_graph=graph,
+                        previous_decision_graph=(
+                            previous_plan_payload.get("decision_graph")
+                            if isinstance(previous_plan_payload, dict)
+                            else None
+                        ),
+                    )
         except Exception:  # noqa: BLE001
             issue_graph_summary = None
+            impact_view = None
         return {
             "session": session_payload,
             "conversation": [_turn_to_dict(t) for t in turns],
             "plan_versions": [_version_to_dict(v) for v in versions],
-            "current_plan": _version_to_dict(current_plan) if current_plan else None,
+            "current_plan": current_plan_payload,
+            "impact_view": impact_view,
             "draft_timing": timing,
             "draft_timing_source": timing_source,
             "round_metrics": [

@@ -12,6 +12,8 @@ from typing import TYPE_CHECKING, Any, Literal
 if TYPE_CHECKING:
     from .issue_similarity import IssueSimilarityService
 
+from .issue_types import IssueType
+
 logger = logging.getLogger(__name__)
 
 IssueStatus = Literal["open", "resolved"]
@@ -41,6 +43,7 @@ class IssueNode:
     resolution_source: IssueResolutionSource | None = None
     severity: IssueSeverity = "major"
     source: IssueSource = "critic"
+    issue_type: IssueType | None = None
     embedding: list[float] | None = None
     tags: set[str] = field(default_factory=set)
     related_decision_ids: set[str] = field(default_factory=set)
@@ -109,6 +112,7 @@ class IssueGraphTracker:
         *,
         severity: IssueSeverity = "major",
         source: IssueSource = "critic",
+        issue_type: IssueType | None = None,
         preferred_id: str | None = None,
     ) -> Issue:
         normalized = self.canonicalize_text(description)
@@ -146,10 +150,18 @@ class IssueGraphTracker:
             raised_round=int(round_number),
             severity=severity,
             source=source,
+            issue_type=issue_type,
         )
         self._graph.nodes[issue_id] = node
         self._enforce_graph_caps()
         return self._to_issue(node)
+
+    def set_issue_type(self, issue_id: str, issue_type: IssueType | None) -> None:
+        canonical_issue_id = self.canonical_issue_id(issue_id)
+        node = self._graph.nodes.get(canonical_issue_id)
+        if node is None or issue_type is None:
+            return
+        node.issue_type = issue_type
 
     def alias_duplicate(self, alias_id: str, canonical_id: str) -> str:
         alias = str(alias_id).strip()
@@ -325,6 +337,7 @@ class IssueGraphTracker:
                 "resolution_source": node.resolution_source,
                 "severity": node.severity,
                 "source": node.source,
+                "issue_type": node.issue_type,
                 "embedding": node.embedding,
                 "tags": sorted(node.tags),
                 "related_decision_ids": sorted(node.related_decision_ids),
@@ -373,6 +386,12 @@ class IssueGraphTracker:
             severity: IssueSeverity = (
                 "minor" if severity_value == "minor" else "info" if severity_value == "info" else "major"
             )
+            issue_type_value = str(raw.get("issue_type", "")).strip().lower()
+            issue_type: IssueType | None = (
+                issue_type_value  # type: ignore[assignment]
+                if issue_type_value in {"architecture", "ambiguity", "correctness", "performance"}
+                else None
+            )
             source_value = str(raw.get("source", "critic")).strip().lower()
             source: IssueSource = (
                 "validation"
@@ -396,6 +415,7 @@ class IssueGraphTracker:
                 ),
                 severity=severity,
                 source=source,
+                issue_type=issue_type,
                 embedding=raw.get("embedding") if isinstance(raw.get("embedding"), list) else None,
                 tags={str(tag) for tag in raw.get("tags", []) if str(tag).strip()},
                 related_decision_ids={

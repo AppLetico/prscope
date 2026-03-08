@@ -169,18 +169,25 @@ def test_review_issue_severity_demotes_architectural_and_implementability_items(
 
 def test_issue_graph_snapshot_persists_related_decision_ids():
     tracker = _tracker()
-    issue = tracker.add_issue("Database choice remains underspecified.", 1, preferred_id="issue_1")
+    issue = tracker.add_issue(
+        "Database choice remains underspecified.",
+        1,
+        preferred_id="issue_1",
+        issue_type="ambiguity",
+    )
 
     tracker.link_issue_to_decisions(issue.id, ["architecture.database"], relation="missing")
 
     snapshot = tracker.graph_snapshot()
     assert snapshot["nodes"][0]["related_decision_ids"] == ["architecture.database"]
+    assert snapshot["nodes"][0]["issue_type"] == "ambiguity"
     assert "decision:missing" in snapshot["nodes"][0]["tags"]
 
     restored = _tracker()
     restored.load_snapshot(snapshot)
     restored_snapshot = restored.graph_snapshot()
     assert restored_snapshot["nodes"][0]["related_decision_ids"] == ["architecture.database"]
+    assert restored_snapshot["nodes"][0]["issue_type"] == "ambiguity"
     assert "decision:missing" in restored_snapshot["nodes"][0]["tags"]
 
 

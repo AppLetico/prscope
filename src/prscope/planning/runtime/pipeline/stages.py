@@ -19,7 +19,7 @@ from ..reasoning import (
     ReasoningContext,
     ReviewReasoner,
 )
-from ..review import ManifestoCheckResult
+from ..review import ManifestoCheckResult, infer_issue_type
 from ..tools import extract_file_references
 from .round_context import PlanningRoundContext
 
@@ -31,6 +31,14 @@ def review_issue_severity(issue_kind: str) -> str:
     if normalized in {"recommended_change", "reviewer_question"}:
         return "info"
     return "major"
+
+
+def review_issue_type(issue_text: str, *, issue_kind: str | None = None, decision_relation: str | None = None) -> str:
+    return infer_issue_type(
+        issue_text,
+        source_kind=issue_kind,
+        decision_relation=decision_relation,
+    )
 
 
 class PlanningStages:
@@ -68,10 +76,19 @@ class PlanningStages:
         issue_id: str,
         issue_text: str,
         decision_graph_json: str | None,
+        issue_kind: str | None = None,
     ) -> None:
         review_decision = await self._review_reasoner.link_issue(
             issue_text=issue_text,
             decision_graph_json=decision_graph_json,
+        )
+        ctx.issue_tracker.set_issue_type(
+            issue_id,
+            review_issue_type(
+                issue_text,
+                issue_kind=issue_kind,
+                decision_relation=review_decision.decision_relation,
+            ),
         )
         if not review_decision.issue_links:
             return
@@ -174,6 +191,7 @@ class PlanningStages:
                     ctx.round_number,
                     severity=review_issue_severity(kind),  # type: ignore[arg-type]
                     source="critic",
+                    issue_type=review_issue_type(item, issue_kind=kind),  # type: ignore[arg-type]
                 )
                 if added_issue.id:
                     await self._link_issue_to_decisions(
@@ -181,6 +199,7 @@ class PlanningStages:
                         issue_id=added_issue.id,
                         issue_text=item,
                         decision_graph_json=current_decision_graph_json,
+                        issue_kind=kind,
                     )
         primary_issue_id = ""
         if review_result.primary_issue and review_result.primary_issue.strip():
@@ -188,6 +207,7 @@ class PlanningStages:
                 review_result.primary_issue,
                 ctx.round_number,
                 source="critic",
+                issue_type=review_issue_type(review_result.primary_issue, issue_kind="primary_issue"),
             ).id
             if primary_issue_id:
                 await self._link_issue_to_decisions(
@@ -195,6 +215,7 @@ class PlanningStages:
                     issue_id=primary_issue_id,
                     issue_text=review_result.primary_issue,
                     decision_graph_json=current_decision_graph_json,
+                    issue_kind="primary_issue",
                 )
             for derived_item in [*review_result.blocking_issues, *review_result.architectural_concerns]:
                 if not derived_item.strip():
@@ -205,6 +226,7 @@ class PlanningStages:
                     ctx.round_number,
                     severity=review_issue_severity(kind),  # type: ignore[arg-type]
                     source="critic",
+                    issue_type=review_issue_type(derived_item, issue_kind=kind),  # type: ignore[arg-type]
                 )
                 if primary_issue_id and derived.id:
                     ctx.issue_tracker.add_edge(primary_issue_id, derived.id, "causes")
@@ -214,6 +236,7 @@ class PlanningStages:
                         issue_id=derived.id,
                         issue_text=derived_item,
                         decision_graph_json=current_decision_graph_json,
+                        issue_kind=kind,
                     )
         for constraint_id in review_result.constraint_violations:
             constraint_issue = ctx.issue_tracker.add_issue(
@@ -221,6 +244,10 @@ class PlanningStages:
                 ctx.round_number,
                 severity=review_issue_severity("constraint_violation"),  # type: ignore[arg-type]
                 source="critic",
+                issue_type=review_issue_type(
+                    f"Constraint violation: {constraint_id}",
+                    issue_kind="constraint_violation",
+                ),
             )
             if primary_issue_id and constraint_issue.id:
                 ctx.issue_tracker.add_edge(primary_issue_id, constraint_issue.id, "depends_on")
@@ -524,6 +551,10 @@ class PlanningStages:
                 ctx.round_number,
                 severity=review_issue_severity("validation_primary_issue"),  # type: ignore[arg-type]
                 source="validation",
+                issue_type=review_issue_type(
+                    validation_review.primary_issue,
+                    issue_kind="validation_primary_issue",
+                ),
             ).id
             if validation_primary_id:
                 await self._link_issue_to_decisions(
@@ -531,6 +562,7 @@ class PlanningStages:
                     issue_id=validation_primary_id,
                     issue_text=validation_review.primary_issue,
                     decision_graph_json=current_decision_graph_json,
+                    issue_kind="validation_primary_issue",
                 )
         for item in [*validation_review.blocking_issues, *validation_review.architectural_concerns]:
             if item.strip():
@@ -544,6 +576,7 @@ class PlanningStages:
                     ctx.round_number,
                     severity=review_issue_severity(kind),  # type: ignore[arg-type]
                     source="validation",
+                    issue_type=review_issue_type(item, issue_kind=kind),  # type: ignore[arg-type]
                 )
                 if issue.id:
                     await self._link_issue_to_decisions(
@@ -551,6 +584,7 @@ class PlanningStages:
                         issue_id=issue.id,
                         issue_text=item,
                         decision_graph_json=current_decision_graph_json,
+                        issue_kind=kind,
                     )
                 if validation_primary_id and issue.id:
                     ctx.issue_tracker.add_edge(validation_primary_id, issue.id, "causes")

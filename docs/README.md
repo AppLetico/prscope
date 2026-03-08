@@ -15,6 +15,7 @@ Technical documentation for architecture, design, runtime behavior, and quality 
 ### Runtime and Operations
 
 - [Agent Harness Guide](./agent-harness.md) — API, runtime, SSE, benchmark harness
+- [Decision and Issue Graphs](./decision-and-issue-graphs.md) — graph artifacts, persistence, and UI/runtime roles
 - [Planning State Machine](./planning-state-machine.md) — state contract, transitions, invariants
 - [Memory, Context, and Manifesto](./memory-context-manifesto.md) — memory layers, context budgets
 - [Skills and Session Recall](./skills-and-recall.md) — skills and episodic recall

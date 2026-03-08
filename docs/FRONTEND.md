@@ -132,6 +132,13 @@ The frontend handles `409` responses gracefully — they indicate the session is
 - Follow-up prompts rendered in `ChatPanel` come from persisted follow-up artifacts derived from the same decision graph.
 - The frontend never infers or mutates decision state locally; graph state is server-authoritative just like session state.
 
+### Impact View Rendering
+
+- `GET /api/sessions/{id}` now includes an additive `impact_view` payload derived from `current_plan.decision_graph` and snapshot `issue_graph`.
+- `PlanPanel` uses `impact_view` to render an aggregate `decisions under pressure` badge plus a top-pressure summary.
+- `IssuePanel` resolves `related_decision_ids` into visible decision chips and shows dominant cluster context such as root cause and suggested action.
+- `impact_view` is a read model for UI and agent prompts. The frontend must not treat it as canonical planning state or write it back.
+
 ### Styling
 
 - Tailwind utility classes for all styling.

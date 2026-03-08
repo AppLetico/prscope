@@ -1,13 +1,16 @@
 import { useState, useRef, useEffect, type ComponentType } from "react";
 import { AlertCircle, ShieldAlert, Target, X, MessageSquarePlus, CheckCircle2, Info } from "lucide-react";
 import { clsx } from "clsx";
-import type { IssueGraphNode } from "../types";
+import { getRelatedDecisionSummaries } from "../lib/impactView";
+import type { ArchitectureImpactView, DecisionGraph, IssueGraphNode } from "../types";
 
 interface IssuePanelProps {
   openIssues: IssueGraphNode[];
   rootIssues: IssueGraphNode[];
   resolvedIssues: IssueGraphNode[];
   constraintViolations: string[];
+  decisionGraph?: DecisionGraph | null;
+  impactView?: ArchitectureImpactView | null;
   rootCausesCount: number;
   onAppendIssue: (issue: IssueGraphNode) => void;
   onAppendAllIssues: () => void;
@@ -23,6 +26,8 @@ export function IssuePanel({
   rootIssues,
   resolvedIssues,
   constraintViolations,
+  decisionGraph = null,
+  impactView = null,
   rootCausesCount,
   onAppendIssue,
   onAppendAllIssues,
@@ -121,6 +126,8 @@ export function IssuePanel({
                     <IssueCard 
                       key={issue.id} 
                       issue={issue} 
+                      decisionGraph={decisionGraph}
+                      impactView={impactView}
                       onAdd={() => onAppendIssue(issue)} 
                     />
                   ))}
@@ -187,6 +194,8 @@ export function IssuePanel({
                     <IssueCard
                       key={issue.id}
                       issue={issue}
+                      decisionGraph={decisionGraph}
+                      impactView={impactView}
                       onAdd={() => onAppendIssue(issue)}
                     />
                   ))}
@@ -216,6 +225,8 @@ export function IssuePanel({
                     <IssueCard
                       key={issue.id}
                       issue={issue}
+                      decisionGraph={decisionGraph}
+                      impactView={impactView}
                       onAdd={() => onAppendIssue(issue)}
                       canAdd={false}
                       statusLabel={`Resolved${issue.resolved_round ? ` in round ${issue.resolved_round}` : ""}`}
@@ -287,6 +298,8 @@ function TabButton({
 
 function IssueCard({
   issue,
+  decisionGraph,
+  impactView,
   onAdd,
   canAdd = true,
   statusLabel,
@@ -295,6 +308,8 @@ function IssueCard({
   provenanceTone = "review",
 }: {
   issue: IssueGraphNode;
+  decisionGraph?: DecisionGraph | null;
+  impactView?: ArchitectureImpactView | null;
   onAdd: () => void;
   canAdd?: boolean;
   statusLabel?: string;
@@ -303,6 +318,8 @@ function IssueCard({
   provenanceTone?: "review" | "lightweight";
 }) {
   const displaySeverity = getDisplaySeverity(issue);
+  const relatedDecisions = getRelatedDecisionSummaries(issue, impactView, decisionGraph);
+  const topRelatedDecision = relatedDecisions[0];
   const severityColors = {
     must_fix: "bg-red-500/10 text-red-400 border-red-500/20",
     needs_attention: "bg-amber-500/10 text-amber-400 border-amber-500/20",
@@ -360,6 +377,36 @@ function IssueCard({
       <p className="text-sm text-zinc-300 leading-relaxed mb-3">
         {issue.description}
       </p>
+
+      {relatedDecisions.length > 0 ? (
+        <div className="mb-3 space-y-2">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="text-[10px] uppercase tracking-wider text-zinc-500">Related decisions</span>
+            {relatedDecisions.map((decision) => (
+              <span
+                key={decision.decisionId}
+                className={clsx(
+                  "rounded-full border px-2 py-0.5 text-[10px] font-medium",
+                  decision.riskLevel === "high"
+                    ? "border-red-500/20 bg-red-500/10 text-red-300"
+                    : decision.riskLevel === "medium"
+                    ? "border-amber-500/20 bg-amber-500/10 text-amber-300"
+                    : "border-zinc-700 bg-zinc-800/70 text-zinc-300",
+                )}
+              >
+                {decision.label}
+              </span>
+            ))}
+          </div>
+          {topRelatedDecision?.dominantCluster ? (
+            <div className="rounded-md border border-zinc-800/70 bg-zinc-950/40 px-3 py-2 text-xs text-zinc-400">
+              <span className="font-medium text-zinc-300">Dominant pressure:</span>{" "}
+              {topRelatedDecision.dominantCluster.rootIssue}
+              <span className="text-zinc-500"> · Action: {topRelatedDecision.dominantCluster.suggestedAction}</span>
+            </div>
+          ) : null}
+        </div>
+      ) : null}
 
       {canAdd ? (
         <div className="flex items-center justify-end pt-2 border-t border-zinc-800/50 mt-2">

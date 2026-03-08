@@ -328,6 +328,87 @@ def test_get_session_parses_version_followups_payload(tmp_path, monkeypatch):
     assert current_plan["followups"]["suggestions"][0]["id"] == "expand_observability"
 
 
+def test_get_session_returns_impact_view_payload(tmp_path, monkeypatch):
+    _write_minimal_config(tmp_path)
+    monkeypatch.setenv("PRSCOPE_CONFIG_ROOT", str(tmp_path))
+    store = Store()
+    session = store.create_planning_session(
+        repo_name=tmp_path.name,
+        title="impact-view",
+        requirements="r",
+        seed_type="requirements",
+        status="refining",
+    )
+    version = store.save_plan_version(
+        session.id,
+        round_number=1,
+        plan_content="# Plan\n\n## Architecture\nUse PostgreSQL.",
+        plan_sha="sha-impact-view",
+        decision_graph_json=json.dumps(
+            {
+                "nodes": {
+                    "architecture.database": {
+                        "id": "architecture.database",
+                        "description": "Which database should store the primary application data?",
+                        "value": "PostgreSQL",
+                        "section": "architecture",
+                    }
+                },
+                "edges": [],
+            }
+        ),
+    )
+    assert version.id is not None
+    snapshot_dir = tmp_path / ".prscope" / "sessions"
+    snapshot_dir.mkdir(parents=True, exist_ok=True)
+    (snapshot_dir / f"{session.id}.json").write_text(
+        json.dumps(
+            {
+                "session_id": session.id,
+                "updated_at": "2026-03-08T12:00:00Z",
+                "issue_graph": {
+                    "nodes": [
+                        {
+                            "id": "issue_1",
+                            "description": "Database scaling limits remain unresolved.",
+                            "status": "open",
+                            "raised_round": 1,
+                            "severity": "major",
+                            "issue_type": "architecture",
+                            "related_decision_ids": ["architecture.database"],
+                            "tags": ["decision:conflict"],
+                        },
+                        {
+                            "id": "issue_2",
+                            "description": "Database throughput may bottleneck rollout traffic.",
+                            "status": "open",
+                            "raised_round": 1,
+                            "severity": "minor",
+                            "issue_type": "performance",
+                            "related_decision_ids": ["architecture.database"],
+                            "tags": [],
+                        },
+                    ],
+                    "edges": [{"source": "issue_1", "target": "issue_2", "relation": "causes"}],
+                    "duplicate_alias": {},
+                    "summary": {"open_total": 2, "root_open": 1, "resolved_total": 0},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    app = create_app()
+    client = TestClient(app)
+    response = client.get(f"/api/sessions/{session.id}")
+    assert response.status_code == 200
+    payload = response.json()
+    impact_view = payload["impact_view"]
+    assert impact_view["decisions"][0]["decision_id"] == "architecture.database"
+    assert impact_view["decisions"][0]["decision_pressure"] == 4
+    assert impact_view["decisions"][0]["dominant_cluster"]["root_issue_id"] == "issue_1"
+
+
 def test_followup_answer_rejects_stale_plan_version(tmp_path, monkeypatch):
     _write_minimal_config(tmp_path)
     monkeypatch.setenv("PRSCOPE_CONFIG_ROOT", str(tmp_path))

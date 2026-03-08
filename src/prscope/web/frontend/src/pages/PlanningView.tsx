@@ -726,6 +726,7 @@ export function PlanningViewPage() {
                 <PlanPanel
                   content={planContent}
                   decisionGraph={sessionQuery.data?.current_plan?.decision_graph ?? null}
+                  impactView={sessionQuery.data?.impact_view ?? null}
                   status={effectiveStatus ?? session.status}
                   isProcessing={sessionState?.is_processing ?? false}
                   canExport={Boolean(sessionQuery.data?.current_plan)}

@@ -6,14 +6,16 @@ import { clsx } from "clsx";
 import mermaid from "mermaid";
 import { Tooltip } from "./ui/Tooltip";
 import { IssuePanel } from "./IssuePanel";
+import { getPressuredDecisions, getTopPressureSummary } from "../lib/impactView";
 import { preprocessPlanMarkdown } from "../lib/markdown";
 import { planMarkdownComponents } from "../lib/markdownComponents";
 import { augmentPlanMarkdownWithDecisionGraph } from "../lib/decisionGraphRender";
-import type { DecisionGraph, IssueGraphNode, IssueGraphSnapshot, SessionStatus } from "../types";
+import type { ArchitectureImpactView, DecisionGraph, IssueGraphNode, IssueGraphSnapshot, SessionStatus } from "../types";
 
 interface PlanPanelProps {
   content: string;
   decisionGraph?: DecisionGraph | null;
+  impactView?: ArchitectureImpactView | null;
   status?: SessionStatus;
   isProcessing?: boolean;
   canExport?: boolean;
@@ -31,6 +33,7 @@ interface PlanPanelProps {
 export function PlanPanel({
   content,
   decisionGraph = null,
+  impactView = null,
   status,
   isProcessing = false,
   canExport: _canExport,
@@ -129,6 +132,9 @@ export function PlanPanel({
   const constraintViolationsCount = health?.constraintViolationsCount ?? 0;
   const reviewItemsCount = (health?.openIssuesCount ?? 0) + constraintViolationsCount + rootCausesCount;
   const reviewLabel = reviewItemsCount > 0 ? `${reviewItemsCount} review notes` : "Review notes";
+  const pressuredDecisions = getPressuredDecisions(impactView);
+  const pressuredDecisionCount = pressuredDecisions.length;
+  const topPressureSummary = getTopPressureSummary(impactView, decisionGraph);
   const planCharacterCount = content.trim().length;
   const planWordCount = content.trim() ? content.trim().split(/\s+/).length : 0;
   const renderedContent = preprocessPlanMarkdown(augmentPlanMarkdownWithDecisionGraph(content, decisionGraph));
@@ -188,6 +194,8 @@ export function PlanPanel({
                     rootIssues={rootIssues}
                     resolvedIssues={resolvedIssues}
                     constraintViolations={health.constraintViolations ?? []}
+                    decisionGraph={decisionGraph}
+                    impactView={impactView}
                     rootCausesCount={rootCausesCount}
                     onAppendIssue={appendIssuePrompt}
                     onAppendAllIssues={appendAllIssuesPrompt}
@@ -197,6 +205,17 @@ export function PlanPanel({
                   />
                 )}
               </div>
+
+              {pressuredDecisionCount > 0 ? (
+                <Tooltip content="Architectural decisions currently under pressure from review findings">
+                  <div className="flex items-center gap-2 px-3 py-1.5 rounded-full border border-indigo-500/20 bg-indigo-500/10 text-indigo-300">
+                    <AlertCircle className="w-3.5 h-3.5" />
+                    <span className="font-medium">
+                      {pressuredDecisionCount} decision{pressuredDecisionCount === 1 ? "" : "s"} under pressure
+                    </span>
+                  </div>
+                </Tooltip>
+              ) : null}
 
               {health.snapshotUpdatedAt ? (
                 <Tooltip content={`Last updated: ${new Date(health.snapshotUpdatedAt).toLocaleString()}`}>
@@ -246,6 +265,22 @@ export function PlanPanel({
             </Tooltip>
           </div>
         </div>
+        {topPressureSummary ? (
+          <div className="border-b border-zinc-800/30 bg-indigo-500/5 px-6 py-3">
+            <div className="flex flex-wrap items-center gap-2 text-xs text-indigo-200">
+              <span className="font-semibold uppercase tracking-wider text-indigo-300">Top pressure</span>
+              <span className="rounded-full border border-indigo-500/20 bg-indigo-500/10 px-2 py-0.5">
+                {topPressureSummary.label}
+              </span>
+              {topPressureSummary.dominantCluster ? (
+                <>
+                  <span className="text-zinc-400">Root cause: {topPressureSummary.dominantCluster.rootIssue}</span>
+                  <span className="text-zinc-500">Action: {topPressureSummary.dominantCluster.suggestedAction}</span>
+                </>
+              ) : null}
+            </div>
+          </div>
+        ) : null}
         <div className="pb-12">
           <div className="max-w-3xl mx-auto pt-6 py-12 px-4 md:px-8" ref={mermaidRef}>
             <article className="prose prose-zinc prose-invert max-w-none">

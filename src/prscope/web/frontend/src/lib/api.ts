@@ -1,4 +1,5 @@
 import type {
+  ArchitectureImpactView,
   DiscoveryTurnResult,
   DraftTimingDiagnostics,
   ModelCatalogItem,
@@ -162,6 +163,7 @@ export function getSession(sessionId: string) {
     conversation: PlanningTurn[];
     plan_versions: PlanVersion[];
     current_plan: PlanVersion | null;
+    impact_view?: ArchitectureImpactView | null;
     tool_summary: { recent_tool_calls: string[] };
     round_metrics?: RoundMetric[];
     draft_timing?: DraftTimingDiagnostics;

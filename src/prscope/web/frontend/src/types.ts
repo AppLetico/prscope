@@ -183,6 +183,8 @@ export interface RoundMetric {
   } | null;
 }
 
+export type IssueType = "architecture" | "ambiguity" | "correctness" | "performance";
+
 export interface SessionSnapshotSummary {
   session_id: string;
   updated_at: string;
@@ -198,6 +200,7 @@ export interface IssueGraphNode {
   resolution_source?: "review" | "lightweight" | null;
   severity?: "major" | "minor" | "info";
   source?: "critic" | "validation" | "inference";
+  issue_type?: IssueType | null;
   tags?: string[];
   related_decision_ids?: string[];
 }
@@ -234,6 +237,47 @@ export interface SessionStateSnapshot {
   critic_prompt_tokens?: number;
   critic_completion_tokens?: number;
   round_cost_usd?: number;
+}
+
+export interface ImpactIssueCluster {
+  root_issue_id: string;
+  root_issue: string;
+  severity: "major" | "minor" | "info";
+  issue_ids: string[];
+  symptom_issue_count: number;
+  affected_plan_sections: string[];
+  suggested_action: string;
+}
+
+export interface ImpactDecision {
+  decision_id: string;
+  linked_issue_ids: string[];
+  decision_pressure: number;
+  pressure_breakdown: {
+    major: number;
+    minor: number;
+    info: number;
+    clusters: number;
+  };
+  risk_level: "low" | "medium" | "high";
+  highest_severity: "major" | "minor" | "info";
+  dominant_cluster: ImpactIssueCluster;
+  issue_clusters: ImpactIssueCluster[];
+}
+
+export interface ReconsiderationCandidate {
+  decision_id: string;
+  reason: string;
+  decision_pressure: number;
+  dominant_cluster: ImpactIssueCluster;
+  suggested_action: string;
+  recently_changed: boolean;
+  eligible: boolean;
+}
+
+export interface ArchitectureImpactView {
+  decisions: ImpactDecision[];
+  reconsideration_candidates: ReconsiderationCandidate[];
 }
 
 export interface ModelCatalogItem {
