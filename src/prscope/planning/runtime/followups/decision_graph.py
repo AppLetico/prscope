@@ -327,11 +327,19 @@ def _merge_edges(
     return merged
 
 
+def _open_question_descriptions(open_questions: str | None) -> set[str]:
+    if not open_questions:
+        return set()
+    lines = [line.strip() for line in str(open_questions).splitlines() if line.strip()]
+    return {_strip_bullet_prefix(line) for line in lines if line.lower() not in {"none", "none."}}
+
+
 def merge_decision_graphs(
     current_graph: DecisionGraph,
     previous_graph: DecisionGraph,
     *,
     carry_forward_unresolved: bool = False,
+    open_questions_current: str | None = None,
 ) -> DecisionGraph:
     if not previous_graph.nodes:
         return current_graph
@@ -366,10 +374,18 @@ def merge_decision_graphs(
         matched_previous.add(previous_node.id)
         merged_nodes[node_id] = _merge_node(current_node, previous_node)
 
+    current_open_set = (
+        _open_question_descriptions(open_questions_current) if open_questions_current is not None else None
+    )
     for previous_id, previous_node in previous_graph.nodes.items():
         previous_value = str(previous_node.value or "").strip()
         if previous_id in matched_previous or (not previous_value and not carry_forward_unresolved):
             continue
+        if current_open_set is not None and any(
+            e.startswith("open_questions:") for e in (previous_node.evidence or [])
+        ):
+            if previous_node.description not in current_open_set:
+                continue
         if previous_id not in merged_nodes:
             merged_nodes[previous_id] = DecisionNode(
                 id=previous_node.id,

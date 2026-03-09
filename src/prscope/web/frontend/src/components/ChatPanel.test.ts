@@ -72,7 +72,7 @@ describe("refinement timeline collapsing", () => {
     expect(shouldHideCompletedToolGroup(makeGroup(["read_file"]))).toBe(true);
   });
 
-  it("removes critic and repair chatter from the displayed timeline", () => {
+  it("keeps critic reviews visible while still hiding repair chatter", () => {
     const timeline = [
       { kind: "tool_group" as const, key: "g1", group: makeGroup(["design_review"]) },
       {
@@ -105,9 +105,11 @@ describe("refinement timeline collapsing", () => {
     ];
 
     const collapsed = collapseTimelineForDisplay(timeline);
-    expect(collapsed).toHaveLength(1);
+    expect(collapsed).toHaveLength(2);
     expect(collapsed[0]?.kind).toBe("turn");
-    expect((collapsed[0] as { kind: "turn"; turn: PlanningTurn }).turn.content).toContain("Updated sections:");
+    expect((collapsed[0] as { kind: "turn"; turn: PlanningTurn }).turn.role).toBe("critic");
+    expect(collapsed[0]?.kind).toBe("turn");
+    expect((collapsed[1] as { kind: "turn"; turn: PlanningTurn }).turn.content).toContain("Updated sections:");
   });
 
   it("extracts the primary critic issue by round", () => {

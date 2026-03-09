@@ -398,7 +398,8 @@ class AuthorRepairService:
             "2. Decide which reviewer issues you accept or reject.\n"
             "3. Identify the root causes of the accepted issues.\n"
             "4. Describe the repair strategy.\n"
-            "5. Identify which sections of the plan must change.\n\n"
+            "5. Identify which sections of the plan must change.\n"
+            "6. When the primary issue is a lack of clarity or missing answer that corresponds to an item in open_questions, include 'open_questions' in target_sections so the revision can remove the addressed question.\n\n"
             "Focus on fixing root causes rather than applying superficial edits.\n"
             "Do not blindly accept all feedback.\n\n"
             "Reject reviewer issues that materially expand scope beyond the user requirements, the current plan's non-goals, "
@@ -567,6 +568,7 @@ class AuthorRepairService:
             "Do not introduce generic comprehensive invalidation lists, manual admin actions, expiration policies, or wrapper-layer abstractions unless the requirements explicitly ask for them.\n"
             "For localized cache-wiring requests, reject speculative concurrency or abstraction drift. "
             "Do not add concurrency management, synchronization schemes, locks, background invalidation workers, shared cache modules, or generic separation-of-concerns/module rhetoric unless the requirements explicitly ask for them.\n"
+            "When your revisions address a question that appears in the current plan's open_questions section (e.g. by adding concrete content that answers it), you MUST include open_questions in your updates and remove that question from the list. If all questions are now addressed, set open_questions to '- None.'.\n"
             "Before generating updates:\n"
             "Step 1: Restate the primary concern.\n"
             "Step 2: Explain how revisions resolve it.\n"
@@ -576,6 +578,7 @@ class AuthorRepairService:
             "- problem_understanding: str\n"
             "- updates: object {section_id: new_content}\n"
             "- justification: object {section_id: why_changed}\n"
+            "- what_changed: object {section_id: one_sentence_concrete_description}. For each updated section, describe in one sentence WHAT was added or changed (e.g. 'Added explicit dependency checks for DB, Redis, and external API health'). Be concrete and specific. Do not write meta-commentary like 'the reviewer will appreciate...'.\n"
             "- review_prediction: str"
         )
         user_message = {
@@ -616,9 +619,16 @@ class AuthorRepairService:
         justification = {
             str(k): str(v) for k, v in justification_raw.items() if isinstance(k, str) and str(k) in limited_updates
         }
+        what_changed_raw = payload.get("what_changed", {})
+        what_changed = {
+            str(k): str(v)
+            for k, v in what_changed_raw.items()
+            if isinstance(k, str) and isinstance(v, str) and str(k) in limited_updates
+        }
         return RevisionResult(
             problem_understanding=str(payload.get("problem_understanding", "")),
             updates=limited_updates,
             justification=justification,
+            what_changed=what_changed,
             review_prediction=str(payload.get("review_prediction", "")),
         )

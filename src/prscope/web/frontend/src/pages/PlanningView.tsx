@@ -25,7 +25,16 @@ import {
   submitClarification,
 } from "../lib/api";
 import { cleanPlanTitle } from "../lib/planTitle";
-import type { ClarificationPrompt, LiveActivityEntry, PlanningSession, UIEvent } from "../types";
+import type {
+  ClarificationPrompt,
+  IssueGraphNode,
+  IssueGraphSnapshot,
+  LiveActivityEntry,
+  PlanningSession,
+  PlanningTurn,
+  RoundMetric,
+  UIEvent,
+} from "../types";
 import { AlertCircle, Check, Loader2 } from "lucide-react";
 import {
   formatPhaseTimingLabel,
@@ -39,6 +48,124 @@ function normalizeActivityText(value: string): string {
   return value.replace(/\.{3,}\s*$/u, "").trim();
 }
 
+function parseCriticConfidence(value: string): number | null {
+  const normalized = value.trim().toLowerCase();
+  if (normalized === "high") return 0.9;
+  if (normalized === "medium") return 0.6;
+  if (normalized === "low") return 0.3;
+  return null;
+}
+
+function parseCriticTurn(turn: PlanningTurn): {
+  roundMetric: RoundMetric;
+  issues: IssueGraphNode[];
+} | null {
+  if (turn.role !== "critic") return null;
+  const content = turn.content.trim();
+  if (!content.toLowerCase().startsWith("design review:")) return null;
+
+  const scoreMatch = content.match(/score\s+([0-9]+(?:\.[0-9]+)?)\/10/i);
+  const confidenceMatch = content.match(/confidence=([a-z]+)/i);
+  const primaryIssueMatch = content.match(/^Primary issue:\s*(.+)$/im);
+  const blockingIssuesMatch = content.match(/^Blocking issues:\s*(.+)$/im);
+  const recommendedChangesMatch = content.match(/^Recommended changes:\s*(.+)$/im);
+
+  const splitList = (raw: string | undefined): string[] =>
+    (raw ?? "")
+      .split(";")
+      .map((item) => item.trim())
+      .filter(Boolean);
+
+  const issueTexts: Array<{ text: string; severity: "major" | "minor" }> = [];
+  if (primaryIssueMatch?.[1]?.trim()) {
+    issueTexts.push({ text: primaryIssueMatch[1].trim(), severity: "major" });
+  }
+  for (const item of splitList(blockingIssuesMatch?.[1])) {
+    issueTexts.push({ text: item, severity: "major" });
+  }
+  for (const item of splitList(recommendedChangesMatch?.[1])) {
+    if (!issueTexts.some((entry) => entry.text === item)) {
+      issueTexts.push({ text: item, severity: "minor" });
+    }
+  }
+
+  const issues: IssueGraphNode[] = issueTexts.map((issue, index) => ({
+    id: `fallback_issue_r${turn.round}_${index + 1}`,
+    description: issue.text,
+    status: "open",
+    raised_round: turn.round,
+    severity: issue.severity,
+    source: "critic",
+    issue_type: issue.severity === "major" ? "correctness" : "ambiguity",
+    tags: [],
+    related_decision_ids: [],
+  }));
+
+  const score = scoreMatch ? Number(scoreMatch[1]) : null;
+  return {
+    roundMetric: {
+      round: turn.round,
+      major_issues: issues.filter((issue) => issue.severity === "major").length,
+      minor_issues: issues.filter((issue) => issue.severity === "minor").length,
+      critic_confidence: confidenceMatch ? parseCriticConfidence(confidenceMatch[1]) : null,
+      convergence_score: score != null ? score / 10 : null,
+      call_cost_usd: null,
+      issue_graph_summary: issues.length > 0
+        ? {
+            open_total: issues.length,
+            resolved_total: 0,
+            unresolved_dependency_chains: 0,
+          }
+        : null,
+    },
+    issues,
+  };
+}
+
+function deriveFallbackReviewData(turns: PlanningTurn[]): {
+  roundMetrics: RoundMetric[];
+  issueGraph: IssueGraphSnapshot | null;
+} {
+  const parsed = turns
+    .map((turn) => parseCriticTurn(turn))
+    .filter((value): value is NonNullable<typeof value> => value !== null);
+  if (parsed.length === 0) {
+    return { roundMetrics: [], issueGraph: null };
+  }
+
+  const metricsByRound = new Map<number, RoundMetric>();
+  const nodesByDescription = new Map<string, IssueGraphNode>();
+  for (const item of parsed) {
+    metricsByRound.set(item.roundMetric.round, item.roundMetric);
+    for (const issue of item.issues) {
+      if (!nodesByDescription.has(issue.description)) {
+        nodesByDescription.set(issue.description, {
+          ...issue,
+          id: `fallback_issue_${nodesByDescription.size + 1}`,
+        });
+      }
+    }
+  }
+
+  const nodes = [...nodesByDescription.values()];
+  return {
+    roundMetrics: [...metricsByRound.values()].sort((a, b) => a.round - b.round),
+    issueGraph: {
+      nodes,
+      edges: [],
+      duplicate_alias: {},
+      summary: {
+        open_total: nodes.length,
+        resolved_total: 0,
+        open_major: nodes.filter((node) => node.severity === "major").length,
+        open_minor: nodes.filter((node) => node.severity === "minor").length,
+        open_info: nodes.filter((node) => node.severity === "info").length,
+        unresolved_dependency_chains: 0,
+      },
+    },
+  };
+}
+
 export function PlanningViewPage() {
   const { id = "" } = useParams();
   const location = useLocation();
@@ -46,6 +173,7 @@ export function PlanningViewPage() {
   const [tl, dispatchTl] = useReducer(timelineReducer, INITIAL_TIMELINE_STATE);
   const [thinkingMessage, setThinkingMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [errorTone, setErrorTone] = useState<"error" | "warning">("error");
   const [warnings, setWarnings] = useState<string[]>([]);
   const [authorModel, setAuthorModel] = useState("");
   const [criticModel, setCriticModel] = useState("");
@@ -131,6 +259,7 @@ export function PlanningViewPage() {
     () => sessionQuery.data?.conversation ?? [],
     [sessionQuery.data?.conversation],
   );
+  const fallbackReviewData = useMemo(() => deriveFallbackReviewData(turns), [turns]);
   const modelItems = modelQuery.data?.items ?? [];
   const availableModelItems = modelItems.filter((item) => item.available);
   const fallbackModel = availableModelItems[0]?.model_id || modelItems[0]?.model_id || "";
@@ -195,15 +324,40 @@ export function PlanningViewPage() {
     if (!id || initialSetupDone || hasCurrentPlan) {
       return;
     }
+    // Do not poll when session fetch failed (404, 400, etc.) to avoid a request loop.
+    if (sessionQuery.isError) {
+      return;
+    }
     const intervalId = window.setInterval(() => {
       void refetchSession();
     }, 1500);
     return () => window.clearInterval(intervalId);
-  }, [hasCurrentPlan, id, initialSetupDone, refetchSession]);
+  }, [hasCurrentPlan, id, initialSetupDone, refetchSession, sessionQuery.isError]);
 
   useEffect(() => {
     dispatchTl({ type: "sync_turns", turns });
   }, [turns]);
+
+  const showBanner = useCallback((message: string, tone: "error" | "warning" = "error") => {
+    setErrorTone(tone);
+    setError(message);
+  }, []);
+
+  const showConflictBanner = useCallback((err: ConflictError) => {
+    if (err.reason === "command_failed") {
+      showBanner(`Review blocked this update: ${err.message}`, "warning");
+      return;
+    }
+    if (err.reason === "processing_lock") {
+      showBanner(err.phase_message || "This session is already working on another command.", "warning");
+      return;
+    }
+    if (err.reason === "invalid_status") {
+      showBanner(err.phase_message || err.message, "warning");
+      return;
+    }
+    showBanner(err.phase_message || err.message, "error");
+  }, [showBanner]);
 
   const handleEvent = useCallback((event: UIEvent) => {
     lastEventAtMs.current = Date.now();
@@ -328,7 +482,7 @@ export function PlanningViewPage() {
     }
     if (event.type === "error") {
       setThinkingMessage(null);
-      setError(event.message);
+      showBanner(event.message, "error");
       return;
     }
     if (event.type === "warning") {
@@ -416,7 +570,7 @@ export function PlanningViewPage() {
       void refetchSession();
       return;
     }
-  }, [appendLiveActivity, id, maxPromptTokens, pendingClarification, queryClient, refetchSession, sessionCostUsd, sessionState?.pending_questions]);
+  }, [appendLiveActivity, id, maxPromptTokens, pendingClarification, queryClient, refetchSession, sessionCostUsd, sessionState?.pending_questions, showBanner]);
 
   const handleReconnect = useCallback(() => {
     lastRefetchAtMs.current = Date.now();
@@ -431,6 +585,7 @@ export function PlanningViewPage() {
   const submitMessage = async (text: string) => {
     try {
       setError(null);
+      setErrorTone("error");
       setThinkingMessage("Thinking...");
       setLiveActivities([]);
       const status = effectiveStatus;
@@ -457,7 +612,7 @@ export function PlanningViewPage() {
           setThinkingMessage(null);
         }
       } else {
-        setError("Messages are only accepted during draft, refinement, or converged feedback.");
+        showBanner("Messages are only accepted during draft, refinement, or converged feedback.");
         return;
       }
       if (sessionQuery.data?.session.repo_name) {
@@ -465,10 +620,10 @@ export function PlanningViewPage() {
       }
     } catch (err) {
       if (err instanceof ConflictError) {
-        setError(err.phase_message || err.message);
+        showConflictBanner(err);
         return;
       }
-      setError(String(err));
+      showBanner(String(err));
     }
   };
 
@@ -479,6 +634,7 @@ export function PlanningViewPage() {
     }
     try {
       setError(null);
+      setErrorTone("error");
       setThinkingMessage("Applying follow-up answer...");
       setLiveActivities([]);
       await answerPlanFollowup(id, {
@@ -494,9 +650,9 @@ export function PlanningViewPage() {
       }
     } catch (err) {
       if (err instanceof ConflictError) {
-        setError(err.message);
+        showConflictBanner(err);
       } else {
-        setError(String(err));
+        showBanner(String(err));
       }
       setThinkingMessage(null);
       throw err;
@@ -506,17 +662,19 @@ export function PlanningViewPage() {
   const handleClarificationSubmit = async (answer: string) => {
     try {
       setError(null);
+      setErrorTone("error");
       const normalized = answer.trim();
       await submitClarification(id, normalized ? [normalized] : []);
       setPendingClarification(null);
     } catch (err) {
-      setError(String(err));
+      showBanner(String(err));
     }
   };
 
   const onCritique = async () => {
     try {
       setError(null);
+      setErrorTone("error");
       setShowCritiquePrompt(false);
       setLiveActivities([]);
       await runRound(id, undefined, {
@@ -524,7 +682,11 @@ export function PlanningViewPage() {
         critic_model: selectedCriticModel || undefined,
       });
     } catch (err) {
-      setError(String(err));
+      if (err instanceof ConflictError) {
+        showConflictBanner(err);
+      } else {
+        showBanner(String(err));
+      }
     } finally {
       await sessionQuery.refetch();
     }
@@ -533,23 +695,33 @@ export function PlanningViewPage() {
   const onApprove = async () => {
     try {
       setError(null);
+      setErrorTone("error");
       await approveSession(id);
       await sessionQuery.refetch();
     } catch (err) {
-      setError(String(err));
+      if (err instanceof ConflictError) {
+        showConflictBanner(err);
+      } else {
+        showBanner(String(err));
+      }
     }
   };
 
   const onExport = async () => {
     try {
       setError(null);
+      setErrorTone("error");
       const response = await exportSession(id);
       for (const file of response.files) {
         await downloadFile(file.url, file.name);
       }
       await sessionQuery.refetch();
     } catch (err) {
-      setError(String(err));
+      if (err instanceof ConflictError) {
+        showConflictBanner(err);
+      } else {
+        showBanner(String(err));
+      }
     }
   };
 
@@ -557,20 +729,26 @@ export function PlanningViewPage() {
     if (!window.confirm("Delete this plan? This cannot be undone.")) return;
     try {
       setError(null);
+      setErrorTone("error");
       await deleteSession(id);
       navigate("/", { replace: true });
     } catch (err) {
-      setError(String(err));
+      showBanner(String(err));
     }
   };
 
   const onStop = async () => {
     try {
       setError(null);
+      setErrorTone("error");
       await stopSession(id);
       await sessionQuery.refetch();
     } catch (err) {
-      setError(String(err));
+      if (err instanceof ConflictError) {
+        showConflictBanner(err);
+      } else {
+        showBanner(String(err));
+      }
     }
   };
 
@@ -578,11 +756,18 @@ export function PlanningViewPage() {
   const planContent = sessionQuery.data?.current_plan?.plan_content ?? "";
   const currentPlanFollowups = sessionQuery.data?.current_plan?.followups ?? null;
   const snapshot = snapshotQuery.data?.snapshot;
-  const openIssuesCount = snapshot?.issue_graph?.summary?.open_total
+  const effectiveIssueGraph = snapshot?.issue_graph?.summary?.open_total
+    || (snapshot?.issue_graph?.nodes?.length ?? 0) > 0
+    ? snapshot.issue_graph
+    : fallbackReviewData.issueGraph;
+  const openIssuesCount = effectiveIssueGraph?.summary?.open_total
     ?? (Array.isArray(snapshot?.open_issues) ? snapshot.open_issues.length : 0);
   const constraintViolationsCount = Array.isArray(snapshot?.constraint_eval?.constraint_violations)
     ? snapshot?.constraint_eval?.constraint_violations.length
     : 0;
+  const effectiveRoundMetrics = (sessionQuery.data?.round_metrics?.length ?? 0) > 0
+    ? sessionQuery.data?.round_metrics
+    : fallbackReviewData.roundMetrics;
   const versionedTitle = useMemo(() => {
     if (!session) return "";
     return cleanPlanTitle(session.title);
@@ -612,16 +797,28 @@ export function PlanningViewPage() {
   };
 
   if (!session && !sessionQuery.isLoading) {
+    const errorMessage =
+      sessionQuery.error instanceof Error ? sessionQuery.error.message : String(sessionQuery.error ?? "");
+    const isRepoError = errorMessage.toLowerCase().includes("repo") && errorMessage.toLowerCase().includes("not found");
     return (
       <main className="h-screen flex items-center justify-center bg-zinc-950 px-6">
         <div className="w-full max-w-lg rounded-2xl border border-zinc-800 bg-zinc-900/70 p-8 shadow-xl">
           <div className="mb-5 inline-flex h-10 w-10 items-center justify-center rounded-lg bg-zinc-800/80 text-zinc-300">
             <AlertCircle className="h-5 w-5" />
           </div>
-          <h1 className="text-xl font-semibold text-zinc-100">Session no longer exists</h1>
+          <h1 className="text-xl font-semibold text-zinc-100">
+            {isRepoError ? "Session not available" : "Session no longer exists"}
+          </h1>
           <p className="mt-2 text-sm leading-6 text-zinc-400">
-            This usually happens after `make reset` or deleting sessions. Open your sessions list to continue.
+            {isRepoError
+              ? "The repo for this session is not in your config (e.g. a test repo like test_followup_answer_rejects_s0). Use a configured repo or start a new plan."
+              : "This usually happens after `make reset` or deleting sessions. Open your sessions list to continue."}
           </p>
+          {errorMessage ? (
+            <p className="mt-3 text-xs font-mono text-amber-200/90 bg-zinc-800/80 rounded px-2 py-1.5 break-words">
+              {errorMessage}
+            </p>
+          ) : null}
           {activeRepoContext ? (
             <p className="mt-3 text-xs text-zinc-500">
               Repo context: <span className="font-mono text-zinc-400">{activeRepoContext}</span>
@@ -677,6 +874,7 @@ export function PlanningViewPage() {
             contextPercent={null}
             contextCompactionEnabled={false}
             routingDiagnostics={sessionQuery.data?.draft_timing ?? null}
+            routingDiagnosticsSource={sessionQuery.data?.draft_timing_source ?? null}
           />
         ) : null}
         <div className="flex-1 flex flex-col items-center justify-center p-8">
@@ -729,17 +927,24 @@ export function PlanningViewPage() {
             contextPercent={contextPercent}
             contextCompactionEnabled={contextCompactionEnabled}
             routingDiagnostics={sessionQuery.data?.draft_timing ?? null}
+            routingDiagnosticsSource={sessionQuery.data?.draft_timing_source ?? null}
             onDelete={onDelete}
-            roundMetrics={sessionQuery.data?.round_metrics}
+            roundMetrics={effectiveRoundMetrics}
           />
           
           {error && (
-            <div className="bg-rose-500/10 border-b border-rose-500/20 px-6 py-3 flex items-center gap-3 text-rose-400 text-sm z-40">
+            <div
+              className={
+                errorTone === "warning"
+                  ? "bg-amber-500/10 border-b border-amber-500/20 px-6 py-3 flex items-center gap-3 text-amber-300 text-sm z-40"
+                  : "bg-rose-500/10 border-b border-rose-500/20 px-6 py-3 flex items-center gap-3 text-rose-400 text-sm z-40"
+              }
+            >
               <AlertCircle className="w-4 h-4 shrink-0" />
               <p>{error}</p>
               <button 
                 onClick={() => setError(null)}
-                className="ml-auto text-rose-400 hover:text-rose-300"
+                className={errorTone === "warning" ? "ml-auto text-amber-300 hover:text-amber-200" : "ml-auto text-rose-400 hover:text-rose-300"}
               >
                 Dismiss
               </button>
@@ -765,7 +970,7 @@ export function PlanningViewPage() {
                     openIssuesCount,
                     constraintViolationsCount,
                     constraintViolations: snapshot?.constraint_eval?.constraint_violations ?? [],
-                    issueGraph: snapshot?.issue_graph ?? null,
+                    issueGraph: effectiveIssueGraph ?? null,
                   }}
                 />
               )}

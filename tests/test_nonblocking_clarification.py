@@ -93,6 +93,7 @@ async def test_round_returns_quickly_when_clarification_requested(tmp_path):
             problem_understanding="Proceeding with best-effort assumptions.",
             updates={"open_questions": "- Which environment should rollout target first?"},
             justification={"open_questions": "Carries reviewer clarification request forward."},
+            what_changed={"open_questions": "Added rollout environment question to open_questions."},
             review_prediction="Reviewer should request explicit answer next round.",
         )
 
@@ -826,6 +827,7 @@ async def test_full_revision_reconciles_decision_graph_before_persisting(tmp_pat
                 )
             },
             justification={"architecture": "Resolves the missing persistence decision."},
+            what_changed={"architecture": "Specified PostgreSQL as the primary database."},
             review_prediction="Reviewer should accept the clarified persistence choice.",
         )
 
@@ -953,6 +955,7 @@ async def test_revise_plan_retries_when_full_refiner_validation_fails(tmp_path) 
                 "architecture": "Keep the change localized to `PlanPanel` and existing helper wiring.",
             },
             justification={"architecture": "Keeps the plan scoped."},
+            what_changed={"architecture": "Scoped change to PlanPanel and helper wiring."},
             review_prediction="Reviewer will still ask for missing sections.",
         ),
         RevisionResult(
@@ -973,6 +976,11 @@ async def test_revise_plan_retries_when_full_refiner_validation_fails(tmp_path) 
                 ),
             },
             justification={"implementation_steps": "Restores missing execution detail."},
+            what_changed={
+                "implementation_steps": "Added 3 steps for PlanPanel export UI.",
+                "test_strategy": "Added assertions for export button state and result display.",
+                "rollback_plan": "Added revert steps for PlanPanel wiring.",
+            },
             review_prediction="Reviewer should accept the completed plan.",
         ),
     ]
@@ -1135,6 +1143,7 @@ async def test_revise_plan_deterministically_supplements_partial_refiner_output(
                 "architecture": "",
             },
             justification={"architecture": "Keeps the plan scoped."},
+            what_changed={"architecture": "Cleared architecture to keep scope minimal."},
             review_prediction="Reviewer will still ask for missing execution detail.",
         )
 
@@ -1286,6 +1295,11 @@ async def test_revise_plan_preserves_localized_owner_files_and_test_target(tmp_p
                 ),
             },
             justification={"files_changed": "Keep the critique focused."},
+            what_changed={
+                "files_changed": "Added PlanPanel export button disable behavior.",
+                "implementation_steps": "Added 2 steps for localized UI flow and API reuse.",
+                "test_strategy": "Added assertions for export flow regression.",
+            },
             review_prediction="Reviewer should accept.",
         )
 
@@ -1869,6 +1883,9 @@ async def test_revise_plan_receives_reconsideration_candidates_from_impact_view(
                 )
             },
             justification={"architecture": "Addresses the pressured cache strategy decision."},
+            what_changed={
+                "architecture": "Specified SQLite as canonical, read-through cache, and session snapshot invalidation."
+            },
             review_prediction="Reviewer should accept the clarified cache ownership decision.",
         )
 

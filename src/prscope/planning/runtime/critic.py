@@ -530,11 +530,62 @@ class CriticAgent:
             raise CriticParseError("Unterminated JSON object in critic response")
         return raw[start:end], raw[end:].strip()
 
+    def _extract_review_json_object(self, raw: str) -> tuple[str, str]:
+        """Extract the review JSON, skipping prose-embedded objects like {\"status\": \"healthy\"}."""
+        required_keys = set(self.schema.required_fields)
+        fallback: tuple[str, str] | None = None
+        search_start = 0
+        while True:
+            start = raw.find("{", search_start)
+            if start < 0:
+                if fallback is not None:
+                    return fallback
+                raise CriticParseError("No JSON block found in critic response")
+            depth = 0
+            in_string = False
+            escaped = False
+            end = -1
+            for idx in range(start, len(raw)):
+                ch = raw[idx]
+                if in_string:
+                    if escaped:
+                        escaped = False
+                        continue
+                    if ch == "\\":
+                        escaped = True
+                        continue
+                    if ch == '"':
+                        in_string = False
+                    continue
+                if ch == '"':
+                    in_string = True
+                    continue
+                if ch == "{":
+                    depth += 1
+                elif ch == "}":
+                    depth -= 1
+                    if depth == 0:
+                        end = idx + 1
+                        break
+            if end < 0:
+                raise CriticParseError("Unterminated JSON object in critic response")
+            json_text = raw[start:end]
+            try:
+                data = json.loads(json_text)
+                if isinstance(data, dict):
+                    if required_keys.issubset(data.keys()):
+                        return json_text, raw[end:].strip()
+                    if fallback is None:
+                        fallback = (json_text, raw[end:].strip())
+            except json.JSONDecodeError:
+                pass
+            search_start = end
+
     def _parse_review_response(
         self,
         raw: str,
     ) -> ReviewResult:
-        json_text, prose = self._extract_first_json_object(raw)
+        json_text, prose = self._extract_review_json_object(raw)
         try:
             data = json.loads(json_text)
         except json.JSONDecodeError as exc:

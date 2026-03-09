@@ -1,17 +1,16 @@
-import { useState, useRef, useEffect, type ComponentType } from "react";
-import { AlertCircle, ShieldAlert, Target, X, MessageSquarePlus, CheckCircle2, Info } from "lucide-react";
+import { useState, useRef, useEffect, useMemo, type ComponentType } from "react";
+import { AlertCircle, ShieldAlert, X, MessageSquarePlus, CheckCircle2 } from "lucide-react";
 import { clsx } from "clsx";
 import { getRelatedDecisionSummaries } from "../lib/impactView";
 import type { ArchitectureImpactView, DecisionGraph, IssueGraphNode } from "../types";
 
 interface IssuePanelProps {
   openIssues: IssueGraphNode[];
-  rootIssues: IssueGraphNode[];
+  rootIssueIds?: string[];
   resolvedIssues: IssueGraphNode[];
   constraintViolations: string[];
   decisionGraph?: DecisionGraph | null;
   impactView?: ArchitectureImpactView | null;
-  rootCausesCount: number;
   onAppendIssue: (issue: IssueGraphNode) => void;
   onAppendAllIssues: () => void;
   onClose: () => void;
@@ -19,24 +18,34 @@ interface IssuePanelProps {
   initialTab?: Tab;
 }
 
-type Tab = "issues" | "violations" | "root-causes" | "resolved";
+type Tab = "issues" | "violations" | "resolved";
 
 export function IssuePanel({
   openIssues,
-  rootIssues,
+  rootIssueIds = [],
   resolvedIssues,
   constraintViolations,
   decisionGraph = null,
   impactView = null,
-  rootCausesCount,
   onAppendIssue,
   onAppendAllIssues,
   onClose,
   className,
-  initialTab = "root-causes",
+  initialTab = "issues",
 }: IssuePanelProps) {
   const [activeTab, setActiveTab] = useState<Tab>(initialTab);
   const panelRef = useRef<HTMLDivElement>(null);
+  const rootIssueIdSet = useMemo(() => new Set(rootIssueIds), [rootIssueIds]);
+  const sortedOpenIssues = useMemo(
+    () =>
+      [...openIssues].sort((a, b) => {
+        const aIsRoot = rootIssueIdSet.has(a.id);
+        const bIsRoot = rootIssueIdSet.has(b.id);
+        if (aIsRoot !== bIsRoot) return aIsRoot ? -1 : 1;
+        return a.id.localeCompare(b.id);
+      }),
+    [openIssues, rootIssueIdSet],
+  );
 
   useEffect(() => {
     setActiveTab(initialTab);
@@ -70,14 +79,6 @@ export function IssuePanel({
       {/* Tabs */}
       <div className="flex flex-wrap items-stretch gap-1 px-2 pt-2 border-b border-zinc-800/50 bg-zinc-900/50">
         <TabButton 
-          active={activeTab === "root-causes"} 
-          onClick={() => setActiveTab("root-causes")}
-          icon={Target}
-          label="Start Here"
-          count={rootCausesCount}
-          color="blue"
-        />
-        <TabButton 
           active={activeTab === "issues"} 
           onClick={() => setActiveTab("issues")}
           icon={AlertCircle}
@@ -107,11 +108,11 @@ export function IssuePanel({
       <div className="flex-1 overflow-y-auto p-4 min-h-[300px]">
         {activeTab === "issues" && (
           <div className="space-y-4">
-            {openIssues.length > 0 ? (
+            {sortedOpenIssues.length > 0 ? (
               <>
                 <div className="flex items-center justify-between mb-2">
                   <span className="text-xs text-zinc-500 font-medium uppercase tracking-wider">
-                    {openIssues.length} Open issues
+                    {sortedOpenIssues.length} Open issues
                   </span>
                   <button
                     onClick={onAppendAllIssues}
@@ -122,12 +123,13 @@ export function IssuePanel({
                   </button>
                 </div>
                 <div className="space-y-3">
-                  {openIssues.map((issue) => (
+                  {sortedOpenIssues.map((issue) => (
                     <IssueCard 
                       key={issue.id} 
                       issue={issue} 
                       decisionGraph={decisionGraph}
                       impactView={impactView}
+                      isRootCause={rootIssueIdSet.has(issue.id)}
                       onAdd={() => onAppendIssue(issue)} 
                     />
                   ))}
@@ -168,44 +170,6 @@ export function IssuePanel({
                 icon={CheckCircle2} 
                 title="No violations" 
                 description="The plan adheres to all defined constraints." 
-              />
-            )}
-          </div>
-        )}
-
-        {activeTab === "root-causes" && (
-          <div className="space-y-4">
-            {rootCausesCount > 0 ? (
-              <>
-                <div className="p-4 rounded-lg bg-blue-500/5 border border-blue-500/10 mb-4">
-                  <div className="flex gap-3">
-                    <Info className="w-5 h-5 text-blue-400 shrink-0 mt-0.5" />
-                    <div>
-                      <h4 className="text-sm font-medium text-blue-400 mb-1">Best place to start</h4>
-                      <p className="text-xs text-blue-300/80 leading-relaxed">
-                        These are the issues that do not appear to be caused by another issue in the current graph.
-                        Fixing one of these often clears several related follow-on issues.
-                      </p>
-                    </div>
-                  </div>
-                </div>
-                <div className="space-y-3">
-                  {rootIssues.map((issue) => (
-                    <IssueCard
-                      key={issue.id}
-                      issue={issue}
-                      decisionGraph={decisionGraph}
-                      impactView={impactView}
-                      onAdd={() => onAppendIssue(issue)}
-                    />
-                  ))}
-                </div>
-              </>
-            ) : (
-              <EmptyState 
-                icon={CheckCircle2} 
-                title="No starting issues" 
-                description="No standalone starting issues were found in the current graph." 
               />
             )}
           </div>
@@ -264,12 +228,11 @@ function TabButton({
   icon: ComponentType<{ className?: string }>; 
   label: string; 
   count: number;
-  color: "amber" | "red" | "blue" | "emerald";
+  color: "amber" | "red" | "emerald";
 }) {
   const colorStyles = {
     amber: active ? "text-amber-400 border-amber-500/50 bg-amber-500/10" : "text-zinc-400 hover:text-amber-300 hover:bg-zinc-800/50",
     red: active ? "text-red-400 border-red-500/50 bg-red-500/10" : "text-zinc-400 hover:text-red-300 hover:bg-zinc-800/50",
-    blue: active ? "text-blue-400 border-blue-500/50 bg-blue-500/10" : "text-zinc-400 hover:text-blue-300 hover:bg-zinc-800/50",
     emerald: active ? "text-emerald-400 border-emerald-500/50 bg-emerald-500/10" : "text-zinc-400 hover:text-emerald-300 hover:bg-zinc-800/50",
   };
 
@@ -301,6 +264,7 @@ function IssueCard({
   decisionGraph,
   impactView,
   onAdd,
+  isRootCause = false,
   canAdd = true,
   statusLabel,
   statusTone = "default",
@@ -311,6 +275,7 @@ function IssueCard({
   decisionGraph?: DecisionGraph | null;
   impactView?: ArchitectureImpactView | null;
   onAdd: () => void;
+  isRootCause?: boolean;
   canAdd?: boolean;
   statusLabel?: string;
   statusTone?: "default" | "resolved";
@@ -347,6 +312,11 @@ function IssueCard({
           )}>
             {severityLabel[severity]}
           </span>
+          {isRootCause ? (
+            <span className="text-[10px] px-2 py-0.5 rounded-full uppercase tracking-wider font-semibold border bg-indigo-500/10 text-indigo-300 border-indigo-500/20">
+              Root cause
+            </span>
+          ) : null}
           {statusLabel ? (
             <span
               className={clsx(

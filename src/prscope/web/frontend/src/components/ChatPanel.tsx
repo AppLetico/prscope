@@ -3,7 +3,7 @@ import type { ClarificationPrompt, DiscoveryQuestion, LiveActivityEntry, PlanFol
 import { OptionButtons } from "./OptionButtons";
 import { ToolCallStream } from "./ToolCallStream";
 import { ModelSelector } from "./ModelSelector";
-import { Send, Bot, User, Sparkles, Microscope, CheckCircle2, Copy, Check, Square, Loader2, ArrowRight, Zap, MessageSquare, X } from "lucide-react";
+import { Send, Bot, User, Sparkles, Microscope, CheckCircle2, Copy, Check, Square, Loader2, ArrowRight, Zap, MessageSquare, X, ChevronDown, ChevronRight } from "lucide-react";
 import { clsx } from "clsx";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -12,9 +12,7 @@ import { chatMarkdownComponents } from "../lib/markdownComponents";
 import {
   buildRefinementRoundSummaries,
   collapseTimelineForDisplay,
-  compactTimelineToRecentRounds,
   extractFirstJsonObject,
-  shouldShowActiveToolStream,
 } from "./chatPanelUtils";
 import type { TimelineItem } from "./chatPanelUtils";
 
@@ -136,6 +134,7 @@ export function ChatPanel({
   const [autoScroll, setAutoScroll] = useState(true);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [thinkingStatusTick, setThinkingStatusTick] = useState(0);
+  const [agentActivityExpanded, setAgentActivityExpanded] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const lastScrollTopRef = useRef(0);
@@ -365,7 +364,7 @@ export function ChatPanel({
   const hasPlanFollowupPanel = visiblePlanFollowups.length > 0 || (planFollowups?.suggestions?.length ?? 0) > 0;
   const canSendMessage = Boolean(input.trim() || focusPrompt?.text.trim());
   const displayedTimeline = useMemo(
-    () => compactTimelineToRecentRounds(collapseTimelineForDisplay(timeline)),
+    () => collapseTimelineForDisplay(timeline),
     [timeline],
   );
   const refinementRoundSummaries = useMemo(() => buildRefinementRoundSummaries(timeline), [timeline]);
@@ -413,12 +412,31 @@ export function ChatPanel({
       return "Prepared the next revision based on the review feedback.";
     }
     if (turn.role === "author" && raw.startsWith("Updated sections:")) {
-      const updatedSections = raw.split("\n")[0];
-      const primaryIssue = refinementRoundSummaries[turn.round]?.primaryIssue;
-      const reviewLine = primaryIssue
-        ? `Addressed review feedback: ${primaryIssue}`
-        : "Review and revision complete.";
-      return `${updatedSections}\n\n${reviewLine}\n\nReview the latest draft in the plan panel.`;
+      const lines = raw.split("\n");
+      const updatedSections = lines[0];
+      const problemUnderstanding = lines.find((l) => l.startsWith("Problem understanding:"))?.replace(/^Problem understanding:\s*/i, "").trim();
+      const reviewPrediction = lines.find((l) => l.startsWith("Review prediction:"))?.replace(/^Review prediction:\s*/i, "").trim();
+      const howWeAddressedIdx = lines.findIndex((l) => l.startsWith("How we addressed it:"));
+      const howWeAddressed =
+        howWeAddressedIdx >= 0
+          ? lines
+              .slice(howWeAddressedIdx + 1)
+              .filter((l) => l.trim())
+              .join("\n")
+              .trim()
+          : null;
+      const parts: string[] = [updatedSections];
+      if (howWeAddressed) {
+        parts.push(`How we addressed it:\n${howWeAddressed}`);
+      } else if (reviewPrediction) {
+        parts.push(`How we addressed it: ${reviewPrediction}`);
+      } else {
+        const primaryIssue = refinementRoundSummaries[turn.round]?.primaryIssue;
+        if (primaryIssue) parts.push(`Addressed review feedback: ${primaryIssue}`);
+        else if (problemUnderstanding) parts.push(`Problem understanding: ${problemUnderstanding}`);
+      }
+      parts.push("Review the latest draft in the plan panel.");
+      return parts.join("\n\n");
     }
     return raw;
   };
@@ -480,30 +498,6 @@ export function ChatPanel({
     ];
     return activityPhrases[(thinkingStatusTick - 1) % activityPhrases.length];
   }, [thinkingMessage, thinkingStatusTick]);
-  // const hasRunningActiveToolCalls = useMemo(
-  //   () => hasRunningToolCalls(activeToolCalls),
-  //   [activeToolCalls],
-  // );
-  const hasVisibleActiveToolStream = shouldShowActiveToolStream(activeToolCalls, isProcessing);
-  const draftingInProgress = useMemo(() => {
-    const phase = (phaseMessage ?? "").toLowerCase();
-    const thinking = (thinkingMessage ?? "").toLowerCase();
-    return phase.includes("draft") || thinking.includes("draft");
-  }, [phaseMessage, thinkingMessage]);
-  const placeholderDraftToolCalls = useMemo<ToolCallEntry[]>(
-    () => ([
-      {
-        id: "draft-placeholder",
-        call_id: "draft-placeholder",
-        name: "draft_plan",
-        sessionStage: "planner",
-        status: "running",
-        created_at: new Date().toISOString(),
-      },
-    ]),
-    [],
-  );
-  const showDraftPlaceholderToolStream = isProcessing && !hasVisibleActiveToolStream && draftingInProgress;
   const latestAuthorTurnKey = useMemo(() => {
     for (let idx = displayedTimeline.length - 1; idx >= 0; idx -= 1) {
       const item = displayedTimeline[idx];
@@ -514,17 +508,20 @@ export function ChatPanel({
   const liveStatusMessage = useMemo(() => {
     if (questions.length > 0 || pendingClarification) return null;
     const hasRunning = activeToolCalls.some((c) => c.status === "running");
-    if (hasVisibleActiveToolStream) return null;
     if (animatedThinkingMessage) return animatedThinkingMessage;
     if (phaseMessage && isProcessing && !hasRunning) return phaseMessage;
     if (hasRunning) return "Running tools...";
     if (isProcessing) return "Working...";
     return null;
-  }, [questions.length, pendingClarification, phaseMessage, animatedThinkingMessage, activeToolCalls, isProcessing, hasVisibleActiveToolStream]);
+  }, [questions.length, pendingClarification, phaseMessage, animatedThinkingMessage, activeToolCalls, isProcessing]);
   const visibleLiveActivities = useMemo(
     () => liveActivities.slice(-6).reverse(),
     [liveActivities],
   );
+  const hasAgentActivity = visibleLiveActivities.length > 0 || liveStatusMessage;
+  useEffect(() => {
+    if (!hasAgentActivity) setAgentActivityExpanded(false);
+  }, [hasAgentActivity]);
 
   return (
     <div className="h-full flex flex-col bg-zinc-950 relative">
@@ -576,7 +573,7 @@ export function ChatPanel({
               ? criticJson?.parsed.hard_constraint_violations.map((i) => String(i))
               : [];
             return (
-              <div 
+              <div
                 key={turnKey}
                 className="flex flex-col gap-2 animate-in slide-in-from-bottom-2 fade-in duration-300 ease-out"
               >
@@ -601,6 +598,13 @@ export function ChatPanel({
                         ? "bg-indigo-500/10 border border-indigo-500/20 text-indigo-100 rounded-tr-sm" 
                         : "bg-zinc-800/50 border border-zinc-700/50 text-zinc-200 rounded-tl-sm"
                     )}>
+                      {!isUser && turn.role === "critic" && (
+                        <div className="mb-2">
+                          <span className="inline-flex items-center rounded-full border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-300">
+                            Critic review
+                          </span>
+                        </div>
+                      )}
                       {!isUser && turn.role === "author" && turnKey === latestAuthorTurnKey && latestResponseMode && (
                         <div className="mb-2">
                           <span
@@ -702,69 +706,6 @@ export function ChatPanel({
                   </div>
                 </div>
               </div>
-            </div>
-          )}
-          {visibleLiveActivities.length > 0 && (
-            <div className="flex justify-start w-full animate-in slide-in-from-bottom-2 fade-in duration-200 ease-out">
-              <div className="ml-12 w-full max-w-2xl rounded-xl border border-zinc-800/80 bg-zinc-900/40 px-4 py-3 shadow-sm">
-                <div className="mb-3 flex items-center gap-2 text-[11px] font-semibold uppercase tracking-[0.18em] text-zinc-400">
-                  <Sparkles className="h-3.5 w-3.5 text-indigo-300" />
-                  Live Activity
-                </div>
-                <div className="space-y-2">
-                  {visibleLiveActivities.map((activity) => {
-                    const isDone = activity.status === "done" || activity.status === "complete";
-                    const isFailed = activity.status === "failed";
-                    const isThought = activity.kind === "thought";
-                    const isTool = activity.kind === "tool";
-                    return (
-                      <div key={activity.id} className="flex items-start gap-3 text-sm text-zinc-200">
-                        <div className="mt-0.5 shrink-0">
-                          {isFailed ? (
-                            <X className="h-3.5 w-3.5 text-rose-400" />
-                          ) : isDone ? (
-                            <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
-                          ) : isThought ? (
-                            <MessageSquare className="h-3.5 w-3.5 text-violet-300" />
-                          ) : isTool ? (
-                            <Microscope className="h-3.5 w-3.5 text-sky-300" />
-                          ) : (
-                            <ArrowRight className="h-3.5 w-3.5 text-amber-300" />
-                          )}
-                        </div>
-                        <div className="min-w-0 flex-1">
-                          <div className="flex flex-wrap items-center gap-2">
-                            <span className="leading-5 text-zinc-100">{activity.message}</span>
-                            {activity.count && activity.count > 1 && (
-                              <span className="rounded-full border border-zinc-700 bg-zinc-800 px-1.5 py-0.5 text-[10px] text-zinc-400">
-                                x{activity.count}
-                              </span>
-                            )}
-                            {activity.stage && (
-                              <span className="rounded-full border border-zinc-700/80 bg-zinc-800/70 px-1.5 py-0.5 text-[10px] uppercase tracking-wide text-zinc-400">
-                                {activity.stage.replace(/[_-]+/g, " ")}
-                              </span>
-                            )}
-                          </div>
-                        </div>
-                      </div>
-                    );
-                  })}
-                </div>
-              </div>
-            </div>
-          )}
-          {hasVisibleActiveToolStream && (
-            <div className="flex justify-start w-full animate-in slide-in-from-bottom-2 fade-in duration-200 ease-out">
-              <ToolCallStream toolCalls={activeToolCalls} forceRunning={isProcessing} />
-            </div>
-          )}
-          {showDraftPlaceholderToolStream && (
-            <div className="flex justify-start w-full animate-in slide-in-from-bottom-2 fade-in duration-200 ease-out">
-              <ToolCallStream
-                toolCalls={placeholderDraftToolCalls}
-                forceRunning
-              />
             </div>
           )}
           <div className="relative z-[60]">
@@ -1020,18 +961,8 @@ export function ChatPanel({
               </div>
             )}
           </div>
-          {(liveStatusMessage || warningSummary.length > 0) && (
+          {warningSummary.length > 0 && (
             <div className="mt-2 space-y-2 animate-in fade-in duration-200">
-              {liveStatusMessage && (
-                <div className="pl-12 flex items-center gap-2 text-xs text-zinc-300 llm-status-glow">
-                  <div className="flex gap-1">
-                    <div className="w-1 h-1 rounded-full bg-zinc-500 animate-bounce [animation-delay:-0.3s]"></div>
-                    <div className="w-1 h-1 rounded-full bg-zinc-500 animate-bounce [animation-delay:-0.15s]"></div>
-                    <div className="w-1 h-1 rounded-full bg-zinc-500 animate-bounce"></div>
-                  </div>
-                  <span className="llm-status-motion">{liveStatusMessage}</span>
-                </div>
-              )}
               {warningSummary.slice(-2).map((warning, idx) => (
                 <div
                   key={`warning-${idx}`}
@@ -1054,6 +985,80 @@ export function ChatPanel({
             ? "border-amber-500/30"
             : "border-zinc-700 focus-within:border-indigo-500/50"
         )}>
+          {/* Agent Activity - always visible as part of input, like Cursor */}
+          <div className="border-b border-zinc-700/80">
+            <button
+              type="button"
+              onClick={() => setAgentActivityExpanded((v) => !v)}
+              className="w-full flex items-center gap-2 px-4 py-2.5 text-left hover:bg-zinc-800/50 transition-colors"
+              aria-expanded={agentActivityExpanded}
+            >
+              {agentActivityExpanded ? (
+                <ChevronDown className="h-3.5 w-3.5 text-zinc-500 shrink-0" />
+              ) : (
+                <ChevronRight className="h-3.5 w-3.5 text-zinc-500 shrink-0" />
+              )}
+              <Sparkles className="h-3.5 w-3.5 text-indigo-300 shrink-0" />
+              <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-zinc-400">
+                Agent Activity
+              </span>
+              {visibleLiveActivities.length > 0 && (
+                <span className="rounded-full border border-zinc-700 bg-zinc-800 px-1.5 py-0.5 text-[10px] text-zinc-500">
+                  {visibleLiveActivities.length} task{visibleLiveActivities.length !== 1 ? "s" : ""}
+                </span>
+              )}
+              {liveStatusMessage && (
+                <Loader2 className="h-3.5 w-3.5 text-indigo-400 animate-spin shrink-0 ml-auto" />
+              )}
+            </button>
+            {agentActivityExpanded && (
+              <div className="border-t border-zinc-800/80 px-4 py-3">
+                {liveStatusMessage && (
+                  <div className={clsx("flex items-center gap-2 text-sm text-zinc-200", visibleLiveActivities.length > 0 && "mb-2")}>
+                    <span className="llm-status-motion">{liveStatusMessage}</span>
+                  </div>
+                )}
+                {visibleLiveActivities.length > 0 && (
+                  <div className="space-y-1.5 max-h-32 overflow-y-auto">
+                    {visibleLiveActivities.map((activity) => {
+                      const isDone = activity.status === "done" || activity.status === "complete";
+                      const isFailed = activity.status === "failed";
+                      const isThought = activity.kind === "thought";
+                      const isTool = activity.kind === "tool";
+                      return (
+                        <div key={activity.id} className="flex items-start gap-2 text-xs text-zinc-200">
+                          <div className="mt-0.5 shrink-0">
+                            {isFailed ? (
+                              <X className="h-3 w-3 text-rose-400" />
+                            ) : isDone ? (
+                              <CheckCircle2 className="h-3 w-3 text-emerald-400" />
+                            ) : isThought ? (
+                              <MessageSquare className="h-3 w-3 text-violet-300" />
+                            ) : isTool ? (
+                              <Microscope className="h-3 w-3 text-sky-300" />
+                            ) : (
+                              <ArrowRight className="h-3 w-3 text-amber-300" />
+                            )}
+                          </div>
+                          <div className="min-w-0 flex-1 truncate">
+                            <span className="text-zinc-100">{activity.message}</span>
+                            {activity.count && activity.count > 1 && (
+                              <span className="ml-1 text-zinc-500">x{activity.count}</span>
+                            )}
+                            {activity.stage && (
+                              <span className="ml-1.5 rounded border border-zinc-700/80 bg-zinc-800/70 px-1 py-0.5 text-[9px] uppercase tracking-wide text-zinc-500">
+                                {activity.stage.replace(/[_-]+/g, " ")}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
           {/* Textarea row */}
           {focusPrompt && (
             <div className="flex items-center gap-2 border-b border-zinc-700/80 px-4 pt-3 pb-2">
@@ -1083,7 +1088,7 @@ export function ChatPanel({
                 void handleSubmit();
               }
             }}
-            placeholder={isProcessing ? "Working on it..." : focusPrompt ? "Add any extra guidance..." : "Type a message..."}
+            placeholder={focusPrompt ? "Add any extra guidance..." : "Type a message..."}
             rows={1}
             style={{ height: "auto" }}
             onInput={(e) => {
@@ -1094,15 +1099,9 @@ export function ChatPanel({
           />
           {/* Footer row */}
           <div className="flex flex-wrap sm:flex-nowrap items-center justify-between gap-2 sm:gap-3 px-3 pb-3 pt-2 border-t border-zinc-700">
-            {/* Left: model selectors or processing status */}
+            {/* Left: model selectors */}
             <div className="flex items-center gap-2 min-w-0 order-2 sm:order-1 w-full sm:w-auto">
-              {isProcessing ? (
-                <div className="flex items-center gap-2.5 px-3 py-1.5 bg-amber-500/10 border border-amber-500/20 rounded-xl shadow-[0_0_15px_rgba(245,158,11,0.1)] animate-in fade-in duration-300">
-                  <Loader2 className="w-3.5 h-3.5 text-amber-400 animate-spin" />
-                  <span className="text-[11px] text-amber-400/90 font-bold tracking-widest uppercase">Working</span>
-                </div>
-              ) : (
-                <div className="flex items-center bg-zinc-900 border border-zinc-700/40 rounded-xl p-1 shadow-inner min-w-0 w-full sm:w-auto">
+              <div className={clsx("flex items-center bg-zinc-900 border border-zinc-700/40 rounded-xl p-1 shadow-inner min-w-0 w-full sm:w-auto", isProcessing && "opacity-70")}>
                   {authorModel !== undefined && onAuthorModelChange && (
                     <ModelSelector
                       label="Author"
@@ -1129,7 +1128,6 @@ export function ChatPanel({
                     </>
                   )}
                 </div>
-              )}
             </div>
 
             {/* Center: context dial */}

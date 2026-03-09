@@ -245,7 +245,7 @@ export function collapseTimelineForDisplay(timeline: TimelineItem[]): TimelineIt
     if (item.kind === "tool_group") {
       return !shouldHideCompletedToolGroup(item.group);
     }
-    return !isCollapsedCriticTurn(item.turn) && !isCollapsedRepairTurn(item.turn);
+    return !isCollapsedRepairTurn(item.turn);
   });
 }
 

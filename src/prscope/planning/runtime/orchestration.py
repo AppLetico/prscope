@@ -254,6 +254,8 @@ class PlanningRuntime:
                                 tracker.alias_duplicate(issue_id, canonical_issue.id)
                             if issue_id:
                                 tracker.canonical_issue_id(issue_id)
+            if not tracker.graph_snapshot().get("nodes"):
+                self._rehydrate_issue_tracker_from_turns(session_id, tracker)
             state = PlanningState(
                 session_id=session_id,
                 requirements=requirements,
@@ -287,6 +289,75 @@ class PlanningRuntime:
         if not state.constraints:
             state.constraints = self._constraints()
         return state
+
+    @staticmethod
+    def _split_issue_items(raw: str | None) -> list[str]:
+        return [item.strip() for item in str(raw or "").split(";") if item.strip()]
+
+    @staticmethod
+    def _normalize_issue_match_text(text: str) -> str:
+        return " ".join(text.strip().rstrip(".").split()).lower()
+
+    def _extract_critic_issues(self, content: str) -> list[tuple[str, str]]:
+        raw = str(content).strip()
+        if not raw.lower().startswith("design review:"):
+            return []
+        issues: list[tuple[str, str]] = []
+        primary_issue = re.search(r"^Primary issue:\s*(.+)$", raw, flags=re.IGNORECASE | re.MULTILINE)
+        if primary_issue and primary_issue.group(1).strip():
+            issues.append((primary_issue.group(1).strip(), "major"))
+        blocking_issues = re.search(r"^Blocking issues:\s*(.+)$", raw, flags=re.IGNORECASE | re.MULTILINE)
+        for item in self._split_issue_items(blocking_issues.group(1) if blocking_issues else None):
+            issues.append((item, "major"))
+        recommended = re.search(r"^Recommended changes:\s*(.+)$", raw, flags=re.IGNORECASE | re.MULTILINE)
+        for item in self._split_issue_items(recommended.group(1) if recommended else None):
+            issues.append((item, "minor"))
+        unique: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for description, severity in issues:
+            key = self._normalize_issue_match_text(description)
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            unique.append((description, severity))
+        return unique
+
+    def _extract_targeted_issue_from_user_message(self, content: str) -> str | None:
+        first_line = str(content).splitlines()[0].strip()
+        match = re.match(r"^Please update the plan to address\s+(.+)$", first_line, flags=re.IGNORECASE)
+        if not match:
+            return None
+        return match.group(1).strip().rstrip(".")
+
+    def _resolve_rehydrated_issue(self, tracker: IssueTracker, description: str, round_number: int) -> None:
+        target = self._normalize_issue_match_text(description)
+        if not target:
+            return
+        for issue in tracker.open_issues():
+            candidate = self._normalize_issue_match_text(str(issue.description or ""))
+            if candidate == target or candidate in target or target in candidate:
+                tracker.resolve_issue(
+                    issue.id,
+                    round_number,
+                    propagate_causes=False,
+                    resolution_source="lightweight",
+                )
+                return
+
+    def _rehydrate_issue_tracker_from_turns(self, session_id: str, tracker: IssueTracker) -> None:
+        for turn in self.store.get_planning_turns(session_id):
+            if turn.role == "critic":
+                for description, severity in self._extract_critic_issues(turn.content):
+                    tracker.add_issue(
+                        description,
+                        turn.round,
+                        severity="minor" if severity == "minor" else "major",
+                        source="critic",
+                    )
+            elif turn.role == "user":
+                targeted_issue = self._extract_targeted_issue_from_user_message(turn.content)
+                if targeted_issue:
+                    self._resolve_rehydrated_issue(tracker, targeted_issue, turn.round)
 
     def _repo_memory(self, state: PlanningState) -> dict[str, str]:
         return self._context_assembler.repo_memory(state)
@@ -327,8 +398,14 @@ class PlanningRuntime:
     def _persist_state_snapshot(self, session_id: str) -> None:
         self._snapshot_io.persist_state_snapshot(session_id)
 
+    def persist_state_snapshot(self, session_id: str) -> None:
+        self._snapshot_io.persist_state_snapshot(session_id)
+
     def read_state_snapshot(self, session_id: str) -> dict[str, Any] | None:
         return self._snapshot_io.read_state_snapshot(session_id)
+
+    def current_state_snapshot(self, session_id: str) -> dict[str, Any] | None:
+        return self._snapshot_io.current_state_snapshot(session_id)
 
     def list_state_snapshots(self) -> list[dict[str, Any]]:
         return self._snapshot_io.list_state_snapshots()
@@ -681,8 +758,9 @@ class PlanningRuntime:
         current_version_id: int | None,
         previous_graph_json: str | None = None,
     ) -> tuple[str, str]:
+        open_questions = getattr(plan_document, "open_questions", "")
         compatibility_graph = decision_graph_from_plan(
-            open_questions=getattr(plan_document, "open_questions", ""),
+            open_questions=open_questions,
             plan_content=plan_content,
         )
         previous_graph = decision_graph_from_json(previous_graph_json)
@@ -692,6 +770,7 @@ class PlanningRuntime:
                 compatibility_graph,
                 current_graph,
                 carry_forward_unresolved=True,
+                open_questions_current=open_questions,
             )
         followups = self._followup_engine.generate(
             current_graph=current_graph,

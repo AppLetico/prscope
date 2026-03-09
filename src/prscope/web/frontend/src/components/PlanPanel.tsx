@@ -43,7 +43,7 @@ export function PlanPanel({
 }: PlanPanelProps) {
   const [copied, setCopied] = useState(false);
   const [showIssuesPopup, setShowIssuesPopup] = useState(false);
-  const [activeIssueTab, setActiveIssueTab] = useState<"issues" | "violations" | "root-causes" | "resolved">("root-causes");
+  const [activeIssueTab, setActiveIssueTab] = useState<"issues" | "violations" | "resolved">("issues");
   const issuesPopupRef = useRef<HTMLDivElement>(null);
   const toolbarRef = useRef<HTMLDivElement>(null);
   const mermaidRef = useRef<HTMLDivElement>(null);
@@ -114,23 +114,20 @@ export function PlanPanel({
   const resolvedIssues = (health?.issueGraph?.nodes?.filter((node) => node.status === "resolved") ?? [])
     .slice()
     .sort((a, b) => a.id.localeCompare(b.id)) as IssueGraphNode[];
-  const rootIssues = (() => {
-    const nodes = health?.issueGraph?.nodes ?? [];
-    const edges = health?.issueGraph?.edges ?? [];
-    const parents = new Map<string, Set<string>>();
-    for (const edge of edges) {
-      if (edge.relation !== "causes") continue;
-      const current = parents.get(edge.target) ?? new Set<string>();
-      current.add(edge.source);
-      parents.set(edge.target, current);
-    }
-    return nodes
-      .filter((node) => node.status === "open" && !(parents.get(node.id)?.size))
-      .sort((a, b) => a.id.localeCompare(b.id));
+  const rootIssueIds = (() => {
+    const issueGraph = health?.issueGraph;
+    if (!issueGraph) return [] as string[];
+    const causedIssueIds = new Set(
+      issueGraph.edges
+        .filter((edge) => edge.relation === "causes")
+        .map((edge) => edge.target),
+    );
+    return openIssues
+      .filter((issue) => !causedIssueIds.has(issue.id))
+      .map((issue) => issue.id);
   })();
-  const rootCausesCount = health?.issueGraph?.summary?.root_open ?? 0;
   const constraintViolationsCount = health?.constraintViolationsCount ?? 0;
-  const reviewItemsCount = (health?.openIssuesCount ?? 0) + constraintViolationsCount + rootCausesCount;
+  const reviewItemsCount = (health?.openIssuesCount ?? 0) + constraintViolationsCount;
   const reviewLabel = reviewItemsCount > 0 ? `${reviewItemsCount} review notes` : "Review notes";
   const pressuredDecisions = getPressuredDecisions(impactView);
   const pressuredDecisionCount = pressuredDecisions.length;
@@ -173,7 +170,14 @@ export function PlanPanel({
                   <button 
                     type="button"
                     onClick={() => {
-                      setActiveIssueTab("root-causes");
+                      const nextTab = openIssues.length > 0
+                        ? "issues"
+                        : constraintViolationsCount > 0
+                          ? "violations"
+                          : resolvedIssues.length > 0
+                            ? "resolved"
+                            : "issues";
+                      setActiveIssueTab(nextTab);
                       setShowIssuesPopup(!showIssuesPopup);
                     }}
                     className={clsx(
@@ -191,12 +195,11 @@ export function PlanPanel({
                 {showIssuesPopup && (
                   <IssuePanel
                     openIssues={openIssues}
-                    rootIssues={rootIssues}
+                    rootIssueIds={rootIssueIds}
                     resolvedIssues={resolvedIssues}
                     constraintViolations={health.constraintViolations ?? []}
                     decisionGraph={decisionGraph}
                     impactView={impactView}
-                    rootCausesCount={rootCausesCount}
                     onAppendIssue={appendIssuePrompt}
                     onAppendAllIssues={appendAllIssuesPrompt}
                     onClose={() => setShowIssuesPopup(false)}

@@ -19,12 +19,7 @@ class RuntimeStateSnapshots:
             return asdict(value)
         return value
 
-    def persist_state_snapshot(self, session_id: str) -> None:
-        state = self._runtime._states.get(session_id)
-        if state is None:
-            return
-        sessions_dir = self._runtime.repo.resolved_path / ".prscope" / "sessions"
-        sessions_dir.mkdir(parents=True, exist_ok=True)
+    def _payload_from_state(self, state: Any) -> dict[str, Any]:
         issue_entries: list[dict[str, Any]] = []
         issue_graph: dict[str, Any] = {
             "nodes": [],
@@ -45,7 +40,7 @@ class RuntimeStateSnapshots:
             snapshot = state.issue_tracker.graph_snapshot()
             if isinstance(snapshot, dict):
                 issue_graph = snapshot
-        payload: dict[str, Any] = {
+        return {
             "schema_version": self._schema_version,
             "session_id": state.session_id,
             "requirements": state.requirements,
@@ -72,6 +67,31 @@ class RuntimeStateSnapshots:
             "critic_completion_tokens": state.critic_completion_tokens,
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
+
+    def current_state_snapshot(self, session_id: str) -> dict[str, Any] | None:
+        state = self._runtime._states.get(session_id)
+        if state is None:
+            payload = self.read_state_snapshot(session_id)
+            issue_graph = payload.get("issue_graph") if isinstance(payload, dict) else None
+            issue_nodes = issue_graph.get("nodes") if isinstance(issue_graph, dict) else None
+            if isinstance(payload, dict) and isinstance(issue_nodes, list) and issue_nodes:
+                return payload
+            bootstrapped_state = self._runtime._state(session_id)
+            recovered = self._payload_from_state(bootstrapped_state)
+            if not isinstance(payload, dict):
+                return recovered
+            payload["open_issues"] = recovered.get("open_issues", [])
+            payload["issue_graph"] = recovered.get("issue_graph")
+            payload["updated_at"] = datetime.now(timezone.utc).isoformat()
+            return payload
+        return self._payload_from_state(state)
+
+    def persist_state_snapshot(self, session_id: str) -> None:
+        payload = self.current_state_snapshot(session_id)
+        if payload is None:
+            return
+        sessions_dir = self._runtime.repo.resolved_path / ".prscope" / "sessions"
+        sessions_dir.mkdir(parents=True, exist_ok=True)
         snapshot_path = sessions_dir / f"{session_id}.json"
         snapshot_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 

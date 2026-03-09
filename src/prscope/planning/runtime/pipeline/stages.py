@@ -1713,6 +1713,7 @@ class PlanningStages:
                             != str(getattr(supplemented_plan, section, ""))
                         },
                         justification=dict(revision_result.justification),
+                        what_changed=dict(revision_result.what_changed),
                         review_prediction=revision_result.review_prediction,
                     )
                     updated_plan = supplemented_plan
@@ -1751,10 +1752,12 @@ class PlanningStages:
             candidate_graph,
             previous_graph,
             carry_forward_unresolved=True,
+            open_questions_current=updated_plan.open_questions,
         )
-        canonical_open_questions = self._open_questions_from_graph(reconciled_graph)
-        if updated_plan.open_questions != canonical_open_questions:
-            updated_plan = apply_section_updates(updated_plan, {"open_questions": canonical_open_questions})
+        if "open_questions" not in revision_result.updates:
+            canonical_open_questions = self._open_questions_from_graph(reconciled_graph)
+            if updated_plan.open_questions != canonical_open_questions:
+                updated_plan = apply_section_updates(updated_plan, {"open_questions": canonical_open_questions})
         updated_markdown = render_markdown(updated_plan)
         changed_sections = sorted(
             section
@@ -1792,13 +1795,26 @@ class PlanningStages:
             duration_ms=round((time.perf_counter() - revise_started) * 1000),
             query=" | ".join(summary_bits) if summary_bits else None,
         )
+        resolution_bits: list[str] = []
+        for sec in changed_sections:
+            concrete = revision_result.what_changed.get(sec, "").strip()
+            if concrete:
+                resolution_bits.append(f"{sec}: {concrete}")
+            else:
+                why = revision_result.justification.get(sec, "").strip()
+                if why:
+                    resolution_bits.append(f"{sec}: {why}")
+        resolution_block = "\n".join(resolution_bits) if resolution_bits else ""
+        turn_lines = [
+            f"Updated sections: {', '.join(changed_sections) if changed_sections else '(none)'}",
+            f"Problem understanding: {revision_result.problem_understanding}",
+            f"Review prediction: {revision_result.review_prediction}",
+        ]
+        if resolution_block:
+            turn_lines.append(f"How we addressed it:\n{resolution_block}")
         ctx.core.add_turn(
             "author",
-            (
-                f"Updated sections: {', '.join(changed_sections) if changed_sections else '(none)'}\n\n"
-                f"Problem understanding: {revision_result.problem_understanding}\n"
-                f"Review prediction: {revision_result.review_prediction}"
-            ),
+            "\n\n".join(turn_lines),
             round_number=ctx.round_number,
         )
         return updated_markdown, changed_sections, revision_result

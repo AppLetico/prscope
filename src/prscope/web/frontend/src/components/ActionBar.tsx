@@ -1,10 +1,11 @@
 import type { DraftTimingDiagnostics, RoundMetric, SessionStatus } from "../types";
-import { ChevronDown, Trash2 } from "lucide-react";
+import { ChevronDown, GitBranch, Trash2 } from "lucide-react";
 import { Link } from "react-router-dom";
 import { clsx } from "clsx";
 import { useRef, useEffect, useState, useMemo } from "react";
 import { Tooltip } from "./ui/Tooltip";
 
+import { formatDiagnosticsSource, formatInvestigationDensity } from "./actionBarDiagnostics";
 import { ThemeToggle } from "./ThemeToggle";
 
 interface ActionBarProps {
@@ -19,6 +20,7 @@ interface ActionBarProps {
   contextPercent?: number | null;
   contextCompactionEnabled?: boolean;
   routingDiagnostics?: DraftTimingDiagnostics | null;
+  routingDiagnosticsSource?: string | null;
   onDelete?: () => void;
   roundMetrics?: RoundMetric[];
 }
@@ -28,6 +30,25 @@ function scoreColor(score: number | null | undefined): string {
   if (score >= 0.85) return "text-emerald-400";
   if (score >= 0.65) return "text-amber-400";
   return "text-rose-400";
+}
+
+function MetricRow({
+  label,
+  value,
+  highlight = false,
+}: {
+  label: string;
+  value: number | string;
+  highlight?: boolean;
+}) {
+  return (
+    <div className="flex justify-between items-baseline gap-2">
+      <span className="text-zinc-500 truncate">{label}</span>
+      <span className={clsx("font-mono tabular-nums shrink-0", highlight ? "text-zinc-200" : "text-zinc-600")}>
+        {value}
+      </span>
+    </div>
+  );
 }
 
 export function ActionBar({
@@ -40,13 +61,16 @@ export function ActionBar({
   maxPromptTokens = 0,
   contextCompactionEnabled = false,
   routingDiagnostics = null,
+  routingDiagnosticsSource = null,
   onDelete,
   roundMetrics,
 }: ActionBarProps) {
   const [moreOpen, setMoreOpen] = useState(false);
   const [convOpen, setConvOpen] = useState(false);
+  const [routingOpen, setRoutingOpen] = useState(false);
   const moreRef = useRef<HTMLDivElement>(null);
   const convRef = useRef<HTMLDivElement>(null);
+  const routingRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     if (!moreOpen) return;
@@ -70,6 +94,17 @@ export function ActionBar({
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, [convOpen]);
 
+  useEffect(() => {
+    if (!routingOpen) return;
+    const handleClickOutside = (e: MouseEvent) => {
+      if (routingRef.current && !routingRef.current.contains(e.target as Node)) {
+        setRoutingOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [routingOpen]);
+
   const sortedMetrics = useMemo(
     () => (roundMetrics ? [...roundMetrics].sort((a, b) => b.round - a.round) : []),
     [roundMetrics],
@@ -90,6 +125,7 @@ export function ActionBar({
   const investigationTriggerRate = Number(routingDiagnostics?.investigation_trigger_rate ?? 0);
   const avgRefinementTurnTokens = Number(routingDiagnostics?.average_refinement_turn_tokens ?? 0);
   const lastInvestigationReason = String(routingDiagnostics?.investigation_trigger_reason_last ?? "");
+  const diagnosticsSource = formatDiagnosticsSource(routingDiagnosticsSource);
 
   const totalCost = useMemo(
     () => sortedMetrics.reduce((sum, m) => sum + (m.call_cost_usd ?? 0), 0),
@@ -188,8 +224,8 @@ export function ActionBar({
                       <>
                         <span className="text-[10px] font-mono text-zinc-500 hidden sm:inline-block">review</span>
                         <span className="text-[10px] font-mono text-zinc-300">R{latestScoredRound}</span>
-                        <span className="hidden sm:inline-flex rounded-full border border-amber-500/30 bg-amber-500/10 px-1.5 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-amber-400">
-                          stale
+                        <span className="hidden sm:inline-flex items-center rounded-md border border-amber-500/30 bg-amber-500/10 px-2 py-0.5 text-[10px] font-medium text-amber-400 whitespace-nowrap">
+                          Needs re-review
                         </span>
                       </>
                     ) : (
@@ -229,7 +265,7 @@ export function ActionBar({
                             <span className="font-mono text-zinc-200">R{latestScoredRound}</span>
                           </span>
                           <span className="ml-auto inline-flex items-center rounded-full bg-amber-400/10 px-2 py-0.5 text-[10px] font-medium text-amber-400 ring-1 ring-inset ring-amber-400/20">
-                            Stale Score
+                            Needs re-review
                           </span>
                         </div>
                         <p className="text-[11px] leading-relaxed text-amber-200/80">
@@ -356,38 +392,92 @@ export function ActionBar({
             </Tooltip>
           )}
           {routingDecisionCount > 0 && (
-            <Tooltip
-              content={(
-                <div className="space-y-1 text-[11px]">
-                  <div>Routing decisions: {routingDecisionCount}</div>
-                  <div>Heuristic: {routingHeuristicCount}</div>
-                  <div>Model: {routingModelCount}</div>
-                  <div>Fallback: {routingFallbackCount}</div>
-                  <div>Author chat: {routeAuthorChatCount}</div>
-                  <div>Lightweight refine: {routeLightweightCount}</div>
-                  <div>Full refine: {routeFullRefineCount}</div>
-                  <div>Existing-feature routes: {routeExistingFeatureCount}</div>
-                  <div>Refinement turns: {refinementTurnCount}</div>
-                  <div>Investigations: {investigationTriggerCount}</div>
-                  <div>Trigger rate: {Math.round(investigationTriggerRate * 100)}%</div>
-                  <div>Avg refine tokens: {Math.round(avgRefinementTurnTokens)}</div>
-                  {lastInvestigationReason ? <div>Last trigger: {lastInvestigationReason}</div> : null}
+            <div className={clsx("relative", routingOpen && "z-[9999]")} ref={routingRef}>
+              <button
+                type="button"
+                onClick={() => setRoutingOpen((v) => !v)}
+                className={clsx(
+                  "flex items-center gap-1.5 px-2 py-1 rounded-md border transition-colors text-[11px] font-medium",
+                  routingOpen
+                    ? "bg-cyan-500/20 border-cyan-500/40 text-cyan-300"
+                    : "text-cyan-400 bg-cyan-500/10 border-cyan-500/20 hover:bg-cyan-500/15 hover:border-cyan-500/30"
+                )}
+                aria-expanded={routingOpen}
+                aria-haspopup="true"
+                title="Internal routing diagnostics"
+              >
+                <GitBranch className="w-3.5 h-3.5 shrink-0" />
+                <span>routing {routingDecisionCount}</span>
+                <ChevronDown className={clsx("w-3 h-3 shrink-0 transition-transform", routingOpen && "rotate-180")} />
+              </button>
+              {routingOpen && (
+                <div className="absolute right-0 top-full mt-2 w-[280px] rounded-xl border border-zinc-800 bg-zinc-900 shadow-2xl z-[100] overflow-hidden">
+                  <div className="p-3 border-b border-zinc-800 bg-zinc-950/50">
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <GitBranch className="w-4 h-4 text-cyan-400 shrink-0" />
+                        <span className="text-xs font-semibold text-zinc-200">Routing Diagnostics</span>
+                      </div>
+                      <span className="inline-flex items-center rounded-full border border-zinc-700/60 bg-zinc-800/70 px-2 py-0.5 text-[10px] font-medium text-zinc-300">
+                        {diagnosticsSource.label}
+                      </span>
+                    </div>
+                    <div className="mt-1 text-[10px] text-zinc-500">
+                      Internal counters for request routing and refinement heuristics.
+                    </div>
+                    <div className="mt-2 text-[10px] text-zinc-600">
+                      {diagnosticsSource.detail}
+                    </div>
+                  </div>
+                  <div className="p-3 space-y-4">
+                    <section>
+                      <div className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider mb-2">Decision source</div>
+                      <div className="space-y-1.5 text-[11px]">
+                        <MetricRow label="Heuristic" value={routingHeuristicCount} highlight={routingHeuristicCount > 0} />
+                        <MetricRow label="Model" value={routingModelCount} highlight={routingModelCount > 0} />
+                        <MetricRow label="Fallback" value={routingFallbackCount} highlight={routingFallbackCount > 0} />
+                      </div>
+                    </section>
+                    <section>
+                      <div className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider mb-2">Routes</div>
+                      <div className="space-y-1.5 text-[11px]">
+                        <MetricRow label="Author chat" value={routeAuthorChatCount} highlight={routeAuthorChatCount > 0} />
+                        <MetricRow label="Lightweight refine" value={routeLightweightCount} highlight={routeLightweightCount > 0} />
+                        <MetricRow label="Full refine" value={routeFullRefineCount} highlight={routeFullRefineCount > 0} />
+                        <MetricRow label="Existing feature" value={routeExistingFeatureCount} highlight={routeExistingFeatureCount > 0} />
+                      </div>
+                    </section>
+                    <section>
+                      <div className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider mb-2">Refinement loop</div>
+                      <div className="space-y-1.5 text-[11px]">
+                        <MetricRow label="Turns observed" value={refinementTurnCount} highlight={refinementTurnCount > 0} />
+                        <MetricRow label="Avg tokens/turn" value={Math.round(avgRefinementTurnTokens)} highlight={avgRefinementTurnTokens > 0} />
+                      </div>
+                    </section>
+                    <section>
+                      <div className="text-[10px] font-semibold text-zinc-500 uppercase tracking-wider mb-2">Investigations</div>
+                      <div className="space-y-1.5 text-[11px]">
+                        <MetricRow label="Triggered" value={investigationTriggerCount} highlight={investigationTriggerCount > 0} />
+                        <MetricRow
+                          label="Triggers / turn"
+                          value={formatInvestigationDensity(investigationTriggerRate)}
+                          highlight={investigationTriggerRate > 0}
+                        />
+                      </div>
+                      {lastInvestigationReason && (
+                        <div className="mt-2 pt-2 border-t border-zinc-800">
+                          <div className="text-[10px] text-zinc-500 mb-0.5">Last trigger</div>
+                          <div className="text-[11px] text-zinc-300 leading-snug">{lastInvestigationReason}</div>
+                        </div>
+                      )}
+                    </section>
+                    <div className="border-t border-zinc-800 pt-3 text-[10px] leading-relaxed text-zinc-500">
+                      These diagnostics describe internal routing behavior. They do not represent critique rounds or review-note counts.
+                    </div>
+                  </div>
                 </div>
               )}
-            >
-              <span className="text-cyan-400 bg-cyan-500/10 px-1.5 py-0.5 rounded border border-cyan-500/20">
-                routing {routingDecisionCount}
-              </span>
-            </Tooltip>
-          )}
-          {investigationTriggerCount > 0 && (
-            <Tooltip
-              content={`Evidence refresh triggered ${investigationTriggerCount} times across ${Math.max(refinementTurnCount, 1)} refinement turns.`}
-            >
-              <span className="text-amber-400 bg-amber-500/10 px-1.5 py-0.5 rounded border border-amber-500/20">
-                investigate {Math.round(investigationTriggerRate * 100)}%
-              </span>
-            </Tooltip>
+            </div>
           )}
         </div>
 

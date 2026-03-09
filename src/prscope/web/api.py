@@ -1257,6 +1257,12 @@ def create_app() -> FastAPI:
                         "allowed_commands": _allowed_commands_for(session, store),
                     }
                 )
+            logger.info(
+                "command conflict session_id={} command={} reason=invalid_status detail={}",
+                session_id,
+                command,
+                str(exc),
+            )
             raise HTTPException(status_code=409, detail=detail) from exc
         except CommandConflictError as exc:
             session = store.get_planning_session(session_id)
@@ -1269,12 +1275,26 @@ def create_app() -> FastAPI:
                         "allowed_commands": _allowed_commands_for(session, store),
                     }
                 )
+            logger.info(
+                "command conflict session_id={} command={} reason={} status={} phase_message={}",
+                session_id,
+                command,
+                exc.reason,
+                detail.get("status", ""),
+                detail.get("phase_message", ""),
+            )
             raise HTTPException(status_code=409, detail=detail) from exc
         except ValueError as exc:
             message = str(exc)
             if message == "session not found":
                 raise HTTPException(status_code=404, detail="session not found") from exc
             session = store.get_planning_session(session_id)
+            if session is not None:
+                try:
+                    _, _, runtime = _runtime_for(repo_name=session.repo_name)
+                    runtime.persist_state_snapshot(session_id)
+                except Exception:  # noqa: BLE001
+                    logger.debug("failed to persist snapshot for command failure session_id={}", session_id)
             detail: dict[str, Any] = {"reason": "command_failed", "detail": message}
             if session is not None:
                 detail.update(
@@ -1284,6 +1304,12 @@ def create_app() -> FastAPI:
                         "allowed_commands": _allowed_commands_for(session, store),
                     }
                 )
+            logger.info(
+                "command conflict session_id={} command={} reason=command_failed detail={}",
+                session_id,
+                command,
+                message,
+            )
             raise HTTPException(status_code=409, detail=detail) from exc
 
     app.add_middleware(
@@ -1574,7 +1600,7 @@ def create_app() -> FastAPI:
         impact_view: dict[str, Any] | None = None
         try:
             _, _, runtime = _runtime_for(repo_name=session.repo_name)
-            snapshot_payload = runtime.read_state_snapshot(session_id)
+            snapshot_payload = runtime.current_state_snapshot(session_id)
             if isinstance(snapshot_payload, dict):
                 graph = snapshot_payload.get("issue_graph")
                 if isinstance(graph, dict):
@@ -1682,7 +1708,7 @@ def create_app() -> FastAPI:
     ) -> dict[str, Any]:
         repo_name = _repo_for_session(session_id, repo)
         _, _, runtime = _runtime_for(repo_name=repo_name)
-        payload = runtime.read_state_snapshot(session_id)
+        payload = runtime.current_state_snapshot(session_id)
         if payload is None:
             raise HTTPException(status_code=404, detail="snapshot not found")
         return {"snapshot": payload}

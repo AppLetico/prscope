@@ -206,7 +206,6 @@ export interface RoundMetric {
   call_cost_usd?: number | null;
   issue_graph_summary?: {
     open_total: number;
-    root_open: number;
     resolved_total: number;
     unresolved_dependency_chains?: number;
   } | null;
@@ -246,7 +245,6 @@ export interface IssueGraphSnapshot {
   duplicate_alias?: Record<string, string>;
   summary?: {
     open_total?: number;
-    root_open?: number;
     resolved_total?: number;
     open_major?: number;
     open_minor?: number;

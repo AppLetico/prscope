@@ -87,6 +87,7 @@ class RevisionResult:
     problem_understanding: str
     updates: dict[str, str]
     justification: dict[str, str]
+    what_changed: dict[str, str]  # section_id -> one-sentence concrete description of what was added/changed
     review_prediction: str
 
 
