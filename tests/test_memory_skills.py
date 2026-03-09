@@ -50,6 +50,7 @@ async def test_memory_complete_emits_usage_without_logging_format_error(monkeypa
         choices=[SimpleNamespace(message=SimpleNamespace(content="summary block"))],
         usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5),
     )
+
     def _completion(**kwargs):
         calls.append(kwargs)
         return fake_response

@@ -22,8 +22,8 @@ from .authoring.discovery import (
     requirements_keywords,
 )
 from .authoring.models import (
-    AttemptContext,
     ArchitectureDesign,
+    AttemptContext,
     AuthorResult,
     DesignRecord,
     EvidenceBundle,
@@ -552,7 +552,9 @@ class AuthorAgent:
             "existing_components": list((evidence_bundle.existing_components if evidence_bundle else ())[:12]),
             "test_targets": list((evidence_bundle.test_targets if evidence_bundle else ())[:8]),
             "related_modules": list((evidence_bundle.related_modules if evidence_bundle else ())[:8]),
-            "existing_routes_or_helpers": list((evidence_bundle.existing_routes_or_helpers if evidence_bundle else ())[:10]),
+            "existing_routes_or_helpers": list(
+                (evidence_bundle.existing_routes_or_helpers if evidence_bundle else ())[:10]
+            ),
             "evidence_notes": list((evidence_bundle.evidence_notes if evidence_bundle else ())[:8]),
         }
         attempt_payload = {
@@ -848,6 +850,7 @@ class AuthorAgent:
         simplest_possible_design: str | None = None,
         revision_hints: list[str] | None = None,
         reconsideration_candidates: list[dict[str, Any]] | None = None,
+        supplemental_evidence: dict[str, Any] | None = None,
     ) -> RevisionResult:
         return await AuthorRepairService(self._llm_call, self._emit).revise_plan(
             repair_plan=repair_plan,
@@ -860,6 +863,7 @@ class AuthorAgent:
             simplest_possible_design=simplest_possible_design,
             revision_hints=revision_hints,
             reconsideration_candidates=reconsideration_candidates,
+            supplemental_evidence=supplemental_evidence,
         )
 
     def incremental_grounding_failures(

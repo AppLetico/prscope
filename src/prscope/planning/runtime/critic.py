@@ -30,7 +30,9 @@ PERSPECTIVE_SYNTHESIS_BUDGET_SECONDS = 45.0
 
 SCOPE_EXPANSION_PATTERNS = (
     re.compile(r"\bauthentication\b|\bauthorization\b|\bunauthorized\b", re.IGNORECASE),
-    re.compile(r"\bdependency checks?\b|\bcritical dependencies\b|\bexternal services?\b|\bdatabase checks?\b", re.IGNORECASE),
+    re.compile(
+        r"\bdependency checks?\b|\bcritical dependencies\b|\bexternal services?\b|\bdatabase checks?\b", re.IGNORECASE
+    ),
     re.compile(r"\bconcurrency\b|\bhigh[- ]load\b|\brace conditions?\b", re.IGNORECASE),
     re.compile(r"\blogging\b|\bmonitoring\b|\btelemetry\b|\bobservability\b", re.IGNORECASE),
     re.compile(r"\bstartup/shutdown\b|\bdocument(?:ation)?\b", re.IGNORECASE),
@@ -59,7 +61,9 @@ LOCALIZED_REUSE_SCOPE_PATTERNS = (
         re.IGNORECASE,
     ),
     re.compile(r"\bfeature flags?\b|\broll out changes incrementally\b", re.IGNORECASE),
-    re.compile(r"\bdedicated .* context\b|\bdedicated .* hook\b|\bcentralized state management solution\b", re.IGNORECASE),
+    re.compile(
+        r"\bdedicated .* context\b|\bdedicated .* hook\b|\bcentralized state management solution\b", re.IGNORECASE
+    ),
 )
 
 
@@ -601,11 +605,18 @@ class CriticAgent:
         lowered = str(requirements or "").lower()
         if not any(token in lowered for token in ("reuse", "existing", "keep the current", "during rollout")):
             return False
-        if not any(token in lowered for token in ("actionbar", "planpanel", "planningview", "frontend", "react", "component", "ui")):
+        if not any(
+            token in lowered
+            for token in ("actionbar", "planpanel", "planningview", "frontend", "react", "component", "ui")
+        ):
             return False
         return any(
             token in lowered
-            for token in ("instead of creating new endpoints", "do not add new endpoints", "without adding backend endpoints")
+            for token in (
+                "instead of creating new endpoints",
+                "do not add new endpoints",
+                "without adding backend endpoints",
+            )
         )
 
     @staticmethod
@@ -949,12 +960,12 @@ class CriticAgent:
                             }
                         )
                         break
-                    raise CriticContractError(
-                        f"Reviewer parse failed after {max_retries + 1} attempts: {exc}"
-                    ) from exc
+                    raise CriticContractError(f"Reviewer parse failed after {max_retries + 1} attempts: {exc}") from exc
 
         if last_parse_error is not None:
-            raise CriticContractError("Reviewer exhausted retries without producing a valid contract") from last_parse_error
+            raise CriticContractError(
+                "Reviewer exhausted retries without producing a valid contract"
+            ) from last_parse_error
         raise CriticContractError("Reviewer exhausted retries without producing a valid contract")
 
     async def run_critic(

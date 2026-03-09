@@ -375,6 +375,88 @@ def test_runtime_registry_tracks_draft_diagnostics(tmp_path):
     assert timing["draft_loop_budget_ms"] == 16000
 
 
+def test_runtime_registry_tracks_refinement_investigation_metrics(tmp_path):
+    store = Store(tmp_path / "test.db")
+    session = store.create_planning_session(
+        repo_name=tmp_path.name,
+        title="investigation-diag",
+        requirements="r",
+        seed_type="chat",
+        status="refining",
+    )
+    registry = RuntimeRegistry(emitter=SimpleNamespace())
+
+    registry.note_event(
+        session.id,
+        {
+            "type": "refinement_investigation",
+            "used": True,
+            "trigger_reason": "decision_graph_conflict",
+        },
+        store=store,
+    )
+    registry.note_event(
+        session.id,
+        {
+            "type": "token_usage",
+            "session_stage": "author",
+            "prompt_tokens": 120,
+            "completion_tokens": 30,
+            "call_cost_usd": 0.0,
+            "llm_call_latency_ms": 100,
+        },
+        store=store,
+    )
+
+    timing = registry.get_session_timing(session.id, store=store)
+    assert timing is not None
+    assert timing["refinement_turns_total"] == 1
+    assert timing["investigation_trigger_total"] == 1
+    assert timing["investigation_trigger_reason_last"] == "decision_graph_conflict"
+    assert timing["investigation_trigger_reason_counts"] == {"decision_graph_conflict": 1}
+    assert timing["investigation_trigger_rate"] == 1.0
+    assert timing["average_refinement_turn_tokens"] == 150.0
+
+
+def test_runtime_registry_does_not_count_stage_investigation_as_extra_turn(tmp_path):
+    store = Store(tmp_path / "test.db")
+    session = store.create_planning_session(
+        repo_name=tmp_path.name,
+        title="investigation-stage-diag",
+        requirements="r",
+        seed_type="chat",
+        status="refining",
+    )
+    registry = RuntimeRegistry(emitter=SimpleNamespace())
+
+    registry.note_event(
+        session.id,
+        {
+            "type": "refinement_investigation",
+            "used": False,
+            "count_as_turn": True,
+        },
+        store=store,
+    )
+    registry.note_event(
+        session.id,
+        {
+            "type": "refinement_investigation",
+            "used": True,
+            "trigger_reason": "missing_tests",
+            "count_as_turn": False,
+        },
+        store=store,
+    )
+
+    timing = registry.get_session_timing(session.id, store=store)
+    assert timing is not None
+    assert timing["refinement_turns_total"] == 1
+    assert timing["investigation_trigger_total"] == 1
+    assert timing["investigation_skip_total"] == 1
+    assert timing["investigation_trigger_rate"] == 1.0
+
+
 def test_runtime_registry_tracks_stage_model_and_contract_events(tmp_path):
     store = Store(tmp_path / "test.db")
     session = store.create_planning_session(

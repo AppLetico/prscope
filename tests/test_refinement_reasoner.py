@@ -31,6 +31,81 @@ async def test_refinement_reasoner_prefers_confident_model_route() -> None:
 
     assert decision.route == "lightweight_refine"
     assert decision.confidence >= 0.8
+    assert decision.investigation is not None
+    assert decision.investigation.should_refresh is False
+
+
+@pytest.mark.asyncio
+async def test_refinement_reasoner_triggers_investigation_for_pressure_without_anchors() -> None:
+    reasoner = RefinementReasoner()
+    signals = RuntimeChatFlow._extract_refinement_message_signals(
+        "We should revisit the architecture tradeoff for auth ownership and the source of truth.",
+    )
+
+    decision = await reasoner.decide(
+        ReasoningContext(
+            signals=signals,
+            revision_metadata={
+                "known_anchors": [],
+                "reconsideration_candidates": [{"decision_id": "architecture.auth", "reason": "high_pressure_cluster"}],
+                "evidence_confidence": 0.1,
+            },
+        )
+    )
+
+    assert decision.route == "full_refine"
+    assert decision.investigation is not None
+    assert decision.investigation.should_refresh is True
+    assert decision.investigation.reason == "decision_graph_conflict"
+
+
+@pytest.mark.asyncio
+async def test_refinement_reasoner_skips_investigation_for_small_grounded_edit() -> None:
+    reasoner = RefinementReasoner()
+    signals = RuntimeChatFlow._extract_refinement_message_signals("Please update the test strategy section wording.")
+
+    decision = await reasoner.decide(
+        ReasoningContext(
+            signals=signals,
+            revision_metadata={
+                "known_anchors": [
+                    "src/prscope/web/frontend/src/components/PlanPanel.tsx",
+                    "tests/test_web_api_models.py",
+                ],
+                "reconsideration_candidates": [],
+                "evidence_confidence": 0.92,
+            },
+        )
+    )
+
+    assert decision.route == "lightweight_refine"
+    assert decision.investigation is not None
+    assert decision.investigation.should_refresh is False
+
+
+@pytest.mark.asyncio
+async def test_refinement_reasoner_skips_preserve_existing_owner_wording_when_grounded() -> None:
+    reasoner = RefinementReasoner()
+    signals = RuntimeChatFlow._extract_refinement_message_signals(
+        "Keep the existing owner choice explicit in Files Changed and Architecture.",
+    )
+
+    decision = await reasoner.decide(
+        ReasoningContext(
+            signals=signals,
+            revision_metadata={
+                "known_anchors": [
+                    "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+                    "src/prscope/web/frontend/src/components/PlanPanel.tsx",
+                ],
+                "reconsideration_candidates": [],
+                "evidence_confidence": 0.9,
+            },
+        )
+    )
+
+    assert decision.investigation is not None
+    assert decision.investigation.should_refresh is False
 
 
 def test_refinement_reasoner_preserves_unanswered_open_questions() -> None:

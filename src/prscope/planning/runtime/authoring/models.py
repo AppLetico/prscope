@@ -34,7 +34,7 @@ class ValidationResult:
         return frozenset(self.reason_codes)
 
     @classmethod
-    def success(cls) -> "ValidationResult":
+    def success(cls) -> ValidationResult:
         return cls(failure_messages=(), reason_codes=(), retryable=False, failure_count=0)
 
 

@@ -85,6 +85,11 @@ export function ActionBar({
   const routeLightweightCount = Number(routingDiagnostics?.route_lightweight_refine_total ?? 0);
   const routeFullRefineCount = Number(routingDiagnostics?.route_full_refine_total ?? 0);
   const routeExistingFeatureCount = Number(routingDiagnostics?.route_existing_feature_total ?? 0);
+  const refinementTurnCount = Number(routingDiagnostics?.refinement_turns_total ?? 0);
+  const investigationTriggerCount = Number(routingDiagnostics?.investigation_trigger_total ?? 0);
+  const investigationTriggerRate = Number(routingDiagnostics?.investigation_trigger_rate ?? 0);
+  const avgRefinementTurnTokens = Number(routingDiagnostics?.average_refinement_turn_tokens ?? 0);
+  const lastInvestigationReason = String(routingDiagnostics?.investigation_trigger_reason_last ?? "");
 
   const totalCost = useMemo(
     () => sortedMetrics.reduce((sum, m) => sum + (m.call_cost_usd ?? 0), 0),
@@ -362,11 +367,25 @@ export function ActionBar({
                   <div>Lightweight refine: {routeLightweightCount}</div>
                   <div>Full refine: {routeFullRefineCount}</div>
                   <div>Existing-feature routes: {routeExistingFeatureCount}</div>
+                  <div>Refinement turns: {refinementTurnCount}</div>
+                  <div>Investigations: {investigationTriggerCount}</div>
+                  <div>Trigger rate: {Math.round(investigationTriggerRate * 100)}%</div>
+                  <div>Avg refine tokens: {Math.round(avgRefinementTurnTokens)}</div>
+                  {lastInvestigationReason ? <div>Last trigger: {lastInvestigationReason}</div> : null}
                 </div>
               )}
             >
               <span className="text-cyan-400 bg-cyan-500/10 px-1.5 py-0.5 rounded border border-cyan-500/20">
                 routing {routingDecisionCount}
+              </span>
+            </Tooltip>
+          )}
+          {investigationTriggerCount > 0 && (
+            <Tooltip
+              content={`Evidence refresh triggered ${investigationTriggerCount} times across ${Math.max(refinementTurnCount, 1)} refinement turns.`}
+            >
+              <span className="text-amber-400 bg-amber-500/10 px-1.5 py-0.5 rounded border border-amber-500/20">
+                investigate {Math.round(investigationTriggerRate * 100)}%
               </span>
             </Tooltip>
           )}

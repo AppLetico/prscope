@@ -8,11 +8,11 @@ then asks only questions that cannot be answered from code.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import asdict
 import json
 import logging
 import re
 from collections.abc import Awaitable
+from dataclasses import asdict
 from typing import Any, Callable
 
 from ...config import PlanningConfig
@@ -33,10 +33,9 @@ from .discovery_support import (
     QuestionOption,
     SignalIndex,
     aggregate_evidence,
-    build_existing_feature_signals,
-    build_framework_signals,
     build_existing_endpoint_deep_summary,
     build_existing_feature_enhancement_summary,
+    build_existing_feature_signals,
     build_signal_index,
     detect_architecture,
     detect_code_signals,

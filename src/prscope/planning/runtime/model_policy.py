@@ -91,7 +91,11 @@ class RuntimeModelPolicyResolver:
         fallback_models: list[str] = []
         if stage in {"critic_review", "author_refine"}:
             fallback = str(structured_output_fallback or "").strip()
-            if fallback and fallback != normalized_primary and model_has_elevated_json_contract_risk(normalized_primary):
+            if (
+                fallback
+                and fallback != normalized_primary
+                and model_has_elevated_json_contract_risk(normalized_primary)
+            ):
                 fallback_models.append(fallback)
         return StageModelSelection(
             stage=stage,

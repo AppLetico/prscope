@@ -354,8 +354,10 @@ class AuthorDiscoveryService:
                     marker in lower_path for marker in ("planningview", "actionbar", "planpanel")
                 ):
                     score += 3
-                if path in candidates.tests_and_config and "decisiongraphrender" in lower_path and not (
-                    {"decision", "graph"} & req_keywords
+                if (
+                    path in candidates.tests_and_config
+                    and "decisiongraphrender" in lower_path
+                    and not ({"decision", "graph"} & req_keywords)
                 ):
                     score -= 6
                 if "sessionlist" in lower_path and "sessionlist" not in req_keywords:
@@ -399,9 +401,7 @@ class AuthorDiscoveryService:
                 key=lambda path: (
                     -(
                         1
-                        if needs_backend_contract_test
-                        and selected_has_web_api
-                        and "web_api_models" in path.lower()
+                        if needs_backend_contract_test and selected_has_web_api and "web_api_models" in path.lower()
                         else 0
                     ),
                     -len(path_tokens(path) & source_token_pool),

@@ -246,6 +246,16 @@ class RuntimeRegistry:
             "route_lightweight_refine_total": 0,
             "route_full_refine_total": 0,
             "route_existing_feature_total": 0,
+            "refinement_turns_total": 0,
+            "investigation_trigger_total": 0,
+            "investigation_skip_total": 0,
+            "investigation_trigger_reason_last": None,
+            "investigation_trigger_reason_counts": {},
+            "investigation_trigger_rate": 0.0,
+            "refinement_turn_tokens_total": 0,
+            "average_refinement_turn_tokens": 0.0,
+            "options_memo_deferred": True,
+            "plan_patch_evaluation_status": "deferred_until_post_benchmark",
             "llm_calls_total": 0,
             "llm_call_latency_ms_total": 0.0,
             "llm_call_latency_ms_max": 0.0,
@@ -340,11 +350,26 @@ class RuntimeRegistry:
         elif etype == "token_usage":
             timing["llm_calls_total"] = int(timing.get("llm_calls_total", 0)) + 1
             latency = float(event.get("llm_call_latency_ms", 0.0) or 0.0)
+            prompt_tokens = int(event.get("prompt_tokens", 0) or 0)
+            completion_tokens = int(event.get("completion_tokens", 0) or 0)
             timing["llm_call_latency_ms_total"] = float(timing.get("llm_call_latency_ms_total", 0.0)) + latency
             timing["llm_call_latency_ms_max"] = max(
                 float(timing.get("llm_call_latency_ms_max", 0.0)),
                 latency,
             )
+            selected_store = store or self._find_store_for_session(session_id)
+            current_session = selected_store.get_planning_session(session_id) if selected_store is not None else None
+            current_status = str(getattr(current_session, "status", "")).strip().lower()
+            if current_status in {"refining", "converged"}:
+                timing["refinement_turn_tokens_total"] = (
+                    int(timing.get("refinement_turn_tokens_total", 0)) + prompt_tokens + completion_tokens
+                )
+                turns_total = int(timing.get("refinement_turns_total", 0) or 0)
+                timing["average_refinement_turn_tokens"] = (
+                    round(float(timing["refinement_turn_tokens_total"]) / float(turns_total), 2)
+                    if turns_total > 0
+                    else 0.0
+                )
             session_stage = str(event.get("session_stage", "")).strip().lower()
             if session_stage == "author":
                 timing["draft_author_calls"] = int(timing.get("draft_author_calls", 0)) + 1
@@ -357,8 +382,8 @@ class RuntimeRegistry:
                 )
             elif session_stage == "discovery":
                 timing["discovery_model"] = str(event.get("model", "")).strip() or timing.get("discovery_model")
-                timing["discovery_provider"] = (
-                    str(event.get("model_provider", "")).strip() or timing.get("discovery_provider")
+                timing["discovery_provider"] = str(event.get("model_provider", "")).strip() or timing.get(
+                    "discovery_provider"
                 )
                 timing["discovery_llm_calls"] = int(timing.get("discovery_llm_calls", 0)) + 1
                 timing["discovery_llm_latency_ms_total"] = (
@@ -470,6 +495,35 @@ class RuntimeRegistry:
                 timing["route_full_refine_total"] = int(timing.get("route_full_refine_total", 0)) + 1
             elif "existing_feature" in route or "proposal_review" in route or "revision_input" in route:
                 timing["route_existing_feature_total"] = int(timing.get("route_existing_feature_total", 0)) + 1
+            changed = True
+        elif etype == "refinement_investigation":
+            used = bool(event.get("used"))
+            reason = str(event.get("trigger_reason", "")).strip()
+            count_as_turn = bool(event.get("count_as_turn", True))
+            if count_as_turn:
+                timing["refinement_turns_total"] = int(timing.get("refinement_turns_total", 0)) + 1
+            if used:
+                timing["investigation_trigger_total"] = int(timing.get("investigation_trigger_total", 0)) + 1
+                if reason:
+                    reason_counts = timing.get("investigation_trigger_reason_counts")
+                    if not isinstance(reason_counts, dict):
+                        reason_counts = {}
+                    reason_counts[reason] = int(reason_counts.get(reason, 0)) + 1
+                    timing["investigation_trigger_reason_counts"] = reason_counts
+                    timing["investigation_trigger_reason_last"] = reason
+            else:
+                if count_as_turn:
+                    timing["investigation_skip_total"] = int(timing.get("investigation_skip_total", 0)) + 1
+            turns_total = int(timing.get("refinement_turns_total", 0) or 0)
+            trigger_total = int(timing.get("investigation_trigger_total", 0) or 0)
+            timing["investigation_trigger_rate"] = (
+                round(float(trigger_total) / float(turns_total), 4) if turns_total > 0 else 0.0
+            )
+            timing["average_refinement_turn_tokens"] = (
+                round(float(timing.get("refinement_turn_tokens_total", 0) or 0) / float(turns_total), 2)
+                if turns_total > 0
+                else 0.0
+            )
             changed = True
         elif etype == "phase_timing":
             stage = str(event.get("session_stage", "")).strip().lower()

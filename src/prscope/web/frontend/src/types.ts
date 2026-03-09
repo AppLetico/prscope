@@ -57,7 +57,17 @@ export interface DraftTimingDiagnostics {
   route_lightweight_refine_total?: number;
   route_full_refine_total?: number;
   route_existing_feature_total?: number;
-  [key: string]: string | number | boolean | null | undefined;
+  refinement_turns_total?: number;
+  investigation_trigger_total?: number;
+  investigation_skip_total?: number;
+  investigation_trigger_reason_last?: string | null;
+  investigation_trigger_reason_counts?: Record<string, number>;
+  investigation_trigger_rate?: number;
+  refinement_turn_tokens_total?: number;
+  average_refinement_turn_tokens?: number;
+  options_memo_deferred?: boolean;
+  plan_patch_evaluation_status?: string | null;
+  [key: string]: string | number | boolean | string[] | Record<string, number> | null | undefined;
 }
 
 export interface PlanningTurn {
@@ -330,6 +340,22 @@ export type UIEvent = UIEventBase & (
       active_command_id?: string | null;
     }
   | { type: "tool_update"; tool: ToolCallEntry }
+  | {
+      type: "routing_decision";
+      route: string;
+      source?: string;
+      confidence?: string;
+      message?: string;
+      evidence?: string[];
+      evidence_refresh_used?: boolean | null;
+      investigation_reason?: string | null;
+    }
+  | {
+      type: "refinement_investigation";
+      used: boolean;
+      trigger_reason?: string | null;
+      session_stage?: string;
+    }
   | {
       type: "context_compaction";
       enabled: boolean;

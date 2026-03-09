@@ -31,6 +31,7 @@ from .author import (
 from .context import ClarificationGate, ContextAssembler, CritiqueCompressor
 from .critic import CriticAgent, CriticResult, ImplementabilityResult, ReviewResult
 from .discovery import DiscoveryManager, DiscoveryTurnResult
+from .discovery_support import RefinementEvidenceRefresh, RefinementEvidenceRefreshResult
 from .events import ToolEventStateManager
 from .followups import (
     FollowupEngine,
@@ -103,6 +104,7 @@ class PlanningRuntime:
         self.author = AuthorAgent(self.planning_config, self.tools)
         self.critic = CriticAgent(self.planning_config, repo)
         self.discovery = DiscoveryManager(self.planning_config, self.tools, self.memory)
+        self._refinement_evidence = RefinementEvidenceRefresh(self.tools)
         self._memory_block_caps = dict(self.planning_config.memory_block_max_chars)
         if self.repo.memory_block_max_chars:
             self._memory_block_caps.update(self.repo.memory_block_max_chars)
@@ -133,6 +135,7 @@ class PlanningRuntime:
             emit_event=self._emit_event,
             attach_plan_artifacts=self._attach_plan_version_artifacts,
             repo_memory=self._repo_memory,
+            refresh_refinement_evidence=self.refresh_refinement_evidence,
             critic=self.critic,
             author=self.author,
             design_record_payload=self._design_record_payload,
@@ -162,11 +165,15 @@ class PlanningRuntime:
         *,
         stage: str = "author_refine",
     ) -> str:
-        return self._resolve_model_policy(
-            session,
-            author_model_override=author_model_override,
-            critic_model_override=None,
-        ).for_stage(stage).primary_model
+        return (
+            self._resolve_model_policy(
+                session,
+                author_model_override=author_model_override,
+                critic_model_override=None,
+            )
+            .for_stage(stage)
+            .primary_model
+        )
 
     def _resolve_critic_model(
         self,
@@ -175,11 +182,15 @@ class PlanningRuntime:
         *,
         stage: str = "critic_review",
     ) -> str:
-        return self._resolve_model_policy(
-            session,
-            author_model_override=None,
-            critic_model_override=critic_model_override,
-        ).for_stage(stage).primary_model
+        return (
+            self._resolve_model_policy(
+                session,
+                author_model_override=None,
+                critic_model_override=critic_model_override,
+            )
+            .for_stage(stage)
+            .primary_model
+        )
 
     def _resolve_model_policy(
         self,
@@ -338,6 +349,25 @@ class PlanningRuntime:
         if not read_paths:
             return
         self._session_reads(session_id).update(read_paths)
+
+    def refresh_refinement_evidence(
+        self,
+        *,
+        user_message: str,
+        reason: str,
+        known_anchor_paths: list[str] | None = None,
+        max_search_queries: int = 3,
+        max_files_read: int = 8,
+        max_wall_clock_seconds: float = 5.0,
+    ) -> RefinementEvidenceRefreshResult:
+        return self._refinement_evidence.refresh(
+            user_message=user_message,
+            reason=reason,
+            known_anchor_paths=known_anchor_paths,
+            max_search_queries=max_search_queries,
+            max_files_read=max_files_read,
+            max_wall_clock_seconds=max_wall_clock_seconds,
+        )
 
     def _critic_evidence_context(self, session_id: str) -> str:
         read_paths = sorted(path for path in self._session_reads(session_id) if path)
@@ -982,6 +1012,7 @@ class PlanningRuntime:
         self,
         session_id: str,
         user_input: str | None = None,
+        refinement_evidence: dict[str, Any] | None = None,
         author_model_override: str | None = None,
         critic_model_override: str | None = None,
         event_callback: Any | None = None,
@@ -989,6 +1020,7 @@ class PlanningRuntime:
         return await self._round_entry.run_adversarial_round(
             session_id=session_id,
             user_input=user_input,
+            refinement_evidence=refinement_evidence,
             author_model_override=author_model_override,
             critic_model_override=critic_model_override,
             event_callback=event_callback,

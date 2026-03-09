@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import time
 from dataclasses import asdict
 from typing import Any
@@ -24,6 +23,8 @@ from ..reasoning import (
     RefinementMessageSignals,
     RefinementReasoner,
 )
+from ..review import build_impact_view
+from ..tools import extract_file_references
 
 
 class RuntimeChatFlow:
@@ -99,6 +100,8 @@ class RuntimeChatFlow:
         evidence: list[str] | None = None,
         decision_source: str | None = None,
         reasoner_version: str | None = None,
+        evidence_refresh_used: bool | None = None,
+        investigation_reason: str | None = None,
     ) -> None:
         await self._runtime._emit_event(
             event_callback,
@@ -112,6 +115,8 @@ class RuntimeChatFlow:
                 "evidence": list(evidence or [])[:6],
                 "decision_source": decision_source,
                 "reasoner_version": reasoner_version,
+                "evidence_refresh_used": evidence_refresh_used,
+                "investigation_reason": investigation_reason,
             },
             session_id,
         )
@@ -202,6 +207,125 @@ class RuntimeChatFlow:
             token in normalized
             for token in ("all questions", "both questions", "resolve all", "no open questions", "none remaining")
         )
+
+    @staticmethod
+    def _known_anchor_paths(current_plan: Any | None, session_reads: set[str]) -> list[str]:
+        plan_paths = extract_file_references(
+            getattr(current_plan, "plan_content", "") if current_plan is not None else ""
+        )
+        ranked = list(
+            dict.fromkeys([*sorted(plan_paths), *sorted(path for path in session_reads if str(path).strip())])
+        )
+        return ranked[:8]
+
+    @staticmethod
+    def _evidence_confidence(
+        *, known_anchor_paths: list[str], reconsideration_candidates: list[dict[str, Any]]
+    ) -> float:
+        anchor_score = min(0.7, len(known_anchor_paths) * 0.18)
+        pressure_bonus = 0.1 if reconsideration_candidates else 0.0
+        base_score = 0.25 if known_anchor_paths else 0.0
+        return round(min(1.0, base_score + anchor_score + pressure_bonus), 2)
+
+    def _refinement_reconsideration_candidates(
+        self, *, session_id: str, current_plan: Any | None
+    ) -> list[dict[str, Any]]:
+        if current_plan is None:
+            return []
+        state = self._runtime._state(session_id)
+        tracker = getattr(state, "issue_tracker", None)
+        if tracker is None or not hasattr(tracker, "graph_snapshot"):
+            return []
+        decision_graph = decision_graph_to_json(
+            decision_graph_from_json(getattr(current_plan, "decision_graph_json", None))
+        )
+        issue_graph = tracker.graph_snapshot()
+        impact_view = build_impact_view(
+            decision_graph=decision_graph,
+            issue_graph=issue_graph if isinstance(issue_graph, dict) else None,
+        )
+        raw_candidates = impact_view.get("reconsideration_candidates", []) if isinstance(impact_view, dict) else []
+        candidates: list[dict[str, Any]] = []
+        for candidate in raw_candidates:
+            if not isinstance(candidate, dict):
+                continue
+            decision_id = str(candidate.get("decision_id", "")).strip()
+            if not decision_id:
+                continue
+            candidates.append(
+                {
+                    "decision_id": decision_id,
+                    "reason": str(candidate.get("reason", "")).strip(),
+                    "decision_pressure": int(candidate.get("decision_pressure", 0) or 0),
+                    "suggested_action": str(candidate.get("suggested_action", "")).strip(),
+                    "recently_changed": bool(candidate.get("recently_changed", False)),
+                }
+            )
+        return candidates[:2]
+
+    async def _refresh_refinement_evidence(
+        self,
+        *,
+        session_id: str,
+        user_message: str,
+        investigation_reason: str,
+        known_anchor_paths: list[str],
+        event_callback: Any | None,
+    ) -> dict[str, Any]:
+        started = time.perf_counter()
+        await self._runtime._emit_event(
+            event_callback,
+            {
+                "type": "tool_update",
+                "tool": {
+                    "name": "refinement_evidence_refresh",
+                    "status": "running",
+                    "session_stage": "author",
+                    "query": f"{investigation_reason}: {user_message[:120]}",
+                },
+            },
+            session_id,
+        )
+        result = self._runtime.refresh_refinement_evidence(
+            user_message=user_message,
+            reason=investigation_reason,
+            known_anchor_paths=known_anchor_paths,
+            max_search_queries=3,
+            max_files_read=8,
+            max_wall_clock_seconds=5.0,
+        )
+        self._runtime._record_session_reads(session_id, set(result.all_paths()))
+        await self._runtime._emit_event(
+            event_callback,
+            {
+                "type": "tool_update",
+                "tool": {
+                    "name": "refinement_evidence_refresh",
+                    "status": "done",
+                    "session_stage": "author",
+                    "duration_ms": round((time.perf_counter() - started) * 1000),
+                    "query": ", ".join(result.anchor_paths[:2] or result.adjacent_tests[:2] or result.read_paths[:2]),
+                },
+            },
+            session_id,
+        )
+        await self._runtime._emit_event(
+            event_callback,
+            {
+                "type": "thinking",
+                "message": (
+                    "Checked targeted repo anchors before revising: "
+                    + ", ".join(
+                        result.anchor_paths[:2]
+                        or result.adjacent_tests[:2]
+                        or result.read_paths[:2]
+                        or ["no new anchors"]
+                    )
+                )[:220],
+            },
+            session_id,
+        )
+        return result.as_prompt_payload()
 
     def _guard_open_question_resolution(
         self,
@@ -872,6 +996,15 @@ class RuntimeChatFlow:
         recent_turns = core.get_conversation()[-8:]
         model_route: dict[str, str] | None = None
         base_signals = self._extract_refinement_message_signals(user_message)
+        known_anchor_paths = self._known_anchor_paths(current_plan, self._runtime._session_reads(session_id))
+        reconsideration_candidates = self._refinement_reconsideration_candidates(
+            session_id=session_id,
+            current_plan=current_plan,
+        )
+        evidence_confidence = self._evidence_confidence(
+            known_anchor_paths=known_anchor_paths,
+            reconsideration_candidates=reconsideration_candidates,
+        )
         if base_signals.heuristic_route is None and current_plan is not None:
             model_route = await self._classify_ambiguous_refinement_message(
                 session_id=session_id,
@@ -885,12 +1018,35 @@ class RuntimeChatFlow:
                 signals=self._extract_refinement_message_signals(user_message, model_route=model_route),
                 plan_state=current_plan,
                 session_metadata={"scenario": "route_message"},
+                revision_metadata={
+                    "known_anchors": known_anchor_paths,
+                    "reconsideration_candidates": reconsideration_candidates,
+                    "evidence_confidence": evidence_confidence,
+                },
             )
         )
         chosen_route = decision.route
         chosen_confidence = "high" if decision.confidence >= 0.8 else "medium" if decision.confidence >= 0.55 else "low"
-        routing_source = "model" if any(item.startswith("model_route:") for item in decision.evidence) else (
-            "heuristic" if base_signals.heuristic_route else "fallback"
+        routing_source = (
+            "model"
+            if any(item.startswith("model_route:") for item in decision.evidence)
+            else ("heuristic" if base_signals.heuristic_route else "fallback")
+        )
+        refinement_evidence: dict[str, Any] | None = None
+        investigation_reason = (
+            decision.investigation.reason
+            if decision.investigation is not None and decision.investigation.should_refresh
+            else None
+        )
+        await self._runtime._emit_event(
+            event_callback,
+            {
+                "type": "refinement_investigation",
+                "used": bool(investigation_reason),
+                "trigger_reason": investigation_reason,
+                "session_stage": "author_refine",
+            },
+            session_id,
         )
         if chosen_route == "lightweight_refine":
             await self._emit_routing_decision(
@@ -903,6 +1059,8 @@ class RuntimeChatFlow:
                 evidence=decision.evidence,
                 decision_source=decision.decision_source,
                 reasoner_version=decision.reasoner_version,
+                evidence_refresh_used=False,
+                investigation_reason=investigation_reason,
             )
             try:
                 await self._apply_lightweight_plan_edit(
@@ -922,6 +1080,8 @@ class RuntimeChatFlow:
                     evidence=decision.evidence,
                     decision_source=decision.decision_source,
                     reasoner_version=decision.reasoner_version,
+                    evidence_refresh_used=False,
+                    investigation_reason=investigation_reason,
                 )
                 await self._runtime.run_adversarial_round(
                     session_id=session_id,
@@ -932,6 +1092,26 @@ class RuntimeChatFlow:
                 )
             return ("refine_round", None)
         if chosen_route == "full_refine":
+            if investigation_reason:
+                try:
+                    refinement_evidence = await self._refresh_refinement_evidence(
+                        session_id=session_id,
+                        user_message=user_message,
+                        investigation_reason=investigation_reason,
+                        known_anchor_paths=decision.investigation.known_anchor_paths
+                        if decision.investigation
+                        else known_anchor_paths,
+                        event_callback=event_callback,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    await self._runtime._emit_event(
+                        event_callback,
+                        {
+                            "type": "warning",
+                            "message": f"Refinement evidence refresh failed; continuing without it: {exc}",
+                        },
+                        session_id,
+                    )
             await self._emit_routing_decision(
                 event_callback=event_callback,
                 session_id=session_id,
@@ -942,10 +1122,13 @@ class RuntimeChatFlow:
                 evidence=decision.evidence,
                 decision_source=decision.decision_source,
                 reasoner_version=decision.reasoner_version,
+                evidence_refresh_used=bool(refinement_evidence),
+                investigation_reason=investigation_reason,
             )
             await self._runtime.run_adversarial_round(
                 session_id=session_id,
                 user_input=user_message,
+                refinement_evidence=refinement_evidence,
                 author_model_override=author_model_override,
                 critic_model_override=critic_model_override,
                 event_callback=event_callback,
@@ -961,6 +1144,8 @@ class RuntimeChatFlow:
             evidence=decision.evidence,
             decision_source=decision.decision_source,
             reasoner_version=decision.reasoner_version,
+            evidence_refresh_used=False,
+            investigation_reason=investigation_reason,
         )
         reply = await self.chat_with_author(
             session_id=session_id,

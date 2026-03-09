@@ -24,3 +24,4 @@ class PlanningRoundContext:
     selected_critic_model: str | None = None
     model_policy: ResolvedModelPolicy | None = None
     event_callback: Any | None = None
+    refinement_evidence: dict[str, Any] | None = None

@@ -19,6 +19,7 @@ from ..reasoning import (
     ConvergenceReasoner,
     ConvergenceSignals,
     ReasoningContext,
+    RefinementReasoner,
     ReviewReasoner,
 )
 from ..review import ManifestoCheckResult, build_impact_view, infer_issue_type
@@ -44,12 +45,23 @@ def review_issue_type(issue_text: str, *, issue_kind: str | None = None, decisio
 
 
 class PlanningStages:
+    _REQUIRED_REFINEMENT_SECTIONS: tuple[str, ...] = (
+        "goals",
+        "non_goals",
+        "files_changed",
+        "architecture",
+        "implementation_steps",
+        "test_strategy",
+        "rollback_plan",
+    )
+
     def __init__(
         self,
         *,
         emit_event: Callable[[Any | None, dict[str, Any], str], Any],
         attach_plan_artifacts: Callable[..., Any],
         repo_memory: Callable[[Any], dict[str, str]],
+        refresh_refinement_evidence: Callable[..., Any],
         critic: Any,
         author: Any,
         design_record_payload: Callable[[Any], dict[str, Any] | None],
@@ -61,6 +73,7 @@ class PlanningStages:
         self._emit_event = emit_event
         self._attach_plan_artifacts = attach_plan_artifacts
         self._repo_memory = repo_memory
+        self._refresh_refinement_evidence = refresh_refinement_evidence
         self._critic = critic
         self._author = author
         self._design_record_payload = design_record_payload
@@ -70,6 +83,7 @@ class PlanningStages:
         self._causality_extractor = causality_extractor
         self._review_reasoner = ReviewReasoner()
         self._convergence_reasoner = ConvergenceReasoner()
+        self._refinement_reasoner = RefinementReasoner()
 
     @staticmethod
     def _critic_fallback_model(ctx: PlanningRoundContext) -> str | None:
@@ -299,7 +313,9 @@ class PlanningStages:
     ) -> RepoUnderstanding:
         referenced_paths = verified_paths | set(extract_file_references(previous_plan_content))
         relevant_tests = sorted(
-            path for path in referenced_paths if path.startswith("tests/") or ".test." in path or path.endswith("_test.py")
+            path
+            for path in referenced_paths
+            if path.startswith("tests/") or ".test." in path or path.endswith("_test.py")
         )
         relevant_modules = sorted(path for path in referenced_paths if path not in relevant_tests)
         entrypoints = sorted(
@@ -326,6 +342,17 @@ class PlanningStages:
             file_contents={},
             from_mental_model=False,
         )
+
+    @staticmethod
+    def _refinement_evidence_confidence(
+        *,
+        verified_paths: set[str],
+        reconsideration_candidates: list[dict[str, Any]],
+    ) -> float:
+        base = 0.2 if verified_paths else 0.0
+        anchor_score = min(0.7, len(verified_paths) * 0.08)
+        pressure_bonus = 0.1 if reconsideration_candidates else 0.0
+        return round(min(1.0, base + anchor_score + pressure_bonus), 2)
 
     @staticmethod
     def _append_files_changed_entry(files_changed: str, path: str, rationale: str) -> str:
@@ -427,7 +454,9 @@ class PlanningStages:
     def _localized_frontend_owner_paths_from_plan(plan: PlanDocument, requirements: str) -> tuple[str, ...]:
         if not is_localized_frontend_request(requirements):
             return ()
-        files_changed_refs = [str(path).strip() for path in extract_file_references(str(plan.files_changed or "")) if str(path).strip()]
+        files_changed_refs = [
+            str(path).strip() for path in extract_file_references(str(plan.files_changed or "")) if str(path).strip()
+        ]
         preferred: list[str] = []
 
         def _append_if_present(path: str) -> None:
@@ -533,9 +562,7 @@ class PlanningStages:
                     "3. Reuse `exportSession` and `downloadFile` from `src/prscope/web/frontend/src/lib/api.ts` exactly as already wired."
                 )
             if previous_test_targets:
-                implementation_steps.append(
-                    f"4. Cover the localized export flow in `{previous_test_targets[0]}`."
-                )
+                implementation_steps.append(f"4. Cover the localized export flow in `{previous_test_targets[0]}`.")
             if implementation_steps:
                 updates["implementation_steps"] = "\n".join(implementation_steps)
 
@@ -551,6 +578,346 @@ class PlanningStages:
         return plan
 
     @staticmethod
+    def _implementation_step_lines(implementation_steps: str) -> list[str]:
+        return [line.strip() for line in str(implementation_steps or "").splitlines() if line.strip()]
+
+    @staticmethod
+    def _is_test_path(path: str) -> bool:
+        lowered = str(path or "").lower()
+        return bool(re.search(r"(^|/)(tests?|__tests__)/|\.test\.(?:[jt]sx?)$|_test\.py$", lowered))
+
+    @classmethod
+    def _files_changed_rationale_map(cls, files_changed: str) -> dict[str, str]:
+        return {path: rationale for path, rationale in cls._parse_files_changed_entries(files_changed)}
+
+    @classmethod
+    def _preferred_test_targets(
+        cls,
+        *,
+        current_plan: PlanDocument,
+        requirements: str,
+        verified_paths: set[str],
+        supplemental_evidence: dict[str, Any] | None,
+    ) -> tuple[str, ...]:
+        current_refs = [
+            str(path).strip()
+            for path in (
+                list(extract_file_references(str(current_plan.files_changed or "")))
+                + list(extract_file_references(str(current_plan.test_strategy or "")))
+            )
+            if str(path).strip() and cls._is_test_path(str(path).strip())
+        ]
+        current_refs = [path for path in current_refs if not verified_paths or path in verified_paths]
+        evidence_refs = [
+            str(path).strip()
+            for path in (
+                list((supplemental_evidence or {}).get("adjacent_tests", []) or [])
+                + list((supplemental_evidence or {}).get("read_paths", []) or [])
+            )
+            if str(path).strip() and cls._is_test_path(str(path).strip())
+        ]
+        verified_test_paths = sorted(
+            [path for path in verified_paths if cls._is_test_path(path)],
+            key=lambda path: (0 if path.endswith("test_web_api_models.py") else 1, path),
+        )
+        ordered = list(dict.fromkeys([*current_refs, *evidence_refs, *verified_test_paths]))
+        lowered_requirements = str(requirements or "").lower()
+        if (
+            not ordered
+            and "cache" in lowered_requirements
+            and any(token in lowered_requirements for token in ("session", "snapshot", "diagnostics"))
+        ):
+            ordered.append("tests/test_web_api_models.py")
+        return tuple(ordered[:3])
+
+    @classmethod
+    def _preferred_owner_paths(
+        cls,
+        *,
+        current_plan: PlanDocument,
+        requirements: str,
+        verified_paths: set[str],
+        supplemental_evidence: dict[str, Any] | None,
+    ) -> tuple[str, ...]:
+        current_entries = cls._parse_files_changed_entries(str(current_plan.files_changed or ""))
+        current_owner_paths = [
+            path
+            for path, _ in current_entries
+            if not cls._is_test_path(path) and (not verified_paths or path in verified_paths)
+        ]
+        lowered_requirements = str(requirements or "").lower()
+        localized_api_request = (
+            "fastapi" in lowered_requirements
+            and any(
+                token in lowered_requirements
+                for token in ("existing", "localized", "session", "diagnostics", "snapshot")
+            )
+        ) or "existing api path" in lowered_requirements
+        evidence_anchor_paths = [
+            str(path).strip()
+            for path in (
+                list((supplemental_evidence or {}).get("anchor_paths", []) or [])
+                + list((supplemental_evidence or {}).get("read_paths", []) or [])
+            )
+            if str(path).strip() and not cls._is_test_path(str(path).strip())
+        ]
+        overlapped = [path for path in current_owner_paths if path in evidence_anchor_paths]
+        preferred = overlapped or current_owner_paths
+        if not preferred and evidence_anchor_paths:
+            preferred = evidence_anchor_paths
+        if localized_api_request:
+            api_paths = [path for path in preferred if path.endswith("/web/api.py")]
+            if not api_paths:
+                api_paths = [path for path in current_owner_paths if path.endswith("/web/api.py")]
+            if api_paths:
+                preferred = api_paths
+        return tuple(dict.fromkeys(preferred))[:4]
+
+    @classmethod
+    def _preserve_verified_owner_paths(
+        cls,
+        *,
+        plan: PlanDocument,
+        current_plan: PlanDocument,
+        requirements: str,
+        verified_paths: set[str],
+        supplemental_evidence: dict[str, Any] | None,
+    ) -> PlanDocument:
+        preferred_owner_paths = cls._preferred_owner_paths(
+            current_plan=current_plan,
+            requirements=requirements,
+            verified_paths=verified_paths,
+            supplemental_evidence=supplemental_evidence,
+        )
+        if not preferred_owner_paths:
+            return plan
+
+        current_rationales = cls._files_changed_rationale_map(str(current_plan.files_changed or ""))
+        candidate_entries = cls._parse_files_changed_entries(str(plan.files_changed or ""))
+        if not candidate_entries:
+            return plan
+
+        retained_entries: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for path, rationale in candidate_entries:
+            if cls._is_test_path(path):
+                retained_entries.append((path, rationale))
+                seen.add(path)
+                continue
+            if path in set(preferred_owner_paths):
+                retained_entries.append((path, rationale or current_rationales.get(path, "")))
+                seen.add(path)
+
+        for path in preferred_owner_paths:
+            if path in seen:
+                continue
+            retained_entries.insert(
+                0,
+                (
+                    path,
+                    current_rationales.get(path, "Keep the refinement anchored to the existing verified owner path."),
+                ),
+            )
+            seen.add(path)
+
+        if not retained_entries:
+            return plan
+
+        updated_files_changed = "\n".join(
+            f"- `{path}`: {rationale}" if str(rationale).strip() else f"- `{path}`"
+            for path, rationale in retained_entries
+        ).strip()
+        updates: dict[str, str] = {}
+        if updated_files_changed != str(plan.files_changed or "").strip():
+            updates["files_changed"] = updated_files_changed
+
+        removed_owner_paths = {
+            path
+            for path, _ in candidate_entries
+            if not cls._is_test_path(path) and path not in set(preferred_owner_paths)
+        }
+        if removed_owner_paths and str(current_plan.architecture or "").strip():
+            updates["architecture"] = str(current_plan.architecture or "").strip()
+
+        implementation_steps = str(plan.implementation_steps or "").strip()
+        if removed_owner_paths and implementation_steps:
+            kept_lines = [
+                line
+                for line in cls._implementation_step_lines(implementation_steps)
+                if not any(path in line for path in removed_owner_paths)
+            ]
+            filtered_steps = "\n".join(kept_lines).strip()
+            if filtered_steps != implementation_steps:
+                updates["implementation_steps"] = filtered_steps or str(current_plan.implementation_steps or "").strip()
+        lowered_requirements = str(requirements or "").lower()
+        localized_api_request = (
+            "fastapi" in lowered_requirements
+            and any(
+                token in lowered_requirements
+                for token in ("existing", "localized", "session", "diagnostics", "snapshot")
+            )
+        ) or "existing api path" in lowered_requirements
+        if (
+            localized_api_request
+            and len(preferred_owner_paths) == 1
+            and preferred_owner_paths[0].endswith("/web/api.py")
+            and implementation_steps
+        ):
+            updates["implementation_steps"] = cls._anchor_backend_implementation_steps(
+                implementation_steps=str(updates.get("implementation_steps", implementation_steps) or ""),
+                owner_path=preferred_owner_paths[0],
+                requirements=requirements,
+                current_plan=current_plan,
+            )
+
+        rollback_plan = str(plan.rollback_plan or "").strip()
+        if removed_owner_paths and rollback_plan and any(path in rollback_plan for path in removed_owner_paths):
+            current_rollback = str(current_plan.rollback_plan or "").strip()
+            if current_rollback:
+                updates["rollback_plan"] = current_rollback
+
+        return apply_section_updates(plan, updates) if updates else plan
+
+    @classmethod
+    def _restore_required_refinement_sections(
+        cls,
+        *,
+        plan: PlanDocument,
+        current_plan: PlanDocument,
+    ) -> PlanDocument:
+        updates: dict[str, str] = {}
+        for section in cls._REQUIRED_REFINEMENT_SECTIONS:
+            candidate = str(getattr(plan, section, "") or "").strip()
+            existing = str(getattr(current_plan, section, "") or "").strip()
+            if not candidate and existing:
+                updates[section] = existing
+        return apply_section_updates(plan, updates) if updates else plan
+
+    @classmethod
+    def _restore_missing_implementation_refs(
+        cls,
+        *,
+        plan: PlanDocument,
+        current_plan: PlanDocument,
+    ) -> PlanDocument:
+        files_changed_refs = sorted(extract_file_references(str(plan.files_changed or "")))
+        if not files_changed_refs:
+            return plan
+        implementation_steps = str(plan.implementation_steps or "").strip()
+        implementation_refs = extract_file_references(implementation_steps)
+        missing_refs = [path for path in files_changed_refs if path not in implementation_refs]
+        if not missing_refs:
+            return plan
+
+        current_lines = cls._implementation_step_lines(current_plan.implementation_steps)
+        candidate_lines = cls._implementation_step_lines(implementation_steps)
+        appended_lines: list[str] = list(candidate_lines)
+        next_number = 1
+        numbered_prefix = re.compile(r"^\s*(\d+)\.\s+")
+        for line in appended_lines:
+            match = numbered_prefix.match(line)
+            if match:
+                next_number = max(next_number, int(match.group(1)) + 1)
+
+        for path in missing_refs:
+            reused_line = next((line for line in current_lines if path in line), None)
+            if reused_line and reused_line not in appended_lines:
+                appended_lines.append(reused_line)
+                match = numbered_prefix.match(reused_line)
+                if match:
+                    next_number = max(next_number, int(match.group(1)) + 1)
+                continue
+            appended_lines.append(f"{next_number}. Update `{path}` for the requested refinement.")
+            next_number += 1
+
+        return apply_section_updates(plan, {"implementation_steps": "\n".join(appended_lines)})
+
+    @classmethod
+    def _stabilize_refinement_plan(
+        cls,
+        *,
+        plan: PlanDocument,
+        current_plan: PlanDocument,
+        requirements: str,
+        localized_detail_preserver: Any,
+        verified_paths: set[str] | None = None,
+        supplemental_evidence: dict[str, Any] | None = None,
+    ) -> PlanDocument:
+        stabilized = cls._restore_required_refinement_sections(plan=plan, current_plan=current_plan)
+        preferred_owner_paths = cls._preferred_owner_paths(
+            current_plan=current_plan,
+            requirements=requirements,
+            verified_paths=set(verified_paths or set()),
+            supplemental_evidence=supplemental_evidence,
+        )
+        preferred_test_targets = cls._preferred_test_targets(
+            current_plan=current_plan,
+            requirements=requirements,
+            verified_paths=set(verified_paths or set()),
+            supplemental_evidence=supplemental_evidence,
+        )
+        stabilized = cls._preserve_verified_owner_paths(
+            plan=stabilized,
+            current_plan=current_plan,
+            requirements=requirements,
+            verified_paths=set(verified_paths or set()),
+            supplemental_evidence=supplemental_evidence,
+        )
+        stabilized = localized_detail_preserver(
+            plan=stabilized,
+            current_plan=current_plan,
+            requirements=requirements,
+        )
+        stabilized = cls._restore_missing_implementation_refs(plan=stabilized, current_plan=current_plan)
+        lowered_requirements = str(requirements or "").lower()
+        localized_api_request = (
+            "fastapi" in lowered_requirements
+            and any(
+                token in lowered_requirements
+                for token in ("existing", "localized", "session", "diagnostics", "snapshot")
+            )
+        ) or "existing api path" in lowered_requirements
+        if (
+            localized_api_request
+            and len(preferred_owner_paths) == 1
+            and preferred_owner_paths[0].endswith("/web/api.py")
+        ):
+            backend_updates: dict[str, str] = {
+                "implementation_steps": cls._anchor_backend_implementation_steps(
+                    implementation_steps=str(stabilized.implementation_steps or ""),
+                    owner_path=preferred_owner_paths[0],
+                    requirements=requirements,
+                    current_plan=current_plan,
+                ),
+                "test_strategy": cls._anchor_backend_test_strategy(
+                    owner_path=preferred_owner_paths[0],
+                    requirements=requirements,
+                    preferred_test_targets=preferred_test_targets,
+                ),
+            }
+            if preferred_test_targets:
+                files_changed = cls._append_files_changed_entry(
+                    str(stabilized.files_changed or ""),
+                    preferred_test_targets[0],
+                    "Cover the backend cache invalidation behavior with the focused regression test.",
+                )
+                backend_updates["files_changed"] = files_changed
+            stabilized = apply_section_updates(stabilized, backend_updates)
+            stabilized = cls._restore_missing_implementation_refs(plan=stabilized, current_plan=current_plan)
+            stabilized = apply_section_updates(
+                stabilized,
+                {
+                    "implementation_steps": cls._anchor_backend_implementation_steps(
+                        implementation_steps=str(stabilized.implementation_steps or ""),
+                        owner_path=preferred_owner_paths[0],
+                        requirements=requirements,
+                        current_plan=current_plan,
+                    )
+                },
+            )
+        return stabilized
+
+    @staticmethod
     def _mentioned_validation_targets(failures: list[str], prefix: str) -> list[str]:
         targets: list[str] = []
         for failure in failures:
@@ -564,6 +931,200 @@ class PlanningStages:
                     targets.append(target)
         return targets
 
+    @staticmethod
+    def _requested_behavior_phrase(requirements: str) -> str:
+        sentences = [
+            part.strip() for part in re.split(r"(?<=[.!?])\s+", str(requirements or "").strip()) if part.strip()
+        ]
+        if not sentences:
+            return "the requested behavior"
+        first = re.sub(r"\s+", " ", sentences[0]).strip().rstrip(".")
+        if len(first) > 120:
+            first = first[:117].rstrip() + "..."
+        return first[0].lower() + first[1:] if first else "the requested behavior"
+
+    @classmethod
+    def _generic_refinement_steps(cls, *, plan: PlanDocument, requirements: str) -> str:
+        requested_behavior = cls._requested_behavior_phrase(requirements)
+        entries = cls._parse_files_changed_entries(str(plan.files_changed or ""))
+        if not entries:
+            return f"1. Update the existing owner path to implement {requested_behavior}."
+        steps: list[str] = []
+        next_number = 1
+        for path, rationale in entries[:4]:
+            lowered = path.lower()
+            if re.search(r"(^|/)(tests?|__tests__)/|\\.test\\.(?:[jt]sx?)$", lowered):
+                steps.append(
+                    f"{next_number}. Add or update focused regression coverage in `{path}` for {requested_behavior}."
+                )
+            else:
+                detail = rationale or f"Implement {requested_behavior}."
+                steps.append(
+                    f"{next_number}. Update `{path}` to {detail[0].lower() + detail[1:] if detail else f'implement {requested_behavior}'}."
+                )
+            next_number += 1
+        return "\n".join(steps)
+
+    @classmethod
+    def _generic_refinement_test_strategy(cls, *, plan: PlanDocument, requirements: str) -> str:
+        requested_behavior = cls._requested_behavior_phrase(requirements)
+        test_paths = [
+            path
+            for path, _ in cls._parse_files_changed_entries(str(plan.files_changed or ""))
+            if re.search(r"(^|/)(tests?|__tests__)/|\\.test\\.(?:[jt]sx?)$", path.lower())
+        ]
+        if test_paths:
+            return "\n".join(
+                f"- Add focused regression coverage in `{path}` for {requested_behavior}." for path in test_paths[:2]
+            )
+        if "cache" in str(requirements or "").lower():
+            return (
+                "- Assert the cache invalidation triggers only on the requested state changes.\n"
+                "- Assert cached reads still return the expected session snapshot data after invalidation."
+            )
+        return f"- Add focused regression coverage for {requested_behavior} in the closest existing test target."
+
+    @classmethod
+    def _generic_refinement_rollback(cls, *, plan: PlanDocument, requirements: str) -> str:
+        changed_paths = [path for path, _ in cls._parse_files_changed_entries(str(plan.files_changed or ""))]
+        if changed_paths:
+            listed = ", ".join(f"`{path}`" for path in changed_paths[:3])
+            return f"- Revert the changes in {listed} if the refined behavior regresses."
+        requested_behavior = cls._requested_behavior_phrase(requirements)
+        return f"- Revert the localized changes if {requested_behavior} regresses."
+
+    @classmethod
+    def _anchor_backend_test_strategy(
+        cls,
+        *,
+        owner_path: str,
+        requirements: str,
+        preferred_test_targets: tuple[str, ...],
+    ) -> str:
+        target = preferred_test_targets[0] if preferred_test_targets else ""
+        lowered_requirements = str(requirements or "").lower()
+        if "cache" in lowered_requirements and target:
+            return (
+                f"- Assert in `{target}` that `{owner_path}` invalidates cached session data only for new plan versions and review note changes.\n"
+                f"- Assert in `{target}` that cached reads served through `{owner_path}` return refreshed snapshot data after invalidation."
+            )
+        if target:
+            return f"- Add focused regression coverage in `{target}` for the `{owner_path}` changes."
+        if "cache" in lowered_requirements:
+            return (
+                f"- Assert that `{owner_path}` invalidates cached session data only on the requested state changes.\n"
+                f"- Assert that cached reads served through `{owner_path}` return refreshed snapshot data after invalidation."
+            )
+        return f"- Add focused regression coverage for the `{owner_path}` changes."
+
+    @staticmethod
+    def _strip_step_prefix(line: str) -> str:
+        return re.sub(r"^\s*(?:[-*]|\d+\.)\s*", "", str(line or "").strip()).strip()
+
+    @classmethod
+    def _preferred_owner_step_phrase(
+        cls,
+        *,
+        owner_path: str,
+        current_plan: PlanDocument,
+        requirements: str,
+    ) -> str:
+        current_lines = cls._implementation_step_lines(str(current_plan.implementation_steps or ""))
+        for line in current_lines:
+            if owner_path in line:
+                return cls._strip_step_prefix(line)
+
+        current_rationales = cls._files_changed_rationale_map(str(current_plan.files_changed or ""))
+        rationale = str(current_rationales.get(owner_path, "") or "").strip()
+        if rationale:
+            normalized_rationale = rationale.rstrip(".")
+            lowered_rationale = normalized_rationale.lower()
+            for verb in ("update ", "modify ", "refactor ", "adjust ", "extend ", "implement ", "add "):
+                if lowered_rationale.startswith(verb) and " to " in lowered_rationale:
+                    normalized_rationale = normalized_rationale.split(" to ", 1)[1].strip()
+                    return f"Update `{owner_path}` to {normalized_rationale.rstrip('.')}"
+            return f"Update `{owner_path}` to {normalized_rationale[0].lower() + normalized_rationale[1:]}"
+
+        lowered_requirements = str(requirements or "").lower()
+        if "cache" in lowered_requirements and "snapshot" in lowered_requirements:
+            return (
+                f"Update `{owner_path}` to check for cached session snapshot data before recomputing it "
+                "and invalidate cached data on the requested triggers."
+            )
+
+        requested_behavior = cls._requested_behavior_phrase(requirements)
+        return f"Update `{owner_path}` to implement {requested_behavior}"
+
+    @classmethod
+    def _anchor_backend_implementation_steps(
+        cls,
+        *,
+        implementation_steps: str,
+        owner_path: str,
+        requirements: str,
+        current_plan: PlanDocument,
+    ) -> str:
+        raw_lines = cls._implementation_step_lines(implementation_steps)
+        if not raw_lines:
+            return "1. " + cls._preferred_owner_step_phrase(
+                owner_path=owner_path,
+                current_plan=current_plan,
+                requirements=requirements,
+            )
+
+        anchored_lines: list[str] = []
+        next_number = 1
+        for raw_line in raw_lines:
+            if owner_path in raw_line:
+                normalized = cls._strip_step_prefix(raw_line)
+                lowered = normalized.lower()
+                if any(
+                    phrase in lowered
+                    for phrase in (
+                        "separate it from the core api endpoint functionality",
+                        "centralized caching helpers",
+                        "without directly handling cache management",
+                        "planning runtime save path",
+                    )
+                ):
+                    normalized = cls._preferred_owner_step_phrase(
+                        owner_path=owner_path,
+                        current_plan=current_plan,
+                        requirements=requirements,
+                    )
+                anchored_lines.append(f"{next_number}. {normalized}")
+                next_number += 1
+                continue
+
+            normalized = cls._strip_step_prefix(raw_line)
+            lowered = normalized.lower()
+            referenced_paths = [path for path in extract_file_references(normalized) if path != owner_path]
+            test_paths = [path for path in referenced_paths if cls._is_test_path(path)]
+            if test_paths:
+                normalized = f"Add regression coverage in `{test_paths[0]}` for `{owner_path}`."
+            elif any(
+                phrase in lowered
+                for phrase in (
+                    "planning runtime save path",
+                    "instead of directly within the api layer",
+                    "move cache invalidation logic",
+                )
+            ):
+                normalized = cls._preferred_owner_step_phrase(
+                    owner_path=owner_path,
+                    current_plan=current_plan,
+                    requirements=requirements,
+                )
+            elif lowered.startswith(("implement ", "ensure ", "establish ", "modify ", "refactor ", "update ")):
+                normalized = f"Update `{owner_path}` to {normalized[0].lower() + normalized[1:]}"
+            else:
+                normalized = f"Update `{owner_path}` to {normalized[0].lower() + normalized[1:]}"
+            if owner_path not in normalized:
+                normalized = f"Update `{owner_path}` to {normalized[0].lower() + normalized[1:]}"
+            anchored_lines.append(f"{next_number}. {normalized}")
+            next_number += 1
+        return "\n".join(anchored_lines).strip()
+
     def _supplement_refinement_plan(
         self,
         *,
@@ -575,40 +1136,58 @@ class PlanningStages:
         failure_text = "\n".join(str(item or "").strip() for item in failures)
         lower_requirements = str(requirements or "").lower()
         explicit_payload_change_requested = self._explicit_payload_change_requested(requirements)
+        localized_frontend = is_localized_frontend_request(requirements)
         helper_phrase = "Reuse the verified helper and API wiring already present in the codebase"
         if "export" in lower_requirements and "download" in lower_requirements:
             helper_phrase = "Reuse `exportSession` and `downloadFile` exactly as already wired"
         elif "snapshot" in lower_requirements:
             helper_phrase = "Reuse the existing snapshot helper wiring exactly as already implemented"
         if "required section is empty: Implementation Steps" in failure_text:
-            implementation_steps = [
-                "1. Update the existing localized UI/component flow to implement the requested behavior.",
-                f"2. {helper_phrase} instead of introducing new abstractions.",
-            ]
-            if explicit_payload_change_requested:
-                implementation_steps.append(
-                    "3. Keep any backend contract adjustment scoped to the existing API path only if the response shape must change."
-                )
-            updates["implementation_steps"] = "\n".join(implementation_steps)
+            if localized_frontend:
+                implementation_steps = [
+                    "1. Update the existing localized UI/component flow to implement the requested behavior.",
+                    f"2. {helper_phrase} instead of introducing new abstractions.",
+                ]
+                if explicit_payload_change_requested:
+                    implementation_steps.append(
+                        "3. Keep any backend contract adjustment scoped to the existing API path only if the response shape must change."
+                    )
+                updates["implementation_steps"] = "\n".join(implementation_steps)
+            else:
+                updates["implementation_steps"] = self._generic_refinement_steps(plan=plan, requirements=requirements)
         if "required section is empty: Architecture" in failure_text:
-            architecture = "Keep the change localized to the existing component and verified helper wiring."
-            if explicit_payload_change_requested:
-                architecture += " Only touch the existing API path if the response shape must change."
-            updates["architecture"] = architecture
+            if localized_frontend:
+                architecture = "Keep the change localized to the existing component and verified helper wiring."
+                if explicit_payload_change_requested:
+                    architecture += " Only touch the existing API path if the response shape must change."
+                updates["architecture"] = architecture
+            else:
+                updates["architecture"] = str(plan.architecture or "").strip() or (
+                    "Keep the refinement localized to the existing owner paths already listed in Files Changed."
+                )
         if "required section is empty: Test Strategy" in failure_text:
-            backend_note = (
-                "\n- If the response shape changes, assert the localized backend contract through the existing API model regression test."
-                if explicit_payload_change_requested
-                else ""
-            )
-            updates["test_strategy"] = (
-                "- Assert the requested user-visible behavior in the focused frontend regression test.\n"
-                "- Assert the export action is disabled while work is in progress and the last export result is rendered after success."
-                + backend_note
-            )
+            if localized_frontend:
+                backend_note = (
+                    "\n- If the response shape changes, assert the localized backend contract through the existing API model regression test."
+                    if explicit_payload_change_requested
+                    else ""
+                )
+                updates["test_strategy"] = (
+                    "- Assert the requested user-visible behavior in the focused frontend regression test.\n"
+                    "- Assert the export action is disabled while work is in progress and the last export result is rendered after success."
+                    + backend_note
+                )
+            else:
+                updates["test_strategy"] = self._generic_refinement_test_strategy(plan=plan, requirements=requirements)
         if "required section is empty: Rollback Plan" in failure_text:
             updates["rollback_plan"] = (
                 "- If the localized export UI behavior regresses, revert the touched UI/API wiring and restore the previous export flow."
+                if localized_frontend
+                else self._generic_refinement_rollback(plan=plan, requirements=requirements)
+            )
+        if "required section is empty: Non-Goals" in failure_text:
+            updates["non_goals"] = (
+                str(plan.non_goals or "").strip() or "- Do not expand the change beyond the verified scope."
             )
         files_changed = str(plan.files_changed or "")
         for path in self._mentioned_validation_targets(
@@ -641,11 +1220,14 @@ class PlanningStages:
         if files_changed != str(plan.files_changed or ""):
             updates["files_changed"] = files_changed
         supplemented = apply_section_updates(plan, updates) if updates else plan
-        return self._preserve_localized_refinement_detail(
+        supplemented = self._preserve_localized_refinement_detail(
             plan=supplemented,
             current_plan=plan,
             requirements=requirements,
         )
+        if "Files Changed entries missing from Implementation Steps:" in failure_text:
+            supplemented = self._restore_missing_implementation_refs(plan=supplemented, current_plan=plan)
+        return self._restore_required_refinement_sections(plan=supplemented, current_plan=plan)
 
     def _confirmed_constraint_violations(
         self,
@@ -970,6 +1552,83 @@ class PlanningStages:
             for failure in current_refinement_validation.failure_messages
             if str(failure).startswith("required section is empty:")
         ]
+        supplemental_evidence = (
+            dict(ctx.refinement_evidence)
+            if isinstance(ctx.refinement_evidence, dict) and ctx.refinement_evidence
+            else None
+        )
+        if supplemental_evidence is None:
+            evidence_gate = self._refinement_reasoner.evaluate_investigation_need(
+                ReasoningContext(
+                    signals=RefinementReasoner.extract_message_signals(ctx.requirements),
+                    session_metadata={"scenario": "route_message"},
+                    revision_metadata={
+                        "known_anchors": sorted(verified_paths)[:8],
+                        "reconsideration_candidates": reconsideration_candidates,
+                        "validation_failures": list(current_refinement_validation.failure_messages),
+                        "evidence_confidence": self._refinement_evidence_confidence(
+                            verified_paths=verified_paths,
+                            reconsideration_candidates=reconsideration_candidates,
+                        ),
+                    },
+                ),
+                "full_refine",
+            )
+            await self._emit_event(
+                ctx.event_callback,
+                {
+                    "type": "refinement_investigation",
+                    "used": bool(evidence_gate.should_refresh),
+                    "trigger_reason": evidence_gate.reason,
+                    "session_stage": "author_refine",
+                    "count_as_turn": False,
+                },
+                ctx.session_id,
+            )
+            if evidence_gate.should_refresh and evidence_gate.reason:
+                await emit_tool(
+                    "refinement_evidence_refresh",
+                    "running",
+                    stage="author",
+                    query=evidence_gate.reason,
+                )
+                evidence_started = time.perf_counter()
+                try:
+                    supplemental_evidence_result = self._refresh_refinement_evidence(
+                        user_message=ctx.requirements,
+                        reason=evidence_gate.reason,
+                        known_anchor_paths=evidence_gate.known_anchor_paths,
+                        max_search_queries=3,
+                        max_files_read=8,
+                        max_wall_clock_seconds=5.0,
+                    )
+                    supplemental_evidence = supplemental_evidence_result.as_prompt_payload()
+                    verified_paths.update(supplemental_evidence_result.all_paths())
+                    revision_repo_understanding = self._revision_repo_understanding(
+                        verified_paths=verified_paths,
+                        previous_plan_content=previous_plan_content,
+                    )
+                    query_summary = ", ".join(
+                        supplemental_evidence_result.anchor_paths[:2] or supplemental_evidence_result.read_paths[:2]
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    supplemental_evidence = None
+                    query_summary = f"failed: {exc}"[:180]
+                    await self._emit_event(
+                        ctx.event_callback,
+                        {
+                            "type": "warning",
+                            "message": f"Refinement evidence refresh failed; continuing without it: {exc}",
+                        },
+                        ctx.session_id,
+                    )
+                await emit_tool(
+                    "refinement_evidence_refresh",
+                    "done",
+                    stage="author",
+                    duration_ms=round((time.perf_counter() - evidence_started) * 1000),
+                    query=query_summary,
+                )
         base_budget = 1 if review_result.primary_issue else min(3, max(1, len(open_issues)))
         revision_budget = max(base_budget, min(5, len(missing_section_failures) or 1))
         if missing_section_failures:
@@ -986,12 +1645,16 @@ class PlanningStages:
                 simplest_possible_design=review_result.simplest_possible_design,
                 revision_hints=revision_hints,
                 reconsideration_candidates=reconsideration_candidates,
+                supplemental_evidence=supplemental_evidence,
             )
             updated_plan = apply_section_updates(current_plan_doc, revision_result.updates)
-            updated_plan = self._preserve_localized_refinement_detail(
+            updated_plan = self._stabilize_refinement_plan(
                 plan=updated_plan,
                 current_plan=current_plan_doc,
                 requirements=ctx.requirements,
+                localized_detail_preserver=self._preserve_localized_refinement_detail,
+                verified_paths=verified_paths,
+                supplemental_evidence=supplemental_evidence,
             )
             preliminary_markdown = render_markdown(updated_plan)
             grounding_failures = self._author.incremental_grounding_failures(
@@ -1062,10 +1725,13 @@ class PlanningStages:
             revision_hints = [*base_revision_hints, *retryable_failures]
         previous_version = ctx.core.get_current_plan()
         updated_plan = apply_section_updates(current_plan_doc, revision_result.updates)
-        updated_plan = self._preserve_localized_refinement_detail(
+        updated_plan = self._stabilize_refinement_plan(
             plan=updated_plan,
             current_plan=current_plan_doc,
             requirements=ctx.requirements,
+            localized_detail_preserver=self._preserve_localized_refinement_detail,
+            verified_paths=verified_paths,
+            supplemental_evidence=supplemental_evidence,
         )
         preliminary_markdown = render_markdown(updated_plan)
         final_validation = self._author.validate_refinement_result(
@@ -1092,7 +1758,7 @@ class PlanningStages:
         updated_markdown = render_markdown(updated_plan)
         changed_sections = sorted(
             section
-            for section in {*revision_result.updates.keys(), "open_questions"}
+            for section in current_plan_doc.__dataclass_fields__.keys()
             if str(getattr(current_plan_doc, section, "")) != str(getattr(updated_plan, section, ""))
         )
         version = ctx.core.save_plan_version(

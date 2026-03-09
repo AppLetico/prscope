@@ -24,6 +24,7 @@ from .models import (
     parse_questions,
     try_extract_completion,
 )
+from .refinement_evidence import RefinementEvidenceRefresh, RefinementEvidenceRefreshResult
 from .signals import (
     BOOTSTRAP_ROUTE_REGEX,
     CODE_SIGNALS,
@@ -60,6 +61,8 @@ __all__ = [
     "Framework",
     "IndexedMatch",
     "QuestionOption",
+    "RefinementEvidenceRefresh",
+    "RefinementEvidenceRefreshResult",
     "SignalIndex",
     "aggregate_evidence",
     "build_framework_signals",

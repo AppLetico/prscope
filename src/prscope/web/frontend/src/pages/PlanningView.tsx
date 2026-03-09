@@ -273,6 +273,32 @@ export function PlanningViewPage() {
       });
       return;
     }
+    if (event.type === "routing_decision") {
+      appendLiveActivity({
+        id: `route:${event.route}:${event.investigation_reason ?? "none"}`,
+        kind: "update",
+        message: event.evidence_refresh_used
+          ? `Routing chose ${event.route} after targeted evidence refresh`
+          : `Routing chose ${event.route}`,
+        stage: "refinement",
+        status: "complete",
+        created_at: new Date().toISOString(),
+      });
+      return;
+    }
+    if (event.type === "refinement_investigation") {
+      appendLiveActivity({
+        id: `investigation:${event.trigger_reason ?? "skip"}`,
+        kind: "update",
+        message: event.used
+          ? `Checked more repo evidence${event.trigger_reason ? ` for ${event.trigger_reason}` : ""}`
+          : "Skipped extra repo investigation",
+        stage: event.session_stage ?? "author_refine",
+        status: event.used ? "running" : "complete",
+        created_at: new Date().toISOString(),
+      });
+      return;
+    }
     if (event.type === "complete") {
       dispatchTl({ type: "complete" });
       setThinkingMessage(null);

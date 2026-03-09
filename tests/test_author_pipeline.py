@@ -8,6 +8,7 @@ import pytest
 
 from prscope.config import PlanningConfig
 from prscope.planning.runtime.author import AuthorAgent, RepoUnderstanding
+from prscope.planning.runtime.authoring import pipeline as pipeline_module
 from prscope.planning.runtime.authoring.discovery import requirement_search_patterns
 from prscope.planning.runtime.authoring.models import (
     AttemptContext,
@@ -18,7 +19,6 @@ from prscope.planning.runtime.authoring.models import (
     RepoCandidates,
     ValidationResult,
 )
-from prscope.planning.runtime.authoring import pipeline as pipeline_module
 from prscope.planning.runtime.authoring.pipeline import AuthorPlannerPipeline
 from prscope.planning.runtime.authoring.repair import AuthorRepairService
 from prscope.planning.runtime.critic import ReviewResult
@@ -83,10 +83,10 @@ def test_explore_repo_reads_around_grep_hits_for_deep_route_definitions(tmp_path
             [
                 "from fastapi import FastAPI",
                 "app = FastAPI()",
-                *[f'# filler {idx}' for idx in range(1, 190)],
-                '@app.get(\"/health\")',
+                *[f"# filler {idx}" for idx in range(1, 190)],
+                '@app.get("/health")',
                 "async def health():",
-                "    return {\"status\": \"healthy\"}",
+                '    return {"status": "healthy"}',
             ]
         )
         + "\n",
@@ -224,8 +224,7 @@ def test_explore_repo_prefers_planning_view_health_paths_for_diagnostics_ui_work
         encoding="utf-8",
     )
     (tmp_path / "src" / "prscope" / "web" / "api.py").write_text(
-        '@app.get("/api/sessions/{session_id}/diagnostics")\n'
-        "async def get_session_diagnostics():\n    return {}\n",
+        '@app.get("/api/sessions/{session_id}/diagnostics")\nasync def get_session_diagnostics():\n    return {}\n',
         encoding="utf-8",
     )
     (tmp_path / "src" / "prscope" / "cli.py").write_text("def main():\n    return 0\n", encoding="utf-8")
@@ -633,12 +632,9 @@ def test_incremental_grounding_failures_detects_new_unverified_paths(tmp_path: P
     agent = _make_agent(tmp_path)
 
     failures = agent.incremental_grounding_failures(
-        previous_plan_content=(
-            "# Plan\n\n## Files Changed\n- `src/prscope/web/frontend/src/lib/api.ts`\n"
-        ),
+        previous_plan_content=("# Plan\n\n## Files Changed\n- `src/prscope/web/frontend/src/lib/api.ts`\n"),
         updated_plan_content=(
-            "# Plan\n\n## Files Changed\n- `src/prscope/web/frontend/src/lib/api.ts`\n"
-            "- `src/prscope/web/lib/api.ts`\n"
+            "# Plan\n\n## Files Changed\n- `src/prscope/web/frontend/src/lib/api.ts`\n- `src/prscope/web/lib/api.ts`\n"
         ),
         verified_paths={"src/prscope/web/frontend/src/lib/api.ts"},
     )
@@ -1016,7 +1012,9 @@ def test_validate_draft_result_normalizes_reason_codes_and_retryability(tmp_path
         relevant_tests=["tests/test_web_api_models.py"],
         architecture_summary="single FastAPI module",
         risks=[],
-        file_contents={"src/prscope/web/api.py": '@app.get("/health")\nasync def health():\n    return {"status": "ok"}\n'},
+        file_contents={
+            "src/prscope/web/api.py": '@app.get("/health")\nasync def health():\n    return {"status": "ok"}\n'
+        },
         from_mental_model=False,
     )
 
@@ -1086,8 +1084,7 @@ def test_validate_refinement_result_flags_under_scoped_localized_refinement(tmp_
     assert "grounding_failure" in result.reason_codes
     assert "under-scoped draft: one file in Files Changed but multiple referenced files" in result.failure_messages
     assert (
-        "Files Changed entries missing from Implementation Steps: "
-        "src/prscope/web/frontend/src/components/PlanPanel.tsx"
+        "Files Changed entries missing from Implementation Steps: src/prscope/web/frontend/src/components/PlanPanel.tsx"
     ) in result.failure_messages
 
 
@@ -1465,8 +1462,7 @@ def test_validate_draft_result_suggests_closest_verified_path_for_unknown_refere
     assert not result.ok
     assert "unknown_file_reference" in result.reason_codes
     assert any(
-        "replace unverified path `src/prscope/web/lib/api.ts` with `src/prscope/web/frontend/src/lib/api.ts`"
-        in failure
+        "replace unverified path `src/prscope/web/lib/api.ts` with `src/prscope/web/frontend/src/lib/api.ts`" in failure
         for failure in result.failure_messages
     )
 
@@ -1611,7 +1607,9 @@ def test_validate_draft_result_reads_prioritized_api_helper_file_for_mixed_utili
     assert any("downloadFile" in failure for failure in result.failure_messages)
 
 
-def test_validate_draft_result_requires_existing_web_api_path_for_localized_backend_payload_tweak(tmp_path: Path) -> None:
+def test_validate_draft_result_requires_existing_web_api_path_for_localized_backend_payload_tweak(
+    tmp_path: Path,
+) -> None:
     agent = _make_agent(tmp_path)
     repo_understanding = RepoUnderstanding(
         entrypoints=["src/prscope/web/api.py"],
@@ -1929,6 +1927,7 @@ async def test_author_planner_pipeline_reuses_same_evidence_and_keeps_best_draft
             retryable=True,
             failure_count=2,
         ),
+        ValidationResult.success(),  # used by _deterministic_plan_repairs after repair
     ]
 
     pipeline = AuthorPlannerPipeline(
@@ -2003,7 +2002,9 @@ async def test_author_planner_pipeline_allows_retry_after_slow_first_attempt_for
 
     validation_results = [
         ValidationResult(
-            failure_messages=("missing test target reference; reference one of: src/prscope/web/frontend/src/pages/PlanningView.test.ts",),
+            failure_messages=(
+                "missing test target reference; reference one of: src/prscope/web/frontend/src/pages/PlanningView.test.ts",
+            ),
             reason_codes=("missing_tests",),
             retryable=True,
             failure_count=1,
@@ -2112,7 +2113,9 @@ async def test_author_planner_pipeline_allows_retry_after_slow_first_attempt_for
 
     validation_results = [
         ValidationResult(
-            failure_messages=("missing test target reference; reference one of: src/prscope/web/frontend/src/pages/PlanningView.test.ts",),
+            failure_messages=(
+                "missing test target reference; reference one of: src/prscope/web/frontend/src/pages/PlanningView.test.ts",
+            ),
             reason_codes=("missing_tests",),
             retryable=True,
             failure_count=1,
@@ -2232,7 +2235,9 @@ async def test_author_planner_pipeline_returns_best_draft_when_retry_attempt_rai
         classify_complexity=lambda **_: "complex",
         draft_plan=_draft_plan,
         validate_draft=lambda **_: ValidationResult(
-            failure_messages=("missing test target reference; reference one of: src/prscope/web/frontend/src/pages/PlanningView.test.ts",),
+            failure_messages=(
+                "missing test target reference; reference one of: src/prscope/web/frontend/src/pages/PlanningView.test.ts",
+            ),
             reason_codes=("missing_tests",),
             retryable=True,
             failure_count=1,
@@ -2276,13 +2281,17 @@ async def test_author_planner_pipeline_deterministically_repairs_missing_test_ta
     )
     validations = [
         ValidationResult(
-            failure_messages=("missing test target reference; reference one of: src/prscope/web/frontend/src/pages/PlanningView.test.ts",),
+            failure_messages=(
+                "missing test target reference; reference one of: src/prscope/web/frontend/src/pages/PlanningView.test.ts",
+            ),
             reason_codes=("missing_tests",),
             retryable=True,
             failure_count=1,
         ),
         ValidationResult(
-            failure_messages=("missing test target reference; reference one of: src/prscope/web/frontend/src/pages/PlanningView.test.ts",),
+            failure_messages=(
+                "missing test target reference; reference one of: src/prscope/web/frontend/src/pages/PlanningView.test.ts",
+            ),
             reason_codes=("missing_tests",),
             retryable=True,
             failure_count=1,
@@ -2560,7 +2569,9 @@ async def test_author_planner_pipeline_preserves_helper_owner_file_when_helper_r
     )
     validations = [
         ValidationResult(
-            failure_messages=("missing test target reference; reference one of: src/prscope/web/frontend/src/pages/PlanningView.test.ts",),
+            failure_messages=(
+                "missing test target reference; reference one of: src/prscope/web/frontend/src/pages/PlanningView.test.ts",
+            ),
             reason_codes=("missing_tests",),
             retryable=True,
             failure_count=1,
@@ -2772,7 +2783,10 @@ async def test_author_planner_pipeline_deterministically_repairs_localized_backe
                 "src/prscope/web/frontend/src/components/ActionBar.tsx",
                 "src/prscope/web/frontend/src/pages/PlanningView.tsx",
             ],
-            tests_and_config=["tests/test_web_api_models.py", "src/prscope/web/frontend/src/pages/PlanningView.test.ts"],
+            tests_and_config=[
+                "tests/test_web_api_models.py",
+                "src/prscope/web/frontend/src/pages/PlanningView.test.ts",
+            ],
             all_paths=[
                 "src/prscope/web/api.py",
                 "src/prscope/web/frontend/src/components/ActionBar.tsx",
@@ -2967,7 +2981,9 @@ async def test_author_planner_pipeline_records_stability_stop_for_same_failure_s
         relevant_tests=["tests/test_web_api_models.py"],
         architecture_summary="single FastAPI module",
         risks=[],
-        file_contents={"src/prscope/web/api.py": "@app.get('/health')\nasync def health():\n    return {'status': 'ok'}\n"},
+        file_contents={
+            "src/prscope/web/api.py": "@app.get('/health')\nasync def health():\n    return {'status': 'ok'}\n"
+        },
         from_mental_model=False,
     )
     draft_calls = 0
@@ -3286,7 +3302,9 @@ async def test_draft_plan_prioritizes_relevant_verified_paths_and_existing_guida
         relevant_tests=["tests/test_web_api_models.py"],
         architecture_summary="single FastAPI module",
         risks=[],
-        file_contents={"src/prscope/web/api.py": '@app.get("/health")\nasync def health():\n    return {"status": "healthy"}\n'},
+        file_contents={
+            "src/prscope/web/api.py": '@app.get("/health")\nasync def health():\n    return {"status": "healthy"}\n'
+        },
         from_mental_model=False,
     )
     captured: dict[str, object] = {}
@@ -3324,7 +3342,9 @@ async def test_draft_plan_prioritizes_relevant_verified_paths_and_existing_guida
     assert "do not add observability, logging, telemetry, rollout controls, or platform notes" in str(
         messages[0]["content"]
     )
-    assert "do not prescribe hook APIs, state variable names, or concrete local-state shapes" in str(messages[0]["content"])
+    assert "do not prescribe hook APIs, state variable names, or concrete local-state shapes" in str(
+        messages[0]["content"]
+    )
 
 
 @pytest.mark.asyncio
@@ -3349,9 +3369,7 @@ async def test_author_repair_service_falls_back_after_google_json_contract_failu
                     "revision_plan": "Update the architecture section with explicit fallback behavior.",
                 }
             )
-        response = SimpleNamespace(
-            choices=[SimpleNamespace(message=SimpleNamespace(content=response_text))]
-        )
+        response = SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=response_text))])
         return response, str(model_override or "")
 
     repair_service = AuthorRepairService(fake_llm_call)

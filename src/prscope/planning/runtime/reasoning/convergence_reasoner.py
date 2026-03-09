@@ -50,7 +50,9 @@ class ConvergenceReasoner(Reasoner[ConvergenceDecision]):
             and signals.constraint_violation_count == 0
             and signals.implementable
         )
-        converged = (base_ready and stability_ready and issue_trend_ready and signals.implementable) or stalled_refinement
+        converged = (
+            base_ready and stability_ready and issue_trend_ready and signals.implementable
+        ) or stalled_refinement
         stability_signals = [
             f"architecture_stable:{architecture_stable}",
             f"score_stable:{score_stable}",

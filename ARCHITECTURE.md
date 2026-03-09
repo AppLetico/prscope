@@ -76,7 +76,7 @@ planning/scanners/*                 ← codebase scanning backends
 
 - `orchestration.py` remains the public coordinator/facade; orchestration internals live under `orchestration_support/*`.
 - `discovery.py`, `author.py`, and `critic.py` are runtime entrypoints coordinated by orchestration, not independent policy owners.
-- `discovery_support/*` plus `planning/scanners/*` form the evidence layer: signal extraction, heuristics, and repository facts.
+- `discovery_support/*` plus `planning/scanners/*` form the evidence layer: signal extraction, heuristics, repository facts, and bounded refinement-time evidence refresh.
 - `reasoning/*` is the policy layer: it interprets structured evidence and must not depend on review state, `issue_graph`, or other persisted critique artifacts.
 - `authoring/*` plus `pipeline/*` form the drafting/refinement engine.
 - `review/*` is the critique subsystem; it may consume reasoning outputs when needed, but it does not own orchestration or decision persistence.
@@ -157,6 +157,7 @@ src/prscope/
 │       │   ├── signals.py     [Intelligence] raw signal extraction + framework evidence helpers
 │       │   ├── existing_feature.py [Intelligence] existing-feature evidence/summarization helpers
 │       │   ├── bootstrap.py   [Intelligence] first-turn bootstrap scanning + evidence ingest
+│       │   ├── refinement_evidence.py [Intelligence] bounded refinement-time repo evidence refresh
 │       │   └── llm.py         [Intelligence] discovery LLM/tool-call loop wrapper
 │       ├── reasoning/         [Intelligence] shared reasoning contract + policy modules
 │       │   ├── base.py        [Intelligence] `Reasoner` interface

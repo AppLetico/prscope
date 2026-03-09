@@ -135,13 +135,17 @@ Refinement now follows the same layered pattern:
 1. extract `RefinementMessageSignals` from the latest message + recent context
 2. optionally classify ambiguous routing with the author model
 3. call `RefinementReasoner`
-4. execute the chosen path (`author_chat`, `lightweight_refine`, `full_refine`, or follow-up/issue resolution)
+4. inside refinement reasoning, optionally run a bounded evidence gate for pressured decisions
+5. execute the chosen path (`author_chat`, `lightweight_refine`, `full_refine`, or follow-up/issue resolution)
 
 Expected behavior:
 
 - `chat_flow.py` should remain execution-oriented: invoke the reasoner, run the selected path, persist, and emit SSE events.
 - lightweight issue resolution and open-question handling should be explainable through reasoner provenance, not hidden heuristics.
 - routing telemetry should carry provenance fields so ambiguous paths can be debugged without re-reading orchestration code.
+- refinement evidence refresh stays bounded (`<=3` search queries, `<=8` files, `<=5s`) and should remain selective rather than becoming the default path.
+- options/tradeoff memos remain deferred until bounded evidence refresh proves value; the runtime currently persists decisions, not internal exploratory artifacts.
+- broader `PLAN_PATCH` runtime simplification remains a post-benchmark evaluation item rather than part of the initial evidence-refresh rollout.
 
 ## Command Model
 

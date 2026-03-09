@@ -104,6 +104,15 @@ class RefinementMessageSignals:
 
 
 @dataclass
+class RefinementInvestigationDecision(ReasoningDecision):
+    should_refresh: bool = False
+    reason: str | None = None
+    known_anchor_paths: list[str] = field(default_factory=list)
+    evidence_confidence: float = 0.0
+    trigger_details: list[str] = field(default_factory=list)
+
+
+@dataclass
 class OpenQuestionResolutionSignals:
     user_message: str
     current_items: list[str]
@@ -125,6 +134,7 @@ class OpenQuestionResolutionDecision(ReasoningDecision):
 @dataclass
 class RefinementDecision(ReasoningDecision):
     route: str = "full_refine"
+    investigation: RefinementInvestigationDecision | None = None
     question_resolution: OpenQuestionResolutionDecision | None = None
     issue_resolution: list[str] = field(default_factory=list)
     target_sections: list[str] = field(default_factory=list)

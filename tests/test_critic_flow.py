@@ -41,7 +41,7 @@ def _make_agent(tmp_path: Path) -> CriticAgent:
 def test_reviewer_prompt_preserves_scope_for_simple_health_endpoints() -> None:
     assert "Preserve the user's requested scope" in REVIEWER_SYSTEM_PROMPT
     assert "A public `/health` endpoint is acceptable by default" in REVIEWER_SYSTEM_PROMPT
-    assert 'Add a lightweight /health endpoint and tests for it' in REVIEWER_SYSTEM_PROMPT
+    assert "Add a lightweight /health endpoint and tests for it" in REVIEWER_SYSTEM_PROMPT
     assert "logging, monitoring, telemetry, or documentation work" in REVIEWER_SYSTEM_PROMPT
     assert "limit tests to the happy-path 200 response" in REVIEWER_SYSTEM_PROMPT
     assert "reuse existing helpers/endpoints and avoid new endpoints" in REVIEWER_SYSTEM_PROMPT

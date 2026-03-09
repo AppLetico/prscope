@@ -18,9 +18,7 @@ def build_impact_view(
     previous_decision_graph: dict[str, Any] | None = None,
     reconsideration_threshold: int = _RECONSIDERATION_THRESHOLD,
 ) -> dict[str, Any]:
-    decisions_payload = (
-        decision_graph.get("nodes", {}) if isinstance(decision_graph, dict) else {}
-    )
+    decisions_payload = decision_graph.get("nodes", {}) if isinstance(decision_graph, dict) else {}
     issue_nodes_raw = issue_graph.get("nodes", []) if isinstance(issue_graph, dict) else []
     issue_edges_raw = issue_graph.get("edges", []) if isinstance(issue_graph, dict) else []
     duplicate_alias_raw = issue_graph.get("duplicate_alias", {}) if isinstance(issue_graph, dict) else {}
@@ -35,9 +33,7 @@ def build_impact_view(
         if str(alias).strip() and str(target).strip()
     }
     parents, dependencies = _build_indexes(issue_edges_raw, issue_nodes, duplicate_alias)
-    blocked_by_dependencies = {
-        issue_id: _is_blocked(issue_id, issue_nodes, dependencies) for issue_id in issue_nodes
-    }
+    blocked_by_dependencies = {issue_id: _is_blocked(issue_id, issue_nodes, dependencies) for issue_id in issue_nodes}
     root_by_issue = {
         issue_id: _canonical_root_for_issue(
             issue_id,
@@ -77,7 +73,11 @@ def build_impact_view(
             continue
         dominant_cluster = max(
             clusters,
-            key=lambda cluster: (cluster["cluster_pressure"], -_issue_id_sort_key(cluster["root_issue_id"]), cluster["root_issue_id"]),
+            key=lambda cluster: (
+                cluster["cluster_pressure"],
+                -_issue_id_sort_key(cluster["root_issue_id"]),
+                cluster["root_issue_id"],
+            ),
         )
         pressure_breakdown = {
             "major": sum(1 for issue_id in linked_issue_ids if _severity_of(issue_nodes[issue_id]) == "major"),
@@ -345,7 +345,9 @@ def _is_contributing_issue(
     node = issue_nodes.get(issue_id)
     if node is None:
         return False
-    return str(node.get("status", "open")).strip().lower() == "open" and not blocked_by_dependencies.get(issue_id, False)
+    return str(node.get("status", "open")).strip().lower() == "open" and not blocked_by_dependencies.get(
+        issue_id, False
+    )
 
 
 def _is_blocked(issue_id: str, issue_nodes: dict[str, dict[str, Any]], dependencies: dict[str, set[str]]) -> bool:

@@ -65,6 +65,28 @@ function normalizeEvent(rawType: string, rawPayload: Record<string, unknown>): U
       },
     };
   }
+  if (rawType === "routing_decision") {
+    return {
+      type: "routing_decision",
+      route: String(rawPayload.route ?? "unknown"),
+      source: rawPayload.source ? String(rawPayload.source) : undefined,
+      confidence: rawPayload.confidence ? String(rawPayload.confidence) : undefined,
+      message: rawPayload.message ? String(rawPayload.message) : undefined,
+      evidence: Array.isArray(rawPayload.evidence) ? rawPayload.evidence.map((item) => String(item)) : [],
+      evidence_refresh_used:
+        rawPayload.evidence_refresh_used !== undefined ? Boolean(rawPayload.evidence_refresh_used) : undefined,
+      investigation_reason:
+        rawPayload.investigation_reason !== undefined ? String(rawPayload.investigation_reason) : undefined,
+    };
+  }
+  if (rawType === "refinement_investigation") {
+    return {
+      type: "refinement_investigation",
+      used: Boolean(rawPayload.used),
+      trigger_reason: rawPayload.trigger_reason ? String(rawPayload.trigger_reason) : undefined,
+      session_stage: rawPayload.session_stage ? String(rawPayload.session_stage) : undefined,
+    };
+  }
   if (rawType === "complete") {
     return { type: "complete", message: rawPayload.message ? String(rawPayload.message) : undefined };
   }
@@ -226,6 +248,8 @@ export function useSessionEvents(
     bind("thinking");
     bind("session_state");
     bind("tool_update");
+    bind("routing_decision");
+    bind("refinement_investigation");
     bind("context_compaction");
     bind("plan_ready");
     bind("complete");

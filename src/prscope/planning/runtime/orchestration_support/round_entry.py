@@ -41,6 +41,7 @@ class RuntimeRoundEntry:
         self,
         session_id: str,
         user_input: str | None = None,
+        refinement_evidence: dict[str, Any] | None = None,
         author_model_override: str | None = None,
         critic_model_override: str | None = None,
         event_callback: Any | None = None,
@@ -88,6 +89,7 @@ class RuntimeRoundEntry:
                 selected_critic_model=model_policy.critic_review.primary_model,
                 model_policy=model_policy,
                 event_callback=event_callback,
+                refinement_evidence=refinement_evidence,
             )
             await self._runtime._emit_event(
                 event_callback,

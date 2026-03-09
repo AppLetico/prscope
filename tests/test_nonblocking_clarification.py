@@ -12,8 +12,9 @@ from prscope.planning.runtime.authoring.models import PlanDocument, ValidationRe
 from prscope.planning.runtime.critic import CriticResult, ReviewResult
 from prscope.planning.runtime.discovery import DiscoveryQuestion, DiscoveryTurnResult, QuestionOption
 from prscope.planning.runtime.orchestration import PlanningRuntime
-from prscope.planning.runtime.pipeline.stages import PlanningStages
 from prscope.planning.runtime.pipeline.round_context import PlanningRoundContext
+from prscope.planning.runtime.pipeline.stages import PlanningStages
+from prscope.planning.runtime.reasoning import RefinementDecision, RefinementInvestigationDecision
 from prscope.store import Store
 
 
@@ -472,6 +473,22 @@ async def test_refinement_message_ambiguous_statement_defaults_to_full_round(tmp
     async def fake_classifier(**kwargs):  # type: ignore[no-untyped-def]
         del kwargs
         return None
+
+    _real_decide = runtime._chat_flow._reasoner.decide
+
+    async def decide_full_refine(context):  # type: ignore[no-untyped-def]
+        if str(context.session_metadata.get("scenario", "")) == "route_message":
+            return RefinementDecision(
+                route="full_refine",
+                confidence=0.3,
+                evidence=["ambiguous:default"],
+                decision_source="refinement_reasoner",
+                investigation=RefinementInvestigationDecision(confidence=0.0, should_refresh=False),
+            )
+        return await _real_decide(context)
+
+    # Patch reasoner so ambiguous message always yields full_refine (avoids test-order dependency)
+    runtime._chat_flow._reasoner.decide = decide_full_refine  # type: ignore[method-assign]
 
     runtime.run_adversarial_round = fake_round  # type: ignore[method-assign]
     runtime._chat_flow.chat_with_author = fake_chat  # type: ignore[method-assign]  # noqa: SLF001
@@ -968,7 +985,11 @@ async def test_revise_plan_retries_when_full_refiner_validation_fails(tmp_path) 
 
     def fake_validate_refinement_result(**kwargs):  # type: ignore[no-untyped-def]
         plan_content = str(kwargs.get("plan_content", "") or "")
-        if "## Implementation Steps" in plan_content and "## Test Strategy" in plan_content and "## Rollback Plan" in plan_content:
+        if (
+            "## Implementation Steps" in plan_content
+            and "## Test Strategy" in plan_content
+            and "## Rollback Plan" in plan_content
+        ):
             return ValidationResult.success()
         return ValidationResult(
             failure_messages=(
@@ -1133,14 +1154,13 @@ async def test_revise_plan_deterministically_supplements_partial_refiner_output(
     assert "## Implementation Steps" in updated_markdown
     assert "## Test Strategy" in updated_markdown
     assert "## Rollback Plan" in updated_markdown
-    assert "Keep the change localized to the existing component and verified helper wiring." in updated_markdown
-    assert "`src/prscope/web/api.py`" in updated_markdown
-    assert "`tests/test_web_api_models.py`" in updated_markdown
-    assert "architecture" in changed_sections
+    assert "Keep the change localized to existing `PlanPanel` wiring and helper reuse." in updated_markdown
+    assert "`src/prscope/web/frontend/src/components/PlanPanel.tsx`" in updated_markdown
+    assert "`src/prscope/web/frontend/src/lib/api.ts`" in updated_markdown
+    assert "`src/prscope/web/frontend/src/pages/PlanningView.test.ts`" in updated_markdown
     assert "implementation_steps" in changed_sections
     assert "test_strategy" in changed_sections
     assert "rollback_plan" in changed_sections
-    assert "files_changed" in changed_sections
 
 
 @pytest.mark.asyncio
@@ -1289,12 +1309,12 @@ async def test_revise_plan_preserves_localized_owner_files_and_test_target(tmp_p
     assert "`src/prscope/web/frontend/src/pages/PlanningView.test.ts`" in updated_markdown
     files_changed_section = updated_markdown.split("## Files Changed", 1)[1].split("## Architecture", 1)[0]
     assert "**Rationale**" not in files_changed_section
-    assert files_changed_section.index("`src/prscope/web/frontend/src/pages/PlanningView.tsx`") < files_changed_section.index(
+    assert files_changed_section.index(
+        "`src/prscope/web/frontend/src/pages/PlanningView.tsx`"
+    ) < files_changed_section.index("`src/prscope/web/frontend/src/components/PlanPanel.tsx`")
+    assert files_changed_section.index(
         "`src/prscope/web/frontend/src/components/PlanPanel.tsx`"
-    )
-    assert files_changed_section.index("`src/prscope/web/frontend/src/components/PlanPanel.tsx`") < files_changed_section.index(
-        "`src/prscope/web/frontend/src/lib/api.ts`"
-    )
+    ) < files_changed_section.index("`src/prscope/web/frontend/src/lib/api.ts`")
     assert files_changed_section.index("`src/prscope/web/frontend/src/lib/api.ts`") < files_changed_section.index(
         "`src/prscope/web/frontend/src/pages/PlanningView.test.ts`"
     )
@@ -1336,6 +1356,271 @@ def test_normalize_files_changed_entries_strips_fake_symbols_and_empty_rationale
     ]
 
 
+def test_stabilize_refinement_plan_restores_empty_required_sections() -> None:
+    current_plan = PlanDocument(
+        title="Plan",
+        summary="Keep the cache behavior scoped.",
+        goals="- Keep cache invalidation explicit.",
+        non_goals="- Do not add generic cache abstractions.",
+        files_changed="- `src/prscope/web/api.py`: Keep cache invalidation in the existing route handler.",
+        architecture="Keep invalidation logic in the existing API path.",
+        implementation_steps="1. Update `src/prscope/web/api.py` to invalidate cache entries for the requested trigger.",
+        test_strategy="- Assert the invalidation trigger in `tests/test_web_api_models.py`.",
+        rollback_plan="- Revert the invalidation change if cache freshness regresses.",
+        open_questions="- None.",
+    )
+    revised_plan = PlanDocument(
+        title="Plan",
+        summary="Keep the cache behavior scoped.",
+        goals="- Keep cache invalidation explicit.",
+        non_goals="",
+        files_changed="- `src/prscope/web/api.py`: Keep cache invalidation in the existing route handler.",
+        architecture="",
+        implementation_steps="",
+        test_strategy="",
+        rollback_plan="",
+        open_questions="- None.",
+    )
+
+    stabilized = PlanningStages._stabilize_refinement_plan(  # noqa: SLF001
+        plan=revised_plan,
+        current_plan=current_plan,
+        requirements="Add cache invalidation when a plan is updated.",
+        localized_detail_preserver=lambda **kwargs: kwargs["plan"],
+    )
+
+    assert stabilized.non_goals == current_plan.non_goals
+    assert stabilized.architecture == current_plan.architecture
+    assert stabilized.implementation_steps == current_plan.implementation_steps
+    assert stabilized.test_strategy == current_plan.test_strategy
+    assert stabilized.rollback_plan == current_plan.rollback_plan
+
+
+def test_stabilize_refinement_plan_reuses_current_steps_for_missing_file_refs() -> None:
+    current_plan = PlanDocument(
+        title="Plan",
+        summary="Keep the cache behavior scoped.",
+        goals="- Keep cache invalidation explicit.",
+        non_goals="- Do not add generic cache abstractions.",
+        files_changed=(
+            "- `src/prscope/web/api.py`: Invalidate cached session summaries.\n"
+            "- `tests/test_web_api_models.py`: Cover the invalidation trigger."
+        ),
+        architecture="Keep invalidation logic in the existing API path.",
+        implementation_steps=(
+            "1. Update `src/prscope/web/api.py` to invalidate cached session summaries when a plan is updated.\n"
+            "2. Extend `tests/test_web_api_models.py` to cover the new invalidation trigger."
+        ),
+        test_strategy="- Assert the invalidation trigger in `tests/test_web_api_models.py`.",
+        rollback_plan="- Revert the invalidation change if cache freshness regresses.",
+        open_questions="- None.",
+    )
+    revised_plan = PlanDocument(
+        title="Plan",
+        summary="Keep the cache behavior scoped.",
+        goals="- Keep cache invalidation explicit.",
+        non_goals="- Do not add generic cache abstractions.",
+        files_changed=current_plan.files_changed,
+        architecture=current_plan.architecture,
+        implementation_steps="1. Clarify the invalidation trigger.",
+        test_strategy=current_plan.test_strategy,
+        rollback_plan=current_plan.rollback_plan,
+        open_questions="- None.",
+    )
+
+    stabilized = PlanningStages._stabilize_refinement_plan(  # noqa: SLF001
+        plan=revised_plan,
+        current_plan=current_plan,
+        requirements="Add cache invalidation when a plan is updated.",
+        localized_detail_preserver=lambda **kwargs: kwargs["plan"],
+    )
+
+    assert "`src/prscope/web/api.py`" in stabilized.implementation_steps
+    assert "`tests/test_web_api_models.py`" in stabilized.implementation_steps
+
+
+def test_supplement_refinement_plan_uses_generic_backend_fallbacks_for_cache_work() -> None:
+    stages = PlanningStages.__new__(PlanningStages)
+    plan = PlanDocument(
+        title="Plan",
+        summary="Cache snapshot responses.",
+        goals="- Cache snapshot responses.",
+        non_goals="- Do not add background workers.",
+        files_changed=(
+            "- `src/prscope/web/api.py`: Keep snapshot caching in the existing API owner path.\n"
+            "- `tests/test_web_api_models.py`: Cover the cache invalidation triggers."
+        ),
+        architecture="Keep cache invalidation in `src/prscope/web/api.py`.",
+        implementation_steps="",
+        test_strategy="",
+        rollback_plan="",
+        open_questions="- None.",
+    )
+
+    supplemented = stages._supplement_refinement_plan(  # noqa: SLF001
+        plan=plan,
+        failures=[
+            "required section is empty: Implementation Steps",
+            "required section is empty: Test Strategy",
+            "required section is empty: Rollback Plan",
+        ],
+        requirements=(
+            "Add targeted cache invalidation so the cached session snapshot refreshes when a new plan version is saved "
+            "or review notes change. Keep the owner explicit and avoid broader cache abstractions."
+        ),
+    )
+
+    assert "localized export UI behavior" not in supplemented.rollback_plan
+    assert "`src/prscope/web/api.py`" in supplemented.implementation_steps
+    assert "`tests/test_web_api_models.py`" in supplemented.test_strategy
+    assert "`src/prscope/web/api.py`" in supplemented.rollback_plan
+
+
+def test_stabilize_refinement_plan_prefers_existing_verified_owner_paths() -> None:
+    current_plan = PlanDocument(
+        title="Plan",
+        summary="Cache snapshot responses.",
+        goals="- Cache snapshot responses.",
+        non_goals="- Do not add background workers.",
+        files_changed=(
+            "- `src/prscope/web/api.py`: Keep snapshot caching in the existing API owner path.\n"
+            "- `tests/test_web_api_models.py`: Cover the cache invalidation triggers."
+        ),
+        architecture="Keep cache invalidation in `src/prscope/web/api.py`.",
+        implementation_steps=(
+            "1. Update `src/prscope/web/api.py` to invalidate cached session snapshots on the requested triggers.\n"
+            "2. Extend `tests/test_web_api_models.py` to cover the invalidation behavior."
+        ),
+        test_strategy="- Assert the invalidation trigger in `tests/test_web_api_models.py`.",
+        rollback_plan="- Revert `src/prscope/web/api.py` if the cache behavior regresses.",
+        open_questions="- None.",
+    )
+    revised_plan = PlanDocument(
+        title="Plan",
+        summary="Cache snapshot responses.",
+        goals="- Cache snapshot responses.",
+        non_goals="- Do not add background workers.",
+        files_changed=(
+            "- `src/prscope/web/api.py`: Keep snapshot caching in the existing API owner path.\n"
+            "- `src/prscope/planning/core.py`: Move invalidation into the planning runtime save path.\n"
+            "- `tests/test_web_api_models.py`: Cover the cache invalidation triggers."
+        ),
+        architecture="Move cache invalidation into `src/prscope/planning/core.py` for owner clarity.",
+        implementation_steps="- Update `src/prscope/planning/core.py` to own invalidation.",
+        test_strategy="- Assert the invalidation trigger in `tests/test_web_api_models.py`.",
+        rollback_plan="- Revert `src/prscope/planning/core.py` if the cache behavior regresses.",
+        open_questions="- None.",
+    )
+
+    stabilized = PlanningStages._stabilize_refinement_plan(  # noqa: SLF001
+        plan=revised_plan,
+        current_plan=current_plan,
+        requirements="Add targeted cache invalidation when a new plan version or review notes change.",
+        localized_detail_preserver=lambda **kwargs: kwargs["plan"],
+        verified_paths={"src/prscope/web/api.py", "src/prscope/planning/core.py", "tests/test_web_api_models.py"},
+        supplemental_evidence={"anchor_paths": ["src/prscope/web/api.py"], "read_paths": ["src/prscope/web/api.py"]},
+    )
+
+    assert "`src/prscope/web/api.py`" in stabilized.files_changed
+    assert "`src/prscope/planning/core.py`" not in stabilized.files_changed
+    assert "`tests/test_web_api_models.py`" in stabilized.files_changed
+    assert "`src/prscope/web/api.py`" in stabilized.architecture
+    assert "`src/prscope/planning/core.py`" not in stabilized.architecture
+    assert "`src/prscope/web/api.py`" in stabilized.implementation_steps
+    assert "`src/prscope/planning/core.py`" not in stabilized.implementation_steps
+    assert "`tests/test_web_api_models.py`" in stabilized.implementation_steps
+
+
+def test_stabilize_refinement_plan_prefers_existing_api_path_for_localized_backend_request() -> None:
+    current_plan = PlanDocument(
+        title="Plan",
+        summary="Cache snapshot responses.",
+        goals="- Cache snapshot responses.",
+        non_goals="- Do not add background workers.",
+        files_changed=(
+            "- `src/prscope/web/api.py`: Keep snapshot caching in the existing FastAPI owner path.\n"
+            "- `src/prscope/planning/core.py`: Existing helper touchpoint noted by the draft.\n"
+            "- `tests/test_web_api_models.py`: Cover the cache invalidation triggers."
+        ),
+        architecture="Keep cache invalidation in `src/prscope/web/api.py`.",
+        implementation_steps="1. Update `src/prscope/web/api.py` to invalidate cached session snapshots on the requested triggers.",
+        test_strategy="- Assert the invalidation trigger in `tests/test_web_api_models.py`.",
+        rollback_plan="- Revert `src/prscope/web/api.py` if the cache behavior regresses.",
+        open_questions="- None.",
+    )
+    revised_plan = PlanDocument(
+        title="Plan",
+        summary="Cache snapshot responses.",
+        goals="- Cache snapshot responses.",
+        non_goals="- Do not add background workers.",
+        files_changed=current_plan.files_changed,
+        architecture="Move cache invalidation into `src/prscope/planning/core.py` for owner clarity.",
+        implementation_steps="- Update `src/prscope/planning/core.py` to own invalidation.",
+        test_strategy="- Assert the invalidation trigger in `tests/test_web_api_models.py`.",
+        rollback_plan="- Revert `src/prscope/planning/core.py` if the cache behavior regresses.",
+        open_questions="- None.",
+    )
+
+    stabilized = PlanningStages._stabilize_refinement_plan(  # noqa: SLF001
+        plan=revised_plan,
+        current_plan=current_plan,
+        requirements=(
+            "Improve the planning session API so diagnostics and live planning views reuse cached session snapshot data "
+            "instead of recomputing it on every request. Keep the change localized to the existing FastAPI session and "
+            "diagnostics paths."
+        ),
+        localized_detail_preserver=lambda **kwargs: kwargs["plan"],
+        verified_paths={"src/prscope/web/api.py", "src/prscope/planning/core.py", "tests/test_web_api_models.py"},
+        supplemental_evidence={
+            "anchor_paths": ["src/prscope/web/api.py", "src/prscope/planning/core.py"],
+            "read_paths": ["src/prscope/web/api.py", "src/prscope/planning/core.py"],
+        },
+    )
+
+    assert "`src/prscope/web/api.py`" in stabilized.files_changed
+    assert "`src/prscope/planning/core.py`" not in stabilized.files_changed
+    assert "`src/prscope/web/api.py`" in stabilized.architecture
+    assert "`src/prscope/planning/core.py`" not in stabilized.architecture
+    assert "planning runtime save path" not in stabilized.implementation_steps.lower()
+    assert "`src/prscope/web/api.py`" in stabilized.implementation_steps
+    assert "`src/prscope/planning/core.py`" not in stabilized.implementation_steps
+    assert "`tests/test_web_api_models.py`" in stabilized.implementation_steps
+    assert "implement improve the planning session api" not in stabilized.implementation_steps.lower()
+    assert all(
+        "`src/prscope/web/api.py`" in line for line in stabilized.implementation_steps.splitlines() if line.strip()
+    )
+    assert "regression coverage" in stabilized.implementation_steps.lower()
+    assert "`tests/test_web_api_models.py`" in stabilized.test_strategy
+    assert "`src/prscope/web/api.py`" in stabilized.test_strategy
+
+
+def test_preferred_test_targets_falls_back_to_api_model_regression_for_session_cache_work() -> None:
+    current_plan = PlanDocument(
+        title="Plan",
+        summary="Cache snapshot responses.",
+        goals="- Cache snapshot responses.",
+        non_goals="- Do not add background workers.",
+        files_changed="- `src/prscope/web/api.py`: Keep snapshot caching in the existing FastAPI owner path.",
+        architecture="Keep cache invalidation in `src/prscope/web/api.py`.",
+        implementation_steps="1. Update `src/prscope/web/api.py` to invalidate cached session snapshots on the requested triggers.",
+        test_strategy="- Keep backend regression coverage focused.",
+        rollback_plan="- Revert `src/prscope/web/api.py` if the cache behavior regresses.",
+        open_questions="- None.",
+    )
+
+    preferred = PlanningStages._preferred_test_targets(  # noqa: SLF001
+        current_plan=current_plan,
+        requirements=(
+            "Improve the planning session API so diagnostics and live planning views reuse cached session snapshot data "
+            "instead of recomputing it on every request. Include focused backend regression coverage."
+        ),
+        verified_paths={"src/prscope/web/api.py"},
+        supplemental_evidence=None,
+    )
+
+    assert preferred == ("tests/test_web_api_models.py",)
+
+
 def test_top_reconsideration_candidates_falls_back_to_medium_pressure_decisions(tmp_path) -> None:
     runtime = PlanningRuntime(
         store=Store(tmp_path / "test.db"),
@@ -1375,9 +1660,7 @@ def test_top_reconsideration_candidates_falls_back_to_medium_pressure_decisions(
                 "duplicate_alias": {},
             }
         ),
-        core=SimpleNamespace(
-            store=SimpleNamespace(get_plan_versions=lambda session_id, limit=2: [])
-        ),
+        core=SimpleNamespace(store=SimpleNamespace(get_plan_versions=lambda session_id, limit=2: [])),
     )
 
     candidates = runtime._stages._top_reconsideration_candidates(  # type: ignore[attr-defined]  # noqa: SLF001

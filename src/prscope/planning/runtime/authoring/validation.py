@@ -5,15 +5,15 @@ import re
 from typing import Any, Literal
 
 from ..tools import extract_file_references
-from .models import ValidationResult
 from .discovery import (
-    is_localized_frontend_request,
     is_entrypoint_like,
+    is_localized_frontend_request,
     is_non_trivial_source,
     is_test_or_config,
     path_tokens,
     requirements_keywords,
 )
+from .models import ValidationResult
 
 _RETRYABLE_REASON_CODES = frozenset(
     {
@@ -55,7 +55,8 @@ _SECTION_FAILURE_NAMES = frozenset(
 def localized_request_explicit_payload_change(requirements_text: str | None) -> bool:
     lowered_requirements = str(requirements_text or "").lower()
     mentions_payload_terms = any(
-        token in lowered_requirements for token in ("payload", "response", "serialization", "serializer", "shape", "contract")
+        token in lowered_requirements
+        for token in ("payload", "response", "serialization", "serializer", "shape", "contract")
     )
     if not mentions_payload_terms:
         return False
@@ -104,7 +105,9 @@ class AuthorValidationService:
         prioritized_paths.sort(
             key=lambda path: (
                 0 if path.lower().endswith("/lib/api.ts") else 1,
-                0 if path.lower().endswith(("planningview.tsx", "actionbar.tsx", "planpanel.tsx", "/lib/api.ts")) else 1,
+                0
+                if path.lower().endswith(("planningview.tsx", "actionbar.tsx", "planpanel.tsx", "/lib/api.ts"))
+                else 1,
             )
         )
         for path in prioritized_paths[:8]:
@@ -517,9 +520,13 @@ class AuthorValidationService:
             r"(what|which).{0,50}(details?|format).{0,80}(export result|latest result|last result)",
             r"(success messages?|error details?)",
         )
-        if asks_for_latest_result and not mentions_format_requirements and any(
-            re.search(pattern, open_questions_section, re.IGNORECASE)
-            for pattern in speculative_result_display_patterns
+        if (
+            asks_for_latest_result
+            and not mentions_format_requirements
+            and any(
+                re.search(pattern, open_questions_section, re.IGNORECASE)
+                for pattern in speculative_result_display_patterns
+            )
         ):
             failures.append(
                 "localized UI/API draft turned a simple result-display request into speculative formatting open questions; "
@@ -537,9 +544,7 @@ class AuthorValidationService:
         if not any(token in requirements for token in ("test", "tests", "coverage", "regression")):
             return []
         relevant_tests = [
-            str(path).strip()
-            for path in getattr(repo_understanding, "relevant_tests", [])
-            if str(path).strip()
+            str(path).strip() for path in getattr(repo_understanding, "relevant_tests", []) if str(path).strip()
         ]
         if not relevant_tests:
             return []

@@ -322,11 +322,7 @@ class AuthorRepairService:
             return text
         if section_id == "architecture":
             text = re.sub(r"```[\s\S]*?```", "", text).strip()
-        filtered_lines = [
-            line
-            for line in text.splitlines()
-            if not any(pattern.search(line) for pattern in patterns)
-        ]
+        filtered_lines = [line for line in text.splitlines() if not any(pattern.search(line) for pattern in patterns)]
         filtered = "\n".join(line for line in filtered_lines if line.strip()).strip()
         if filtered:
             return filtered
@@ -346,9 +342,7 @@ class AuthorRepairService:
             ),
             "changes": "- Update the existing UI component and helper wiring directly without adding new frontend state abstractions.",
             "files_changed": "\n".join(
-                line
-                for line in str(getattr(current_plan, "files_changed", "") or "").splitlines()
-                if line.strip()
+                line for line in str(getattr(current_plan, "files_changed", "") or "").splitlines() if line.strip()
             ).strip(),
             "architecture": (
                 "Keep the change localized to the existing component and verified helper wiring. "
@@ -414,7 +408,7 @@ class AuthorRepairService:
             "service layers, dedicated hooks/contexts, centralized state/error handling, single state objects, concurrency-management rhetoric, observability/telemetry work, broad architecture refactors, or code-level React prescriptions like typed state objects, `useRef`, `useCallback`, `Promise.race`, timeout guards, or unmount guards unless the requirements or verified "
             "repository evidence explicitly require those structures.\n\n"
             "If the requirements say backend payload or contract work is needed only conditionally (for example, "
-            "\"only if the response shape must change\"), treat backend response fields, session-state plumbing, API model tests, "
+            '"only if the response shape must change"), treat backend response fields, session-state plumbing, API model tests, '
             "and backend file changes as out of scope unless the review proves a concrete payload change is required.\n\n"
             "If cross-graph reconsideration candidates are provided, treat them as architectural pressure signals. "
             "Explicitly decide whether the top pressured decision should be clarified, narrowed, reconsidered, or defended with a concrete rationale in the revised plan.\n"
@@ -527,6 +521,7 @@ class AuthorRepairService:
         simplest_possible_design: str | None = None,
         revision_hints: list[str] | None = None,
         reconsideration_candidates: list[dict[str, Any]] | None = None,
+        supplemental_evidence: dict[str, Any] | None = None,
     ) -> RevisionResult:
         simplification_hint = (
             "\nIf a simplification proposal is provided and sound, prefer it over incremental fixes."
@@ -547,7 +542,7 @@ class AuthorRepairService:
             "dedicated hooks/contexts, centralized state/error handling, single state objects, concurrency-management rhetoric, observability/telemetry work, broad component architecture changes, or code-level React prescriptions like typed state objects, `useRef`, `useCallback`, `Promise.race`, timeout guards, or unmount guards unless the accepted issues explicitly "
             "require them and the repository evidence supports that added structure.\n"
             "If the requirements say backend payload or contract work is needed only conditionally (for example, "
-            "\"only if the response shape must change\"), do not add backend response fields, session-state plumbing, "
+            '"only if the response shape must change"), do not add backend response fields, session-state plumbing, '
             "backend files, or API model regression tests unless the accepted issues prove a concrete payload change is required.\n"
             "Preserve exact grounded file paths, helper names, and endpoint names already present in the current plan "
             "unless the requirements or accepted issues explicitly replace them with another verified spelling.\n"
@@ -566,6 +561,7 @@ class AuthorRepairService:
             "If reconsideration candidates are provided, update the relevant plan sections so the highest-pressure "
             "decision is explicitly clarified, constrained, reconsidered, or defended with concrete rationale rather than left as implicit pressure.\n"
             "When architectural pressure guidance is present, make a visible plan change that addresses that pressure unless you can justify preserving the current decision.\n"
+            "If bounded refinement evidence is provided, prefer those verified anchors and adjacent tests over inventing new files, owners, or abstractions.\n"
             "When the requirements name a source of truth, keep that source-of-truth statement explicit in the revised plan.\n"
             "For localized caching or invalidation work, name only the requested invalidation triggers. "
             "Do not introduce generic comprehensive invalidation lists, manual admin actions, expiration policies, or wrapper-layer abstractions unless the requirements explicitly ask for them.\n"
@@ -592,7 +588,8 @@ class AuthorRepairService:
                 f"## Design Record\n{json.dumps(design_record or {}, indent=2)}\n\n"
                 f"## Simplest Possible Design\n{simplest_possible_design or '(none)'}\n\n"
                 f"## Revision Hints\n{json.dumps(revision_hints or [], indent=2)}\n\n"
-                f"## Reconsideration Candidates\n{json.dumps(reconsideration_candidates or [], indent=2)}"
+                f"## Reconsideration Candidates\n{json.dumps(reconsideration_candidates or [], indent=2)}\n\n"
+                f"## Bounded Refinement Evidence\n{json.dumps(supplemental_evidence or {}, indent=2)}"
             ),
         }
         payload = await self._call_json_object(

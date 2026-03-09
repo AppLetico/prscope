@@ -8,7 +8,13 @@ from typing import Any
 
 from ..tools import extract_file_references
 from .discovery import is_localized_frontend_request
-from .models import AttemptContext, AuthorResult, EvidenceBundle, ValidationResult
+from .models import (
+    AttemptContext,
+    AuthorResult,
+    EvidenceBundle,
+    RepoUnderstanding,
+    ValidationResult,
+)
 from .validation import localized_request_explicit_payload_change
 
 logger = logging.getLogger(__name__)
@@ -97,12 +103,18 @@ class AuthorPlannerPipeline:
                 seen.add(label)
                 entries.append(label)
         for helper in AuthorPlannerPipeline._extract_imported_helpers(content):
-            if any(token in helper.lower() for token in ("get", "list", "fetch", "load", "export", "download", "snapshot", "diagnostic")):
+            if any(
+                token in helper.lower()
+                for token in ("get", "list", "fetch", "load", "export", "download", "snapshot", "diagnostic")
+            ):
                 if helper not in seen:
                     seen.add(helper)
                     entries.append(helper)
         for name in AuthorPlannerPipeline._extract_symbol_names(content):
-            if any(token in name.lower() for token in ("get", "list", "fetch", "load", "export", "download", "snapshot", "diagnostic")):
+            if any(
+                token in name.lower()
+                for token in ("get", "list", "fetch", "load", "export", "download", "snapshot", "diagnostic")
+            ):
                 if name not in seen:
                     seen.add(name)
                     entries.append(name)
@@ -138,7 +150,9 @@ class AuthorPlannerPipeline:
             score = 0
             if "actionbar" in lower_requirements and "actionbar" in lowered:
                 score += 8
-            if ("planningview" in lower_requirements or "planning page" in lower_requirements) and "planningview" in lowered:
+            if (
+                "planningview" in lower_requirements or "planning page" in lower_requirements
+            ) and "planningview" in lowered:
                 score += 7
             if lowered.endswith("/lib/api.ts"):
                 score += 6
@@ -150,18 +164,15 @@ class AuthorPlannerPipeline:
 
         relevant_files: list[str] = []
         source_candidates = [
-            str(path).strip()
-            for path in getattr(repo_understanding, "relevant_modules", [])
-            if str(path).strip()
+            str(path).strip() for path in getattr(repo_understanding, "relevant_modules", []) if str(path).strip()
         ]
         test_candidates = [
-            str(path).strip()
-            for path in getattr(repo_understanding, "relevant_tests", [])
-            if str(path).strip()
+            str(path).strip() for path in getattr(repo_understanding, "relevant_tests", []) if str(path).strip()
         ]
         extra_candidates = [
             str(path).strip()
-            for path in list(getattr(repo_understanding, "file_contents", {}).keys()) + list(getattr(repo_understanding, "entrypoints", []))
+            for path in list(getattr(repo_understanding, "file_contents", {}).keys())
+            + list(getattr(repo_understanding, "entrypoints", []))
             if str(path).strip()
         ]
         source_candidates = sorted(source_candidates, key=_path_priority)
@@ -181,7 +192,9 @@ class AuthorPlannerPipeline:
                 if symbol not in existing_components:
                     existing_components.append(symbol)
             for helper in AuthorPlannerPipeline._extract_imported_helpers(content):
-                if any(token in helper.lower() for token in ("session", "snapshot", "diagnostic", "export", "download")):
+                if any(
+                    token in helper.lower() for token in ("session", "snapshot", "diagnostic", "export", "download")
+                ):
                     if helper not in existing_components:
                         existing_components.append(helper)
             for route_or_helper in AuthorPlannerPipeline._extract_routes_or_helpers(content):
@@ -190,7 +203,11 @@ class AuthorPlannerPipeline:
             if "diagnostic" in lower_requirements and "get_session_diagnostics" in self_symbols:
                 if "get_session_diagnostics" not in existing_routes_or_helpers:
                     existing_routes_or_helpers.append("get_session_diagnostics")
-            if "snapshot" in lower_requirements and "getSessionSnapshot" in content and "getSessionSnapshot" not in existing_routes_or_helpers:
+            if (
+                "snapshot" in lower_requirements
+                and "getSessionSnapshot" in content
+                and "getSessionSnapshot" not in existing_routes_or_helpers
+            ):
                 existing_routes_or_helpers.append("getSessionSnapshot")
         related_modules: list[str] = []
         for path in source_candidates:
@@ -201,7 +218,9 @@ class AuthorPlannerPipeline:
         if architecture_summary:
             evidence_notes.append(architecture_summary)
         if "planpanel" in lower_requirements and any("PlanPanel.tsx" in path for path in relevant_files):
-            evidence_notes.append("Existing PlanPanel health presentation should remain intact unless requirements say otherwise.")
+            evidence_notes.append(
+                "Existing PlanPanel health presentation should remain intact unless requirements say otherwise."
+            )
         for risk in getattr(repo_understanding, "risks", [])[:3]:
             note = str(risk).strip()
             if note:
@@ -245,7 +264,11 @@ class AuthorPlannerPipeline:
                 candidates = text.split(":", 1)[1].strip()
                 hints.append(f"Reference at least one exact verified test target in the plan: {candidates}.")
             elif text.startswith("missing explicit helper reuse reference for "):
-                hints.append(text.replace("missing explicit helper reuse reference for ", "Mention exact verified helper reuse for "))
+                hints.append(
+                    text.replace(
+                        "missing explicit helper reuse reference for ", "Mention exact verified helper reuse for "
+                    )
+                )
             elif text.startswith("localized backend payload/response change must reference "):
                 hints.append(text.replace("must reference", "should explicitly reference"))
             elif text.startswith("replace unverified path "):
@@ -508,10 +531,16 @@ class AuthorPlannerPipeline:
             repaired = self._insert_path_into_files_changed(
                 repaired,
                 path,
-                localized_owner_rationales.get(path, "Keep the localized UI change anchored to the verified existing frontend owner."),
+                localized_owner_rationales.get(
+                    path, "Keep the localized UI change anchored to the verified existing frontend owner."
+                ),
             )
         planpanel_path = "src/prscope/web/frontend/src/components/PlanPanel.tsx"
-        if "planpanel" in requirements.lower() and "PlanPanel" in repaired and planpanel_path in evidence_bundle.relevant_files:
+        if (
+            "planpanel" in requirements.lower()
+            and "PlanPanel" in repaired
+            and planpanel_path in evidence_bundle.relevant_files
+        ):
             repaired = self._insert_path_into_files_changed(
                 repaired,
                 planpanel_path,
@@ -725,7 +754,10 @@ class AuthorPlannerPipeline:
             else:
                 revision_hints = tuple(
                     dict.fromkeys(
-                        [*validation_result.failure_messages[:4], *self._deterministic_revision_hints(validation_result)]
+                        [
+                            *validation_result.failure_messages[:4],
+                            *self._deterministic_revision_hints(validation_result),
+                        ]
                     )
                 )[:4]
             previous_signature = validation_result.normalized_signature

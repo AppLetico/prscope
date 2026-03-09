@@ -10,6 +10,7 @@ from .models import (
     OpenQuestionResolutionSignals,
     ReasoningContext,
     RefinementDecision,
+    RefinementInvestigationDecision,
     RefinementMessageSignals,
 )
 
@@ -28,7 +29,226 @@ class RefinementReasoner(Reasoner[RefinementDecision]):
             )
         if scenario == "issue_resolution":
             return self.resolve_issue_references(context)
-        return self.route_message(context)
+        decision = self.route_message(context)
+        decision.investigation = self.evaluate_investigation_need(context, decision.route)
+        if decision.investigation.should_refresh and decision.route == "lightweight_refine":
+            decision.route = "full_refine"
+            decision.evidence.append("investigation_escalated_route:true")
+        return decision
+
+    @staticmethod
+    def _normalized_text(value: str) -> str:
+        return " ".join(str(value or "").lower().split())
+
+    @classmethod
+    def _has_architecture_tradeoff_signal(cls, normalized: str) -> bool:
+        tradeoff_markers = (
+            "tradeoff",
+            "trade-off",
+            "approach",
+            "approaches",
+            "option",
+            "options",
+            "architecture",
+            "architectural",
+            "source of truth",
+            "ownership",
+            "owner",
+            "schema",
+            "payload",
+            "contract",
+            "state lives",
+            "should we",
+            "choose between",
+            "vs ",
+            " instead of ",
+        )
+        return any(marker in normalized for marker in tradeoff_markers)
+
+    @classmethod
+    def _has_owner_resolution_signal(cls, normalized: str) -> bool:
+        owner_markers = (
+            "owner",
+            "ownership",
+            "source of truth",
+            "state lives",
+            "who owns",
+            "which component",
+            "planningview",
+            "planpanel",
+        )
+        return any(marker in normalized for marker in owner_markers)
+
+    @staticmethod
+    def _looks_like_preserve_existing_wording(normalized: str) -> bool:
+        preserve_markers = (
+            "keep the existing",
+            "keep existing",
+            "remain explicit",
+            "stays explicit",
+            "make explicit",
+            "keep explicit",
+            "clarify the",
+            "clarify wording",
+            "wording only",
+            "without changing scope",
+        )
+        return any(marker in normalized for marker in preserve_markers)
+
+    @staticmethod
+    def _coerce_anchor_paths(raw_paths: object) -> list[str]:
+        if not isinstance(raw_paths, list):
+            return []
+        deduped: list[str] = []
+        seen: set[str] = set()
+        for raw in raw_paths:
+            path = str(raw).strip()
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            deduped.append(path)
+        return deduped[:8]
+
+    @classmethod
+    def evaluate_investigation_need(
+        cls,
+        context: ReasoningContext,
+        route: str,
+    ) -> RefinementInvestigationDecision:
+        if route == "author_chat":
+            return RefinementInvestigationDecision(
+                should_refresh=False,
+                confidence=0.9,
+                evidence=["route:author_chat"],
+                decision_source="refinement_reasoner",
+            )
+        signals = context.signals
+        if not isinstance(signals, RefinementMessageSignals):
+            return RefinementInvestigationDecision(
+                should_refresh=False,
+                confidence=0.25,
+                evidence=["missing_refinement_signals"],
+                decision_source="refinement_reasoner",
+            )
+        metadata = context.revision_metadata if isinstance(context.revision_metadata, dict) else {}
+        normalized = cls._normalized_text(signals.user_message)
+        known_anchor_paths = cls._coerce_anchor_paths(metadata.get("known_anchors"))
+        validation_failures = [
+            cls._normalized_text(item) for item in (metadata.get("validation_failures") or []) if str(item).strip()
+        ]
+        reconsideration_candidates = metadata.get("reconsideration_candidates") or []
+        evidence_confidence = float(metadata.get("evidence_confidence", 0.0) or 0.0)
+        small_and_grounded = bool(signals.small_refinement and known_anchor_paths and evidence_confidence >= 0.7)
+        high_confidence = evidence_confidence >= 0.85
+        trigger_reason: str | None = None
+        trigger_details: list[str] = []
+
+        if any("ground" in failure for failure in validation_failures):
+            trigger_reason = "missing_grounding"
+            trigger_details.append("validation:missing_grounding")
+        elif any("test" in failure for failure in validation_failures):
+            trigger_reason = "missing_tests"
+            trigger_details.append("validation:missing_tests")
+        elif isinstance(reconsideration_candidates, list) and reconsideration_candidates:
+            top = reconsideration_candidates[0] if isinstance(reconsideration_candidates[0], dict) else {}
+            decision_id = str(top.get("decision_id", "")).strip()
+            trigger_reason = "decision_graph_conflict"
+            trigger_details.append(f"decision:{decision_id or 'pressed'}")
+        elif cls._has_owner_resolution_signal(normalized) and not known_anchor_paths:
+            trigger_reason = "owner_resolution_failed"
+            trigger_details.append("owner_signal_without_anchor")
+        elif cls._has_architecture_tradeoff_signal(normalized) and not signals.small_refinement:
+            trigger_reason = "architecture_tradeoff"
+            trigger_details.append("message:architecture_tradeoff")
+        elif signals.ambiguous and evidence_confidence < 0.45 and not known_anchor_paths:
+            trigger_reason = "low_confidence"
+            trigger_details.append("ambiguous_without_anchor")
+
+        if (
+            trigger_reason == "architecture_tradeoff"
+            and known_anchor_paths
+            and evidence_confidence >= 0.7
+            and cls._looks_like_preserve_existing_wording(normalized)
+        ):
+            return RefinementInvestigationDecision(
+                should_refresh=False,
+                reason=None,
+                known_anchor_paths=known_anchor_paths,
+                evidence_confidence=evidence_confidence,
+                trigger_details=["skip:preserve_existing_grounded"],
+                confidence=0.82,
+                evidence=[
+                    f"route:{route}",
+                    f"known_anchors:{len(known_anchor_paths)}",
+                    f"evidence_confidence:{evidence_confidence:.2f}",
+                ],
+                decision_source="refinement_reasoner",
+            )
+        if small_and_grounded and trigger_reason not in {
+            "missing_grounding",
+            "missing_tests",
+            "decision_graph_conflict",
+        }:
+            return RefinementInvestigationDecision(
+                should_refresh=False,
+                reason=None,
+                known_anchor_paths=known_anchor_paths,
+                evidence_confidence=evidence_confidence,
+                trigger_details=["skip:small_and_grounded"],
+                confidence=0.9,
+                evidence=[
+                    f"route:{route}",
+                    f"known_anchors:{len(known_anchor_paths)}",
+                    f"evidence_confidence:{evidence_confidence:.2f}",
+                ],
+                decision_source="refinement_reasoner",
+            )
+        if high_confidence and known_anchor_paths and trigger_reason in {None, "low_confidence"}:
+            return RefinementInvestigationDecision(
+                should_refresh=False,
+                reason=None,
+                known_anchor_paths=known_anchor_paths,
+                evidence_confidence=evidence_confidence,
+                trigger_details=["skip:high_confidence_known_anchors"],
+                confidence=0.85,
+                evidence=[
+                    f"route:{route}",
+                    f"known_anchors:{len(known_anchor_paths)}",
+                    f"evidence_confidence:{evidence_confidence:.2f}",
+                ],
+                decision_source="refinement_reasoner",
+            )
+        if not trigger_reason:
+            return RefinementInvestigationDecision(
+                should_refresh=False,
+                reason=None,
+                known_anchor_paths=known_anchor_paths,
+                evidence_confidence=evidence_confidence,
+                trigger_details=["skip:no_trigger"],
+                confidence=0.7,
+                evidence=[
+                    f"route:{route}",
+                    f"known_anchors:{len(known_anchor_paths)}",
+                    f"evidence_confidence:{evidence_confidence:.2f}",
+                ],
+                decision_source="refinement_reasoner",
+            )
+        return RefinementInvestigationDecision(
+            should_refresh=True,
+            reason=trigger_reason,
+            known_anchor_paths=known_anchor_paths,
+            evidence_confidence=evidence_confidence,
+            trigger_details=trigger_details[:4],
+            confidence=0.8 if trigger_reason != "low_confidence" else 0.6,
+            evidence=[
+                f"route:{route}",
+                f"trigger:{trigger_reason}",
+                f"known_anchors:{len(known_anchor_paths)}",
+                f"evidence_confidence:{evidence_confidence:.2f}",
+                *trigger_details[:2],
+            ],
+            decision_source="refinement_reasoner",
+        )
 
     @staticmethod
     def classify_message_intent(user_message: str) -> str:
@@ -333,9 +553,8 @@ class RefinementReasoner(Reasoner[RefinementDecision]):
             )
         current_items = signals.current_items
         proposed_items = signals.proposed_items
-        proposed_is_none = (
-            not proposed_items
-            or (len(proposed_items) == 1 and proposed_items[0].strip().lower() in {"none", "- none.", "none."})
+        proposed_is_none = not proposed_items or (
+            len(proposed_items) == 1 and proposed_items[0].strip().lower() in {"none", "- none.", "none."}
         )
         if not current_items:
             return OpenQuestionResolutionDecision(
@@ -393,7 +612,9 @@ class RefinementReasoner(Reasoner[RefinementDecision]):
                 decision_source="refinement_reasoner",
             )
         normalized_message = " ".join(signals.user_message.lower().split())
-        explicit_matches = [issue["id"] for issue in issues if issue.get("id") and issue["id"].lower() in normalized_message]
+        explicit_matches = [
+            issue["id"] for issue in issues if issue.get("id") and issue["id"].lower() in normalized_message
+        ]
         if len(explicit_matches) == 1:
             return RefinementDecision(
                 route="issue_resolution",
