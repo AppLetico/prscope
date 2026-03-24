@@ -259,7 +259,7 @@ async def test_convergence_allows_stable_clean_round_without_explicit_review_com
 
 
 @pytest.mark.asyncio
-async def test_convergence_stops_stalled_refinement_loop(tmp_path):
+async def test_convergence_requires_full_gates_without_stalled_shortcut(tmp_path):
     runtime = _runtime(tmp_path)
     session = runtime.store.create_planning_session(
         repo_name="repo",
@@ -333,8 +333,9 @@ async def test_convergence_stops_stalled_refinement_loop(tmp_path):
     )
 
     assert implementability.implementable is True
-    assert convergence.converged is True
-    assert convergence.reason == "stalled_refinement"
+    # No stalled_refinement escape: score < 7.8 and primary issue present → no convergence.
+    assert convergence.converged is False
+    assert convergence.reason in {"review_open_issues", "stability_not_met", "rubric_below_floor"}
 
 
 def test_config_parses_issue_dedupe_settings(tmp_path):

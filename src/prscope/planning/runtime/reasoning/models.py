@@ -171,6 +171,14 @@ class ConvergenceSignals:
     review_score_history: list[float] = field(default_factory=list)
     open_issue_history: list[int] = field(default_factory=list)
     implementable: bool = True
+    # Harness gates (defaults permissive for unit tests that omit them).
+    plan_rubric_min: float = 10.0
+    plan_rubric_floor: float = 7.25
+    rubric_floor_ok: bool = True
+    rubric_incomplete: bool = False
+    blockers_ok: bool = True
+    acceptance_structurally_valid: bool = True
+    acceptance_satisfied: bool = True
 
 
 @dataclass

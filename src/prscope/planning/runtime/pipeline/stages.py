@@ -5,12 +5,19 @@ Stage implementations for adversarial planning rounds.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import time
 from collections.abc import Callable
 from typing import Any, Literal
 
+from ....config import PlanningConfig
 from ...core import ConvergenceResult
+from ..acceptance_contract import (
+    build_convergence_debug_payload,
+    compute_harness_convergence_gates,
+    verify_convergence_postcondition,
+)
 from ..author import PlanDocument, RepairPlan, RepoUnderstanding, RevisionResult, apply_section_updates, render_markdown
 from ..authoring.discovery import is_localized_frontend_request
 from ..critic import ImplementabilityResult, ReviewResult
@@ -25,6 +32,8 @@ from ..reasoning import (
 from ..review import ManifestoCheckResult, build_impact_view, infer_issue_type
 from ..tools import extract_file_references
 from .round_context import PlanningRoundContext
+
+_LOG = logging.getLogger(__name__)
 
 
 def review_issue_severity(issue_kind: str) -> str:
@@ -69,6 +78,7 @@ class PlanningStages:
         review_chat_summary: Callable[[ReviewResult], str],
         manifesto_checker: Any,
         causality_extractor: Any | None = None,
+        planning_config: PlanningConfig | None = None,
     ) -> None:
         self._emit_event = emit_event
         self._attach_plan_artifacts = attach_plan_artifacts
@@ -81,9 +91,47 @@ class PlanningStages:
         self._review_chat_summary = review_chat_summary
         self._manifesto_checker = manifesto_checker
         self._causality_extractor = causality_extractor
+        self._planning_config = planning_config or PlanningConfig()
         self._review_reasoner = ReviewReasoner()
         self._convergence_reasoner = ConvergenceReasoner()
         self._refinement_reasoner = RefinementReasoner()
+
+    def _convergence_signals(
+        self,
+        *,
+        ctx: PlanningRoundContext,
+        validation_review: ReviewResult,
+        score_history: list[float],
+        open_issue_history: list[int],
+        root_open_issue_count: int,
+        implementable: bool,
+        plan_markdown: str,
+    ) -> tuple[ConvergenceSignals, dict[str, Any]]:
+        floor = float(self._planning_config.plan_rubric_floor)
+        gates = compute_harness_convergence_gates(validation_review, plan_markdown, rubric_floor=floor)
+        signals = ConvergenceSignals(
+            round_number=ctx.round_number,
+            design_quality_score=float(validation_review.design_quality_score),
+            review_complete=bool(validation_review.review_complete),
+            blocking_issue_count=len(validation_review.blocking_issues),
+            architectural_concern_count=len(validation_review.architectural_concerns),
+            has_primary_issue=bool(validation_review.primary_issue),
+            constraint_violation_count=len(validation_review.constraint_violations),
+            root_open_issue_count=root_open_issue_count,
+            unresolved_dependency_chains=int(ctx.issue_tracker.unresolved_dependency_chains()),
+            architecture_change_rounds=list(ctx.state.architecture_change_rounds),
+            review_score_history=list(score_history),
+            open_issue_history=list(open_issue_history),
+            implementable=bool(implementable),
+            plan_rubric_min=float(gates["min_rubric"]),
+            plan_rubric_floor=float(gates["floor"]),
+            rubric_floor_ok=bool(gates["rubric_floor_ok"]),
+            rubric_incomplete=bool(gates["rubric_incomplete"]),
+            blockers_ok=bool(gates["blockers_ok"]),
+            acceptance_structurally_valid=bool(gates["acceptance_structurally_valid"]),
+            acceptance_satisfied=bool(gates["acceptance_satisfied"]),
+        )
+        return signals, gates
 
     @staticmethod
     def _critic_fallback_model(ctx: PlanningRoundContext) -> str | None:
@@ -1948,25 +1996,16 @@ class PlanningStages:
             prose="Skipped - prerequisites not met",
         )
         score_history = [*ctx.state.review_score_history, float(validation_review.design_quality_score)]
-        pre_impl_decision = await self._convergence_reasoner.decide(
-            ReasoningContext(
-                signals=ConvergenceSignals(
-                    round_number=ctx.round_number,
-                    design_quality_score=float(validation_review.design_quality_score),
-                    review_complete=bool(validation_review.review_complete),
-                    blocking_issue_count=len(validation_review.blocking_issues),
-                    architectural_concern_count=len(validation_review.architectural_concerns),
-                    has_primary_issue=bool(validation_review.primary_issue),
-                    constraint_violation_count=len(validation_review.constraint_violations),
-                    root_open_issue_count=len(ctx.issue_tracker.root_open_issues()),
-                    unresolved_dependency_chains=int(ctx.issue_tracker.unresolved_dependency_chains()),
-                    architecture_change_rounds=list(ctx.state.architecture_change_rounds),
-                    review_score_history=list(ctx.state.review_score_history),
-                    open_issue_history=list(ctx.state.open_issue_history),
-                    implementable=True,
-                )
-            )
+        pre_signals, _pre_gates = self._convergence_signals(
+            ctx=ctx,
+            validation_review=validation_review,
+            score_history=list(ctx.state.review_score_history),
+            open_issue_history=list(ctx.state.open_issue_history),
+            root_open_issue_count=len(ctx.issue_tracker.root_open_issues()),
+            implementable=True,
+            plan_markdown=updated_markdown,
         )
+        pre_impl_decision = await self._convergence_reasoner.decide(ReasoningContext(signals=pre_signals))
         would_converge = pre_impl_decision.converged
         if would_converge:
             await emit_tool("implementability_check", "running", stage="reviewer")
@@ -2009,26 +2048,33 @@ class PlanningStages:
         issue_history = [*ctx.state.open_issue_history, open_issue_count]
         ctx.state.review_score_history = score_history[-8:]
         ctx.state.open_issue_history = issue_history[-8:]
-        convergence_decision = await self._convergence_reasoner.decide(
-            ReasoningContext(
-                signals=ConvergenceSignals(
-                    round_number=ctx.round_number,
-                    design_quality_score=float(validation_review.design_quality_score),
-                    review_complete=bool(validation_review.review_complete),
-                    blocking_issue_count=len(validation_review.blocking_issues),
-                    architectural_concern_count=len(validation_review.architectural_concerns),
-                    has_primary_issue=bool(validation_review.primary_issue),
-                    constraint_violation_count=len(validation_review.constraint_violations),
-                    root_open_issue_count=root_open_issue_count,
-                    unresolved_dependency_chains=int(ctx.issue_tracker.unresolved_dependency_chains()),
-                    architecture_change_rounds=list(ctx.state.architecture_change_rounds),
-                    review_score_history=score_history[:-1],
-                    open_issue_history=issue_history[:-1],
-                    implementable=bool(implementability.implementable),
-                )
-            )
+        final_signals, final_gates = self._convergence_signals(
+            ctx=ctx,
+            validation_review=validation_review,
+            score_history=score_history[:-1],
+            open_issue_history=issue_history[:-1],
+            root_open_issue_count=root_open_issue_count,
+            implementable=bool(implementability.implementable),
+            plan_markdown=updated_markdown,
         )
+        convergence_decision = await self._convergence_reasoner.decide(ReasoningContext(signals=final_signals))
         converged = convergence_decision.converged
+        _LOG.debug(
+            "convergence_gate %s",
+            build_convergence_debug_payload(
+                final_gates,
+                validation_review,
+                updated_markdown,
+                converged=converged,
+                reason=convergence_decision.rationale or "",
+            ),
+        )
+        verify_convergence_postcondition(
+            converged,
+            validation_review,
+            updated_markdown,
+            rubric_floor=float(self._planning_config.plan_rubric_floor),
+        )
         convergence = ConvergenceResult(
             converged=converged,
             reason=convergence_decision.rationale or ("review_complete" if converged else "review_open_issues"),

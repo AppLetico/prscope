@@ -143,6 +143,7 @@ class PlanningRuntime:
             review_chat_summary=self._review_chat_summary,
             manifesto_checker=self._manifesto_checker,
             causality_extractor=self._causality_extractor,
+            planning_config=self.planning_config,
         )
         self._adversarial_loop = AdversarialPlanningLoop(self)
         self._event_router = RuntimeEventRouter(self)

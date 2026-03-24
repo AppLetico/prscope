@@ -315,6 +315,24 @@ python3 -m prscope.benchmark \
 - Check `status`, `is_processing`, and `processing_started_at`.
 - Restart server and verify startup reconciliation logs for stale-session recovery.
 
+## Planning harness invariants (critic + convergence)
+
+Refinement convergence is gated by **feasibility**, not only “review complete”:
+
+- **`plan_rubric`**: four axes (`specificity`, `testability`, `coherence`, `evidence_alignment`) in [0,10]. Convergence requires `min(axis scores) >= planning.plan_rubric_floor` (default **7.25**, configurable in `prscope.yml`). Missing axes default to `MISSING_RUBRIC_SCORE` (0) and set **`rubric_incomplete`**, which **blocks** convergence.
+- **`blocking_categories`**: closed vocabulary `testability` | `evidence` | `vagueness` | `scope`. Unknown tokens **fail closed** (convergence blocked). Empty `[]` means no category blockers. **`_apply_scope_discipline` does not strip issues** when any category blocker is present or the list is invalid.
+- **`acceptance_criteria`**: falsifiable bullets; a structural check rejects vague wording. Satisfaction is computed from **plan markdown evidence** (shallow text overlap), not a critic self-report flag.
+- **`stalled_refinement`** shortcut was **removed**; convergence must satisfy the full legacy stability checks **and** the harness gates above. A **postcondition** assert runs after each convergence decision (see `acceptance_contract.verify_convergence_postcondition`).
+- **Debug**: `PlanningStages` logs `convergence_gate` at DEBUG with min rubric, floor, gate booleans, and rationale.
+
+## Ablations (methodology)
+
+When changing models or prompts, treat harness components as **hypotheses**: remove or relax one gate at a time, re-run `pytest` and the HTTP **benchmark** (`prscope-benchmark`), and record which pieces are load-bearing. Prefer documenting outcomes in this file or `docs/QUALITY_SCORE.md` rather than leaving behavior implicit in code.
+
+## Future: context reset experiments
+
+If long sessions show quality cliffs or premature convergence, consider **round-boundary context resets** with a handoff payload of current plan + decision graph + open issues (not full chat). This is **not** implemented by default; validate with benchmarks before enabling.
+
 ## Change-Safety Checklist
 
 When editing harness code, keep these fixed:

@@ -147,6 +147,8 @@ class PlanningConfig:
     issue_dedupe: IssueDedupeConfig = field(default_factory=IssueDedupeConfig)
     issue_graph: IssueGraphConfig = field(default_factory=IssueGraphConfig)
     clarification_timeout_seconds: int = 600
+    # Minimum score on each plan_rubric axis (0–10) required for convergence; min(axis scores) must be >= this.
+    plan_rubric_floor: float = 7.25
 
 
 @dataclass
@@ -443,6 +445,7 @@ class PrscopeConfig:
             issue_dedupe=dedupe_config,
             issue_graph=issue_graph_config,
             clarification_timeout_seconds=int(planning_data.get("clarification_timeout_seconds", 600)),
+            plan_rubric_floor=float(planning_data.get("plan_rubric_floor", 7.25)),
         )
 
         repos_data = data.get("repos", {})

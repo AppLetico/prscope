@@ -11,7 +11,7 @@ Grading: **A** = solid, well-tested, documented | **B** = functional, minor gaps
 | **Foundation** (`config`, `pricing`, `model_catalog`, `profile`, `semantic`) | B | Well-tested. `config.py` is stable. `semantic.py` could use more edge-case coverage. |
 | **Storage** (`store.py`) | A | Thorough test coverage. Protected field guards. Schema is stable. |
 | **Planning Core** (`planning/core.py`, `planning/executor.py`) | A | State machine is well-specified with invariant enforcement. Executor has durable command log. |
-| **Planning Runtime** (`planning/runtime/*`) | A | Runtime now has an explicit `signals -> reasoners -> orchestration` split, graph-backed follow-up state, and targeted unit coverage for discovery/refinement/review/convergence reasoners. `orchestration.py` remains large but semantic policy is no longer distributed through helper modules. |
+| **Planning Runtime** (`planning/runtime/*`) | A | Runtime has `signals -> reasoners -> orchestration`, graph-backed follow-up state, and **Tier-A harness gates**: `plan_rubric` min-floor, closed `blocking_categories`, `acceptance_criteria` + plan-evidence checks, no `stalled_refinement` escape, convergence postcondition (`acceptance_contract.py`). Ablate gates deliberately when tuning models (see `docs/agent-harness.md`). |
 | **Planning Scanners** (`planning/scanners/*`) | B | grep backend is reliable. repomap/repomix backends are less exercised. |
 | **Memory** (`memory.py`) | B | Rebuild logic and skill loading are tested. Manifesto parsing is solid. Memory block summarization depends on LLM availability. |
 | **Scoring** (`scoring.py`) | B | Rule-based scoring with good unit tests. Feature config is stable. |

@@ -10,7 +10,8 @@ from prscope.planning.runtime.reasoning import (
 
 
 @pytest.mark.asyncio
-async def test_convergence_reasoner_detects_stalled_refinement() -> None:
+async def test_convergence_reasoner_no_stalled_escape_hatch_with_open_roots() -> None:
+    """Stalled-refinement shortcut removed: open root issues must block convergence."""
     reasoner = ConvergenceReasoner()
 
     decision = await reasoner.decide(
@@ -33,5 +34,5 @@ async def test_convergence_reasoner_detects_stalled_refinement() -> None:
         )
     )
 
-    assert decision.converged is True
-    assert decision.rationale == "stalled_refinement"
+    assert decision.converged is False
+    assert decision.rationale == "review_open_issues"

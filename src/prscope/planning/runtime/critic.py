@@ -66,6 +66,15 @@ LOCALIZED_REUSE_SCOPE_PATTERNS = (
     ),
 )
 
+# Plan harness: rubric axes, blocking categories (closed vocabulary), missing rubric fill.
+PLAN_RUBRIC_AXIS_KEYS: tuple[str, ...] = ("specificity", "testability", "coherence", "evidence_alignment")
+VALID_BLOCKING_CATEGORIES: frozenset[str] = frozenset({"testability", "evidence", "vagueness", "scope"})
+MISSING_RUBRIC_SCORE: float = 0.0
+
+
+def _default_plan_rubric() -> dict[str, float]:
+    return dict.fromkeys(PLAN_RUBRIC_AXIS_KEYS, 8.0)
+
 
 class CriticParseError(RuntimeError):
     """Raised on malformed reviewer contract responses."""
@@ -144,6 +153,21 @@ class ReviewResult:
     issue_priority: list[str]
     prose: str
     parse_error: str | None = None
+    # Harness (Tier A): enforced at convergence; permissive defaults for tests / manual construction.
+    plan_rubric: dict[str, float] = field(default_factory=_default_plan_rubric)
+    rubric_incomplete: bool = False
+    blocking_categories: list[str] = field(default_factory=list)
+    blocking_categories_invalid: bool = False
+    acceptance_criteria: list[str] = field(default_factory=list)
+
+    @property
+    def blockers_ok(self) -> bool:
+        return len(self.blocking_categories) == 0 and not self.blocking_categories_invalid
+
+    def min_plan_rubric_score(self) -> float:
+        if not self.plan_rubric:
+            return 0.0
+        return float(min(self.plan_rubric.values()))
 
 
 @dataclass
@@ -159,12 +183,37 @@ class ImplementabilityResult:
 # Backwards-compatibility aliases during migration.
 CriticResult = ReviewResult
 
+_HARNESS_JSON_SENTINEL = object()
 
-REVIEWER_SYSTEM_PROMPT = """You are a senior staff engineer reviewing a design proposal.
-Prioritize identifying architectural flaws over minor improvements.
-Your goal is to improve the design, not simply criticize it.
+REVIEWER_CALIBRATION_FEWSHOTS = """
+## Required calibration examples (follow this strictness)
 
-Scope discipline rules:
+### BAD (too lenient — do NOT emulate)
+Plan: "We will improve the API and add tests." Reviewer gives design_quality_score 8, empty blocking_issues, vague praise.
+This is INVALID: vagueness must be a blocking issue; testability and evidence_alignment rubric scores must be low; blocking_categories should include vagueness and testability.
+
+### GOOD (appropriate gatekeeper)
+Same plan. Reviewer: blocking_issues include "No concrete routes, files, or acceptance tests named"; design_quality_score <= 6; plan_rubric testability <= 4; evidence_alignment <= 4; blocking_categories: ["vagueness","testability"]; acceptance_criteria rewritten to falsifiable bullets only.
+
+You must behave like the GOOD example, not the BAD one.
+"""
+
+REVIEWER_SYSTEM_PROMPT = (
+    """You are an adversarial staff engineer acting as a GATEKEEPER, not a polite collaborator.
+Optimize for correctness, testability, and evidence — not for agreement or a smooth conversation.
+"Seems fine" is never sufficient justification. If you label an issue minor, you must state explicitly why it is NOT major.
+
+GLOBAL RULE (non-negotiable): Mode-specific user hints (validation, stabilization) must NEVER override blocking standards.
+If the plan is vague, untestable, or makes claims without repo path / constraint / manifesto / prior-decision linkage, that remains BLOCKING regardless of mode.
+
+Gatekeeper standards:
+- Vague plans → blocking_issues (not buried in minor concerns).
+- Missing or non-actionable test strategy → blocking; use blocking_categories "testability" when applicable.
+- Architectural or behavioral claims without evidence (backtick file paths, constraints, manifesto, decision graph) → blocking; use "evidence".
+- Prefer false positives over silent misses.
+- Never downgrade a serious gap to "architectural_concern" to avoid conflict.
+
+Scope discipline rules (still apply when they do not contradict the gatekeeper standards above):
 - Preserve the user's requested scope unless broader changes are clearly required by repository evidence or explicit constraints.
 - Do not recommend authentication, authorization, cross-service dependency checks, or major contract expansion for a simple health/status endpoint unless the requirements explicitly ask for them or the design would otherwise expose sensitive data.
 - A public `/health` endpoint is acceptable by default; treat it as a problem only if the plan exposes secrets, private diagnostics, or privileged controls.
@@ -176,19 +225,30 @@ Scope discipline rules:
 - For localized UI or API-wiring requests that explicitly say to reuse existing helpers/endpoints and avoid new endpoints, do not escalate into new service layers, shared utility modules, state-management rewrites, or broad page-action redesigns unless verified repository evidence shows the current structure cannot support the request.
 - For localized UI requests that simply say to show the latest result/status, do not treat unspecified display formatting as a blocking flaw; a simple success/failure presentation is acceptable unless the requirements or verified repository evidence call for richer formatting.
 
+"""
+    + REVIEWER_CALIBRATION_FEWSHOTS
+    + """
+
+Acceptance criteria (per round):
+- Emit acceptance_criteria: list[str] of short, FALSIFIABLE bullets for what "done" means this round (observable in the plan markdown).
+- Reject subjective fluff: do NOT use criteria like "plan is clear", "architecture is solid", "robust", "good enough".
+- Each criterion should be checkable from the plan text (sections, file paths, named tests, enumerated behaviors).
+
+plan_rubric object (required): scores 0–10 for EACH key exactly:
+- specificity: actionable detail vs generic boilerplate
+- testability: verifiable steps / tests / acceptance
+- coherence: the plan hangs together
+- evidence_alignment: claims tied to repo paths, constraints, manifesto, or recorded decisions; low if claims lack linkage
+
+blocking_categories (required): list[str], each MUST be one of: testability | evidence | vagueness | scope
+Use [] only when no category applies. Do NOT invent new category strings.
+
 First perform structured analysis using these headings:
 
 ### Problem Reconstruction
-Restate the problem in your own words. What is actually being solved?
-
 ### Architecture Model
-Reconstruct the proposed architecture. What are the key components, interfaces, and data flows?
-
 ### Failure Simulation
-Simulate 2-3 realistic failure scenarios. What breaks under concurrency, partial failure, or edge cases?
-
 ### Simplification Opportunities
-Can any component be removed entirely? Can mechanisms be merged? Can derived state replace stored state?
 
 Then output the JSON review exactly as specified below.
 Do NOT wrap JSON in markdown fences.
@@ -209,6 +269,9 @@ Required JSON fields:
 - resolved_issues: list[str]
 - constraint_violations: list[str] (constraint IDs violated)
 - issue_priority: list[str] (issues ranked highest impact first)
+- plan_rubric: object with keys specificity, testability, coherence, evidence_alignment (numbers [0,10])
+- blocking_categories: list[str] (subset of testability|evidence|vagueness|scope, or [])
+- acceptance_criteria: list[str] (falsifiable bullets; use [] if none this round)
 
 Review process (perform in order):
 1) Understand the problem
@@ -228,6 +291,7 @@ Review process (perform in order):
 15) Ask reviewer questions
 16) Recommend concrete improvements
 17) Evaluate constraints and rank issue priority
+18) Assign plan_rubric, blocking_categories, acceptance_criteria consistent with blocking_issues
 
 If a significantly simpler architecture can solve the problem, set simplest_possible_design.
 Otherwise set it to null.
@@ -237,9 +301,8 @@ Only propose a completely different architecture if the current design has funda
 
 After listing issues, identify the single issue that would most improve the design if fixed.
 Return it as primary_issue (or null if no serious issue exists).
-
-Focus primarily on solution quality and architectural clarity.
 """
+)
 
 ARCHITECTURE_PERSPECTIVE_PROMPT = """Focus only on architecture quality.
 Analyze component boundaries, responsibilities, coupling, data flow, and scaling implications.
@@ -581,6 +644,57 @@ class CriticAgent:
                 pass
             search_start = end
 
+    @staticmethod
+    def _parse_plan_rubric_field(data: dict[str, Any]) -> tuple[dict[str, float], bool]:
+        raw = data.get("plan_rubric", _HARNESS_JSON_SENTINEL)
+        incomplete = False
+        if raw is _HARNESS_JSON_SENTINEL:
+            incomplete = True
+            return dict.fromkeys(PLAN_RUBRIC_AXIS_KEYS, MISSING_RUBRIC_SCORE), incomplete
+        if not isinstance(raw, dict):
+            raise CriticParseError("plan_rubric must be an object")
+        rubric: dict[str, float] = {}
+        for axis in PLAN_RUBRIC_AXIS_KEYS:
+            if axis not in raw:
+                incomplete = True
+                rubric[axis] = MISSING_RUBRIC_SCORE
+                continue
+            val = raw[axis]
+            if not isinstance(val, (int, float)):
+                raise CriticParseError(f"plan_rubric.{axis} must be a number")
+            score = float(val)
+            if score < 0.0 or score > 10.0:
+                raise CriticParseError(f"plan_rubric.{axis} must be in [0,10]")
+            rubric[axis] = score
+        return rubric, incomplete
+
+    @staticmethod
+    def _parse_blocking_categories_field(data: dict[str, Any]) -> tuple[list[str], bool]:
+        raw = data.get("blocking_categories", _HARNESS_JSON_SENTINEL)
+        if raw is _HARNESS_JSON_SENTINEL:
+            return [], True
+        if not isinstance(raw, list):
+            raise CriticParseError("blocking_categories must be a list")
+        normalized: list[str] = []
+        invalid = False
+        for item in raw:
+            token = str(item).strip().lower().replace(" ", "_").replace("-", "_")
+            if token in VALID_BLOCKING_CATEGORIES:
+                if token not in normalized:
+                    normalized.append(token)
+            else:
+                invalid = True
+        return normalized, invalid
+
+    @staticmethod
+    def _parse_acceptance_criteria_field(data: dict[str, Any]) -> list[str]:
+        raw = data.get("acceptance_criteria", [])
+        if raw is None:
+            return []
+        if not isinstance(raw, list):
+            raise CriticParseError("acceptance_criteria must be a list")
+        return [str(x).strip() for x in raw if str(x).strip()]
+
     def _parse_review_response(
         self,
         raw: str,
@@ -625,6 +739,10 @@ class CriticAgent:
         constraint_violations = [str(item) for item in optional_values.get("constraint_violations", [])]
         issue_priority = [str(item) for item in optional_values.get("issue_priority", [])]
 
+        plan_rubric, rubric_incomplete = CriticAgent._parse_plan_rubric_field(data)
+        blocking_categories, blocking_categories_invalid = CriticAgent._parse_blocking_categories_field(data)
+        acceptance_criteria = CriticAgent._parse_acceptance_criteria_field(data)
+
         return ReviewResult(
             strengths=[str(item) for item in data["strengths"]],
             architectural_concerns=[str(item) for item in data["architectural_concerns"]],
@@ -642,6 +760,11 @@ class CriticAgent:
             constraint_violations=constraint_violations,
             issue_priority=issue_priority,
             prose=prose,
+            plan_rubric=plan_rubric,
+            rubric_incomplete=rubric_incomplete,
+            blocking_categories=blocking_categories,
+            blocking_categories_invalid=blocking_categories_invalid,
+            acceptance_criteria=acceptance_criteria,
         )
 
     @staticmethod
@@ -685,6 +808,9 @@ class CriticAgent:
         return any(pattern.search(normalized) for pattern in LOCALIZED_REUSE_SCOPE_PATTERNS)
 
     def _apply_scope_discipline(self, requirements: str, review: ReviewResult) -> ReviewResult:
+        # Hard rule: never strip issues when category blockers are present (avoids critic→strip→converge ghosts).
+        if review.blocking_categories or review.blocking_categories_invalid:
+            return review
         apply_health_filter = self._is_lightweight_health_request(requirements)
         apply_localized_filter = self._is_localized_reuse_request(requirements)
         if not apply_health_filter and not apply_localized_filter:
@@ -731,6 +857,11 @@ class CriticAgent:
             issue_priority=issue_priority,
             prose=review.prose,
             parse_error=review.parse_error,
+            plan_rubric=dict(review.plan_rubric),
+            rubric_incomplete=review.rubric_incomplete,
+            blocking_categories=list(review.blocking_categories),
+            blocking_categories_invalid=review.blocking_categories_invalid,
+            acceptance_criteria=list(review.acceptance_criteria),
         )
 
     @staticmethod
@@ -780,19 +911,19 @@ class CriticAgent:
             return (
                 "Validation mode:\n"
                 "Evaluate whether recent section updates resolved previously identified issues.\n"
-                "Do not introduce new critiques unless they represent serious defects.\n"
-                "Focus on confirming or rejecting fixes.\n"
-                "Keep the score stable when the revision meaningfully addresses the prior issue set.\n"
-                "Do not reduce the score for low-severity ambiguity that can be handled by existing repo conventions."
+                "You must still apply the global gatekeeper standards: vagueness, missing testability, and "
+                "ungrounded claims remain BLOCKING even when confirming fixes.\n"
+                "You may close issues that are truly fixed, but do not soften rubric scores or "
+                "blocking_categories to 'move on' if defects remain.\n"
+                "Update plan_rubric, blocking_categories, and acceptance_criteria to match the current plan text."
             )
         if mode == "stabilization":
             return (
                 "Stabilization mode:\n"
                 "The design has changed significantly across rounds without improvement.\n"
                 "Focus on stabilizing the architecture and refining the current design.\n"
-                "Avoid proposing brand-new architectural directions unless required.\n"
-                "Prefer incremental closure of already-known issues over surfacing new minor concerns.\n"
-                "Only reduce the design score if you observe a concrete regression or still-open major issue."
+                "Global gatekeeper standards still apply: do not trade honesty for closure.\n"
+                "Prefer incremental closure only when issues are actually resolved—not by reclassifying them as minor."
             )
         if mode == "implementability":
             return (
@@ -964,6 +1095,26 @@ class CriticAgent:
                     if mode == "implementability":
                         return self._parse_implementability_response(raw)
                     parsed = self._parse_review_response(raw)
+                    if parsed.rubric_incomplete:
+                        await self._emit(
+                            {
+                                "type": "warning",
+                                "message": (
+                                    "Reviewer omitted or partially omitted plan_rubric axes; "
+                                    f"defaulted missing scores to {MISSING_RUBRIC_SCORE} (rubric_incomplete)."
+                                ),
+                            }
+                        )
+                    if parsed.blocking_categories_invalid:
+                        await self._emit(
+                            {
+                                "type": "warning",
+                                "message": (
+                                    "blocking_categories contained unknown tokens or was omitted; "
+                                    "convergence will fail closed until fixed."
+                                ),
+                            }
+                        )
                     return self._apply_scope_discipline(requirements, parsed)
                 except CriticParseError as exc:
                     last_parse_error = exc

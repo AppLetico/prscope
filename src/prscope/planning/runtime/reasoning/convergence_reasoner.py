@@ -40,27 +40,35 @@ class ConvergenceReasoner(Reasoner[ConvergenceDecision]):
         issue_trend_ready = len(recent_issue_history) >= 3 and all(
             recent_issue_history[idx] <= recent_issue_history[idx - 1] for idx in range(1, len(recent_issue_history))
         )
-        stalled_refinement = (
-            signals.round_number >= 3
-            and len(score_history) >= 3
-            and (max(score_history[-3:]) - min(score_history[-3:])) <= 0.2
-            and len(recent_issue_history) >= 3
-            and len(set(recent_issue_history)) == 1
-            and signals.design_quality_score >= 7.0
-            and signals.constraint_violation_count == 0
-            and signals.implementable
+        legacy_converged = base_ready and stability_ready and issue_trend_ready and signals.implementable
+        harness_ok = (
+            signals.rubric_floor_ok
+            and signals.blockers_ok
+            and not signals.rubric_incomplete
+            and signals.acceptance_structurally_valid
+            and signals.acceptance_satisfied
         )
-        converged = (
-            base_ready and stability_ready and issue_trend_ready and signals.implementable
-        ) or stalled_refinement
+        converged = legacy_converged and harness_ok
         stability_signals = [
             f"architecture_stable:{architecture_stable}",
             f"score_stable:{score_stable}",
             f"issue_trend_ready:{issue_trend_ready}",
+            f"harness_ok:{harness_ok}",
         ]
         rationale = "review_complete" if converged else "review_open_issues"
-        if stalled_refinement:
-            rationale = "stalled_refinement"
+        if legacy_converged and not harness_ok:
+            if not signals.rubric_floor_ok:
+                rationale = "rubric_below_floor"
+            elif signals.rubric_incomplete:
+                rationale = "rubric_incomplete"
+            elif not signals.blockers_ok:
+                rationale = "blocking_categories"
+            elif not signals.acceptance_structurally_valid:
+                rationale = "acceptance_criteria_invalid"
+            elif not signals.acceptance_satisfied:
+                rationale = "acceptance_not_evidence"
+            else:
+                rationale = "harness_gate_failed"
         elif not stability_ready:
             rationale = "stability_not_met"
         return ConvergenceDecision(

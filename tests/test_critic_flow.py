@@ -39,6 +39,9 @@ def _make_agent(tmp_path: Path) -> CriticAgent:
 
 
 def test_reviewer_prompt_preserves_scope_for_simple_health_endpoints() -> None:
+    assert "GATEKEEPER" in REVIEWER_SYSTEM_PROMPT
+    assert "plan_rubric" in REVIEWER_SYSTEM_PROMPT
+    assert "blocking_categories" in REVIEWER_SYSTEM_PROMPT
     assert "Preserve the user's requested scope" in REVIEWER_SYSTEM_PROMPT
     assert "A public `/health` endpoint is acceptable by default" in REVIEWER_SYSTEM_PROMPT
     assert "Add a lightweight /health endpoint and tests for it" in REVIEWER_SYSTEM_PROMPT
@@ -69,6 +72,14 @@ def _review_json(
     if include_optional:
         payload["simplest_possible_design"] = "Single orchestrator with derived state"
         payload["primary_issue"] = "Missing rollback strategy"
+    payload["plan_rubric"] = {
+        "specificity": 7.5,
+        "testability": 7.5,
+        "coherence": 7.5,
+        "evidence_alignment": 7.5,
+    }
+    payload["blocking_categories"] = []
+    payload["acceptance_criteria"] = []
     return json.dumps(payload)
 
 
