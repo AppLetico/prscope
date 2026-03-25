@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 
 from prscope.store import Store
 from prscope.web.api import create_app
+from prscope.web.events import SessionEventEmitter
 
 
 def _write_minimal_config(tmp_path):
@@ -267,3 +268,64 @@ def test_round_value_error_returns_conflict_instead_of_500(tmp_path, monkeypatch
     assert detail["reason"] == "command_failed"
     assert "required section is empty: Architecture" in detail["detail"]
     assert detail["status"] == "refining"
+
+
+def _first_sse_session_state(client: TestClient, path: str, params: dict) -> dict:
+    body = ""
+    with client.stream("GET", path, params=params) as response:
+        assert response.status_code == 200
+        for chunk in response.iter_bytes():
+            body += chunk.decode("utf-8", errors="replace")
+            if "\n\n" in body and "session_state" in body:
+                break
+    for block in body.split("\n\n"):
+        if not block.strip():
+            continue
+        event_type = None
+        data_line = None
+        for line in block.split("\n"):
+            if line.startswith("event:"):
+                event_type = line[6:].strip()
+            elif line.startswith("data:"):
+                data_line = line[5:].strip()
+        if event_type == "session_state" and data_line:
+            return json.loads(data_line)
+    raise AssertionError(f"no session_state event in SSE body: {body!r}")
+
+
+async def _subscribe_no_wait(self, session_id: str):  # type: ignore[no-untyped-def]
+    """End SSE stream after initial snapshot (real subscribe blocks forever on queue.get)."""
+    del self, session_id
+    if False:
+        yield {}
+
+
+def test_events_stream_repo_param_matches_session_get(tmp_path, monkeypatch):
+    """SSE initial snapshot uses the same repo-scoped store as other session routes."""
+    _write_minimal_config(tmp_path)
+    monkeypatch.setenv("PRSCOPE_CONFIG_ROOT", str(tmp_path))
+    monkeypatch.setattr("prscope.store.get_prscope_dir", lambda repo_root=None: tmp_path / ".prscope")
+    monkeypatch.setattr(SessionEventEmitter, "subscribe", _subscribe_no_wait)
+    app = create_app()
+    client = TestClient(app)
+
+    repo_name = tmp_path.name
+    store = Store()
+    session = store.create_planning_session(
+        repo_name=repo_name,
+        title="SSE repo",
+        requirements="r",
+        seed_type="requirements",
+        status="refining",
+    )
+
+    detail = client.get(f"/api/sessions/{session.id}", params={"repo": repo_name}).json()
+    assert detail["session"]["status"] == "refining"
+
+    sse_state = _first_sse_session_state(
+        client,
+        f"/api/sessions/{session.id}/events",
+        params={"repo": repo_name},
+    )
+    assert sse_state["status"] == detail["session"]["status"]
+    assert int(sse_state.get("current_round", -1)) == int(detail["session"].get("current_round", -1))

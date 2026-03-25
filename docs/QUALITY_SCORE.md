@@ -17,7 +17,7 @@ Grading: **A** = solid, well-tested, documented | **B** = functional, minor gaps
 | **Scoring** (`scoring.py`) | B | Rule-based scoring with good unit tests. Feature config is stable. |
 | **GitHub Integration** (`github.py`) | B | PR sync tested. Rate limiting and pagination could be more robust. |
 | **Web API** (`web/api.py`) | B | Command model is well-tested. SSE contract is documented. Some wrapper endpoints have lighter coverage. |
-| **Web Frontend** (`web/frontend/`) | B | 2 test files with 12 tests covering timeline reducer, buildTimeline, upsertToolCall, and hasRunningToolCalls. No integration or e2e tests. Timeline architecture is well-structured with reducer-based state management. |
+| **Web Frontend** (`web/frontend/`) | B | Vitest unit tests plus **Tier 1 Playwright** smoke (health, `/api/sessions`, `/` and `/new` shell) in CI. No LLM-backed e2e in default CI. Timeline architecture is reducer-based. |
 | **Benchmark** (`benchmark.py`) | B | HTTP-based, repeatable. Historical tracking works. No automated regression gate in CI yet. |
 | **Documentation** | A- | Runtime docs now cover the reasoning layer, decision-graph-backed plan artifacts, and frontend graph rendering. Remaining gap: no automated stale-doc detection. |
 | **CI / Linting** | B | Standard ruff + eslint. Structural import lints are new (`test_architecture.py`). No custom lint rules with agent-friendly remediation messages yet. |
@@ -27,7 +27,8 @@ Grading: **A** = solid, well-tested, documented | **B** = functional, minor gaps
 ### High Priority
 
 - [ ] Frontend test coverage: `PlanningView.test.ts` (10 tests: reducer, buildTimeline, upsertToolCall) and `ChatPanel.test.ts` (2 tests: hasRunningToolCalls) exist. No component unit tests for `ActionBar`, `PlanPanel`, `ToolCallStream`.
-- [ ] No e2e test harness for the web UI (no Playwright/Cypress).
+- [x] Tier 1 Playwright smoke in CI (`src/prscope/web/frontend/e2e/`).
+- [ ] Full-stack e2e (create session, draft, run round) with API keys — optional / manual.
 - [ ] `orchestration.py` is still the largest runtime module. Continue shrinking coordinator size as helper seams become clearer.
 
 ### Medium Priority

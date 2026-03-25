@@ -1872,12 +1872,17 @@ def create_app() -> FastAPI:
         return {"diff": diff}
 
     @app.get("/api/sessions/{session_id}/events")
-    async def stream_events(session_id: str) -> EventSourceResponse:
+    async def stream_events(
+        session_id: str,
+        repo: Optional[str] = Query(default=None),
+    ) -> EventSourceResponse:
         async def event_generator() -> Any:
             try:
-                session = Store().get_planning_session(session_id)
+                repo_name = _repo_for_session(session_id, repo)
+                _, store, _ = _runtime_for(repo_name=repo_name)
+                session = store.get_planning_session(session_id)
                 if session is not None:
-                    snapshot = _build_session_snapshot(session_id, Store())
+                    snapshot = _build_session_snapshot(session_id, store)
                     yield {
                         "event": "session_state",
                         "data": json.dumps({k: v for k, v in snapshot.items() if k != "type"}),

@@ -5,6 +5,7 @@ Web server bootstrap for prscope UI.
 from __future__ import annotations
 
 import logging
+import os
 import socket
 import subprocess
 import sys
@@ -33,6 +34,24 @@ from .api import create_app
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8420
+
+# Opt-in for binding on all interfaces (0.0.0.0 / ::). Prscope has no API auth; do not expose raw.
+PUBLIC_BIND_ENV = "PRSCOPE_ALLOW_PUBLIC_BIND"
+
+
+def require_safe_bind_host(host: str) -> None:
+    """
+    Refuse wildcard binds unless PRSCOPE_ALLOW_PUBLIC_BIND=1.
+
+    Direct `uvicorn ... --host 0.0.0.0` bypasses this helper; set the same env var there.
+    """
+    h = (host or "").strip()
+    if h in ("0.0.0.0", "::"):
+        if os.environ.get(PUBLIC_BIND_ENV) != "1":
+            raise RuntimeError(
+                f"Refusing to bind to {h!r}: Prscope has no API authentication. "
+                f"To override, set {PUBLIC_BIND_ENV}=1 (not recommended on untrusted networks)."
+            )
 
 
 class InterceptHandler(logging.Handler):
@@ -124,6 +143,7 @@ def create_server_app() -> object:
 
 
 def run_server(host: str = DEFAULT_HOST, port: int = DEFAULT_PORT) -> None:
+    require_safe_bind_host(host)
     uvicorn.run("prscope.web.server:create_server_app", host=host, port=port, log_level="info", factory=True)
 
 
@@ -142,6 +162,8 @@ def ensure_server_running(
         if open_browser:
             webbrowser.open(url)
         return True, url
+
+    require_safe_bind_host(host)
 
     cmd = [
         sys.executable,

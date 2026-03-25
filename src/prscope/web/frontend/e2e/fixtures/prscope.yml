@@ -1,0 +1,5 @@
+# Minimal config for Tier-1 Playwright smoke (no LLM calls in smoke tests).
+local_repo: .
+planning:
+  author_model: gpt-4o-mini
+  critic_model: gpt-4o-mini

@@ -55,10 +55,12 @@ benchmarks/                ← prompt suites, configs, historical results
 ```bash
 make dev            # install with dev deps
 make check          # lint + format check + tests
-make ci             # full CI parity (includes frontend)
+make ci             # full CI parity (frontend build + Playwright Tier 1 smoke)
 make web-backend    # uvicorn on :8420
 make web-frontend   # vite on :5173
 ```
+
+**Web bind safety:** `prscope.web.server.run_server` and the CLI-spawned server refuse `--host 0.0.0.0` or `::` unless `PRSCOPE_ALLOW_PUBLIC_BIND=1`. The API has no authentication; do not expose it on untrusted networks. Running `uvicorn` yourself bypasses that guard — set the same env var if you intentionally bind all interfaces.
 
 ## Testing
 
@@ -83,3 +85,5 @@ Performance-sensitive changes require a benchmark run — see `CONTRIBUTING.md`.
 - `prscope.yml` — main config (repos, planning settings, scanner backend)
 - `prscope.features.yml` — feature definitions for PR scoring
 - `.env` — API keys (never committed)
+
+**Frontend e2e (local):** from `src/prscope/web/frontend`, run `npm run e2e` (starts API via `playwright.config` webServer; uses repo `.venv` Python when present).

@@ -80,6 +80,7 @@ ci: lint
 	ruff format --check .
 	pytest -q
 	@cd src/prscope/web/frontend && npm run lint && npm run build
+	@cd src/prscope/web/frontend && npx playwright install chromium && npx playwright test --project=chromium
 
 # Clean build artifacts
 clean:

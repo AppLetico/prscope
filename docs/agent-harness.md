@@ -26,7 +26,10 @@ Core components:
   - Canonical command endpoint: `POST /api/sessions/{id}/command`
   - Wrapper endpoints (`/message`, `/round`, `/approve`, `/export`, `/stop`) route through the same executor
   - Command gate order: replay -> allowed revalidation -> processing lock -> reserve row
-  - SSE endpoint with **snapshot-on-connect** (`session_state` emitted first)
+  - SSE endpoint with **snapshot-on-connect** (`session_state` emitted first); optional query `repo=` uses the same repo-scoped `Store` as other session routes for that initial snapshot
+  - `POST /api/sessions/{id}/clarify` **does not** go through the command executor (see [Clarification vs commands](#clarification-vs-commands))
+- `src/prscope/web/server.py`
+  - `run_server` / `ensure_server_running` refuse binding to `0.0.0.0` or `::` unless `PRSCOPE_ALLOW_PUBLIC_BIND=1` (no API auth by default)
 - `src/prscope/web/events.py`
   - Session-scoped, **multi-subscriber** emitter (`set` of queues per session)
 - `src/prscope/planning/core.py`
@@ -167,6 +170,17 @@ Executor details:
 - Reserve phase writes `planning_commands` row as `running` with lease
 - Execute phase runs handler/pipeline and renews lease heartbeat
 - Finalize phase writes canonical snapshot, marks command `completed`, clears `current_command_id`
+
+## Clarification vs commands
+
+`POST /api/sessions/{id}/clarify` calls `PlanningRuntime.provide_clarification` directly and **does not** create a `planning_commands` row or take the processing lock.
+
+Rationale:
+
+- Clarification answers unblock an in-memory `ClarificationGate` and patch `clarifications_log_json` on the session row; the operation is synchronous and short-lived.
+- Routing it through `execute_command` would either block concurrent `run_round` / other commands or require a new “non-locking command” category.
+
+Revisit this if you need **durable audit rows for every user action** or unified lease semantics for clarification; until then, treat clarify as a coordination primitive, not a planning command.
 
 ## SSE Event Model
 
@@ -323,7 +337,25 @@ Refinement convergence is gated by **feasibility**, not only “review complete�
 - **`blocking_categories`**: closed vocabulary `testability` | `evidence` | `vagueness` | `scope`. Unknown tokens **fail closed** (convergence blocked). Empty `[]` means no category blockers. **`_apply_scope_discipline` does not strip issues** when any category blocker is present or the list is invalid.
 - **`acceptance_criteria`**: falsifiable bullets; a structural check rejects vague wording. Satisfaction is computed from **plan markdown evidence** (shallow text overlap), not a critic self-report flag.
 - **`stalled_refinement`** shortcut was **removed**; convergence must satisfy the full legacy stability checks **and** the harness gates above. A **postcondition** assert runs after each convergence decision (see `acceptance_contract.verify_convergence_postcondition`).
-- **Debug**: `PlanningStages` logs `convergence_gate` at DEBUG with min rubric, floor, gate booleans, and rationale.
+- **Debug**: `PlanningStages` logs `convergence_gate` at DEBUG with min rubric, floor, gate booleans, rationale, **`failed_gate`**, **`failure_delta`** (`rubric_floor` gap below floor when applicable, `acceptance_missing_count`), **`acceptance_missing`**, and **`blocking_categories`**.
+
+### Failure distribution (tuning workflow)
+
+Use DEBUG logs (e.g. `~/.prscope/server.log` when running the web server) to see **why** refinement did not converge, then aggregate across runs:
+
+1. Run **N** comparable sessions (same rough requirements class, same models).
+2. Extract lines containing `convergence_gate` (JSON payload after the message).
+3. Histogram **`failed_gate`** counts: `rubric_incomplete`, `rubric_floor`, `blockers`, `acceptance_structural`, `acceptance_evidence`, `legacy`.
+4. Cross-check **`failure_delta.rubric_floor`** (how far below floor) vs **`acceptance_missing_count`** to separate near-miss rubric from brittle acceptance evidence.
+
+Interpretation hints:
+
+- Many **`rubric_floor`** → critic rubric calibration / few-shots (avoid lowering the floor first).
+- Many **`acceptance_evidence`** with stable **`acceptance_missing`** → matcher or criterion wording.
+- Many **`blockers`** with unstable **`blocking_categories`** across runs → critic inconsistency.
+- **`legacy`** with harness gates passing → convergence reasoner / non-harness signals.
+
+Helper: `python scripts/summarize_convergence_logs.py ~/.prscope/server.log` (or stdin).
 
 ## Ablations (methodology)
 

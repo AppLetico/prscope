@@ -756,10 +756,12 @@ export function PlanningViewPage() {
   const planContent = sessionQuery.data?.current_plan?.plan_content ?? "";
   const currentPlanFollowups = sessionQuery.data?.current_plan?.followups ?? null;
   const snapshot = snapshotQuery.data?.snapshot;
-  const effectiveIssueGraph = snapshot?.issue_graph?.summary?.open_total
-    || (snapshot?.issue_graph?.nodes?.length ?? 0) > 0
-    ? snapshot.issue_graph
-    : fallbackReviewData.issueGraph;
+  const effectiveIssueGraph =
+    (snapshot?.issue_graph?.summary?.open_total ||
+      (snapshot?.issue_graph?.nodes?.length ?? 0) > 0) &&
+    snapshot?.issue_graph
+      ? snapshot.issue_graph
+      : fallbackReviewData.issueGraph;
   const openIssuesCount = effectiveIssueGraph?.summary?.open_total
     ?? (Array.isArray(snapshot?.open_issues) ? snapshot.open_issues.length : 0);
   const constraintViolationsCount = Array.isArray(snapshot?.constraint_eval?.constraint_violations)

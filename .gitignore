@@ -32,6 +32,8 @@ htmlcov/
 
 # Node / frontend
 node_modules/
+src/prscope/web/frontend/test-results/
+src/prscope/web/frontend/playwright-report/
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
