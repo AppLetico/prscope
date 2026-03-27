@@ -1,8 +1,8 @@
 # Prscope Makefile
 # Common development tasks
 
-# Use python3 on macOS, python elsewhere
-PYTHON := $(shell command -v python3 2>/dev/null || echo python)
+# Prefer repo .venv so `make web-backend` etc. work even when another venv is activated.
+PYTHON := $(shell test -x "$(CURDIR)/.venv/bin/python" && echo "$(CURDIR)/.venv/bin/python" || (command -v python3 2>/dev/null || echo python))
 
 .PHONY: install dev test lint format check lint-typecheck ci clean help web web-backend web-frontend web-kill sessions-delete reset
 
@@ -51,11 +51,11 @@ dev:
 
 # Run tests
 test:
-	pytest -v
+	$(PYTHON) -m pytest -v
 
 # Run tests with coverage
 test-cov:
-	pytest --cov=prscope --cov-report=term-missing
+	$(PYTHON) -m pytest --cov=prscope --cov-report=term-missing
 
 # Lint code
 lint:
@@ -68,7 +68,7 @@ format:
 # Check all (lint, format check, tests)
 check: lint
 	ruff format --check .
-	pytest -q
+	$(PYTHON) -m pytest -q
 
 # Lint and typecheck only (no tests): backend ruff + frontend eslint + tsc
 lint-typecheck: lint
@@ -78,7 +78,7 @@ lint-typecheck: lint
 # Full CI parity: what .github/workflows/ci.yml runs (lint, format check, tests, frontend lint + build)
 ci: lint
 	ruff format --check .
-	pytest -q
+	$(PYTHON) -m pytest -q
 	@cd src/prscope/web/frontend && npm run lint && npm run build
 	@cd src/prscope/web/frontend && npx playwright install chromium && npx playwright test --project=chromium
 
@@ -144,7 +144,7 @@ web:
 
 # Start API server (loads .env from repo root). Use --reload for dev (auto-restart on file changes).
 web-backend:
-	@bash -c 'set -a; [ -f .env ] && . ./.env; set +a; exec uvicorn prscope.web.api:create_app --factory --host 127.0.0.1 --port 8420 --reload'
+	@bash -c 'set -a; [ -f .env ] && . ./.env; set +a; exec "$(PYTHON)" -m uvicorn prscope.web.api:create_app --factory --host 127.0.0.1 --port 8420 --reload'
 
 # Start Vite dev server (frontend)
 web-frontend:
