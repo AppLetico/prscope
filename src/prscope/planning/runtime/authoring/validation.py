@@ -13,7 +13,7 @@ from .discovery import (
     path_tokens,
     requirements_keywords,
 )
-from .models import ValidationResult
+from .models import PlanDocument, ValidationResult, apply_section_updates, render_markdown
 
 _RETRYABLE_REASON_CODES = frozenset(
     {
@@ -893,3 +893,39 @@ class AuthorValidationService:
             )
             failures.extend(grounding)
         return self.build_validation_result(failures)
+
+
+def patch_plan_document_localized_backend_grounding(
+    plan: PlanDocument,
+    repo_understanding: Any,
+    requirements_text: str | None,
+) -> PlanDocument:
+    """
+    Append Files Changed entries referencing the web API path and API model test when
+    localized_backend_grounding_failures would fire. Prevents refinement failures when the
+    author draft mentions payload/response changes but omits backtick paths.
+    """
+    md = render_markdown(plan)
+    failures = AuthorValidationService.localized_backend_grounding_failures(md, repo_understanding, requirements_text)
+    if not failures:
+        return plan
+    files_changed = str(plan.files_changed or "")
+    for failure in failures:
+        m = re.search(r"mention `([^`]+)`", str(failure))
+        if not m:
+            continue
+        path = m.group(1).strip()
+        if path in files_changed:
+            continue
+        if "test_web_api_models" in path.lower():
+            rationale = (
+                "Cover the localized backend payload/response adjustment with the existing API model regression test."
+            )
+        else:
+            rationale = "Keep the small backend payload/response adjustment localized to the existing web API path."
+        entry = f"- `{path}`: {rationale}"
+        if not files_changed.strip():
+            files_changed = entry
+        else:
+            files_changed = files_changed.rstrip() + "\n" + entry
+    return apply_section_updates(plan, {"files_changed": files_changed})

@@ -14,6 +14,8 @@ interface ActionBarProps {
   title: string;
   round: number;
   status: SessionStatus;
+  /** When false, refining/draft status shows as idle (no pulse). Omittable for non-session bars. */
+  isProcessing?: boolean;
   convergenceScore?: number;
   sessionCostUsd?: number;
   maxPromptTokens?: number;
@@ -50,6 +52,7 @@ export function ActionBar({
   title,
   round,
   status,
+  isProcessing = false,
   convergenceScore = 0,
   sessionCostUsd = 0,
   maxPromptTokens = 0,
@@ -127,13 +130,21 @@ export function ActionBar({
   );
   const isConverged = isConvergedOrApproved(status);
   const isRefining = status === "refining" || status === "draft";
-  const statusTooltip = {
-    draft: "Collecting requirements and preparing the first plan draft.",
-    refining: "Refining plan with critique rounds.",
-    converged: "Plan has converged and is ready for approval.",
-    approved: "Plan approved.",
-    error: "Session encountered an error and needs attention.",
-  }[status];
+  const refiningActive = isRefining && isProcessing;
+  const showIdleHint =
+    (status === "refining" || status === "draft") && !isProcessing;
+  const statusTooltip =
+    status === "refining" && !isProcessing
+      ? "Refining: idle. The last run finished; run Review again or keep editing."
+      : status === "draft" && !isProcessing
+        ? "Draft: idle. Continue the conversation or request changes."
+        : {
+            draft: "Collecting requirements and preparing the first plan draft.",
+            refining: "Refining plan with critique rounds.",
+            converged: "Plan has converged and is ready for approval.",
+            approved: "Plan approved.",
+            error: "Session encountered an error and needs attention.",
+          }[status];
   
   return (
     <div className="h-14 flex items-center justify-between px-4 border-b border-zinc-800 bg-zinc-950/80 backdrop-blur-md sticky top-0 z-[100]">
@@ -182,15 +193,40 @@ export function ActionBar({
                   {isConverged ? (
                     <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]"></div>
                   ) : isRefining ? (
-                    <div className="w-1.5 h-1.5 rounded-full bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.5)] animate-pulse"></div>
+                    <div
+                      className={clsx(
+                        "w-1.5 h-1.5 rounded-full shadow-[0_0_8px_rgba(245,158,11,0.35)]",
+                        refiningActive
+                          ? "bg-amber-500 animate-pulse"
+                          : "bg-amber-500/55",
+                      )}
+                    ></div>
                   ) : (
                     <div className="w-1.5 h-1.5 rounded-full bg-zinc-500"></div>
                   )}
-                  <span className={clsx(
-                    "text-[10px] font-bold uppercase tracking-widest hidden sm:inline-block",
-                    isConverged ? "text-emerald-400" : isRefining ? "text-amber-400" : "text-zinc-400"
-                  )}>
-                    {status}
+                  <span className="hidden sm:inline-flex items-baseline gap-1">
+                    <span
+                      className={clsx(
+                        "text-[10px] font-bold uppercase tracking-widest",
+                        isConverged
+                          ? "text-emerald-400"
+                          : isRefining
+                            ? refiningActive
+                              ? "text-amber-400"
+                              : "text-amber-400/75"
+                            : "text-zinc-400",
+                      )}
+                    >
+                      {status}
+                    </span>
+                    {showIdleHint && (
+                      <span
+                        className="text-[9px] font-semibold uppercase tracking-wider text-zinc-500"
+                        aria-hidden
+                      >
+                        · idle
+                      </span>
+                    )}
                   </span>
                 </div>
               </div>

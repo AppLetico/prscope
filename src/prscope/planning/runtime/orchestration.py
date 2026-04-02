@@ -313,6 +313,9 @@ class PlanningRuntime:
                 open_issue_history = snapshot.get("open_issue_history", [])
                 if isinstance(open_issue_history, list):
                     state.open_issue_history = [int(item) for item in open_issue_history][-8:]
+                fp = snapshot.get("last_critic_turn_plan_fingerprint")
+                if isinstance(fp, str) and fp.strip():
+                    state.last_critic_turn_plan_fingerprint = fp.strip()
             self._states[session_id] = state
             if len(self._states) > MAX_STATE_CACHE:
                 oldest_session_id = next(iter(self._states))

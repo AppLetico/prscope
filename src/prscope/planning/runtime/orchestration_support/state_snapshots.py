@@ -48,6 +48,7 @@ class RuntimeStateSnapshots:
             "manifesto_excerpt": (state.manifesto or "")[:2000],
             "constraints": [asdict(constraint) for constraint in state.constraints],
             "plan_markdown": state.plan_markdown,
+            "last_critic_turn_plan_fingerprint": getattr(state, "last_critic_turn_plan_fingerprint", "") or "",
             "design_record": self.as_serializable(state.design_record),
             "review": self.as_serializable(state.review),
             "constraint_eval": self.as_serializable(state.constraint_eval),

@@ -1,9 +1,13 @@
 from prscope.planning.runtime.followups import (
+    DecisionGraph,
+    DecisionNode,
     apply_answer_to_graph,
     decision_graph_from_json,
     decision_graph_from_open_questions,
     decision_graph_from_plan,
     decision_graph_to_json,
+    graph_to_followup_questions,
+    infer_followup_options,
     merge_decision_graphs,
 )
 
@@ -156,3 +160,50 @@ def test_decision_graph_json_round_trip_preserves_edges() -> None:
     assert restored.edges
     assert restored.edges[0].source == "architecture.response_schema"
     assert restored.edges[0].target == "architecture.database"
+
+
+def test_infer_followup_options_jwt_errors() -> None:
+    q = "What specific error messages should be returned for different JWT verification failures?"
+    opts = infer_followup_options(q)
+    assert len(opts) == 3
+    joined = " ".join(opts).lower()
+    assert "jwt" in joined or "opaque" in joined or "rfc" in joined
+
+
+def test_infer_followup_options_token_lifecycle_not_jwt_error_pack() -> None:
+    """Renewal/expiry/session questions must not reuse the JWT *error response* option pack."""
+    for q in (
+        "What specific requirements exist for token expiration and renewal?",
+        "Are there any existing mechanisms for session termination, or will JWTs persist until expiry?",
+    ):
+        opts = infer_followup_options(q)
+        joined = " ".join(opts).lower()
+        assert "rfc 6750" not in joined
+        assert "opaque authentication error" not in joined
+        assert "refresh" in joined or "revocation" in joined or "session" in joined
+
+
+def test_graph_to_followup_questions_fills_options_when_catalog_missing() -> None:
+    graph = decision_graph_from_open_questions(
+        "- What specific error messages should be returned for different JWT verification failures?"
+    )
+    questions = graph_to_followup_questions(graph)
+    assert len(questions) == 1
+    assert questions[0].options and len(questions[0].options) == 3
+
+
+def test_explicit_node_options_are_not_replaced_by_inference() -> None:
+    """Catalog-backed open questions use required=False and do not surface as followups; test a manual node."""
+    graph = DecisionGraph()
+    graph.nodes["custom"] = DecisionNode(
+        id="custom",
+        description="Pick a primary color for the UI accent.",
+        options=["Red", "Blue", "Green"],
+        value=None,
+        section="architecture",
+        required=True,
+        concept="accent_color",
+    )
+    questions = graph_to_followup_questions(graph)
+    assert len(questions) == 1
+    assert questions[0].options == ["Red", "Blue", "Green"]

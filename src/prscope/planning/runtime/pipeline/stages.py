@@ -20,6 +20,7 @@ from ..acceptance_contract import (
 )
 from ..author import PlanDocument, RepairPlan, RepoUnderstanding, RevisionResult, apply_section_updates, render_markdown
 from ..authoring.discovery import is_localized_frontend_request
+from ..authoring.validation import patch_plan_document_localized_backend_grounding
 from ..critic import ImplementabilityResult, ReviewResult
 from ..elapsed_ping import run_with_elapsed_thinking
 from ..followups import decision_graph_from_json, decision_graph_from_plan, merge_decision_graphs
@@ -32,6 +33,7 @@ from ..reasoning import (
 )
 from ..review import ManifestoCheckResult, build_impact_view, infer_issue_type
 from ..tools import extract_file_references
+from .plan_fingerprint import plan_content_fingerprint
 from .round_context import PlanningRoundContext
 
 _LOG = logging.getLogger(__name__)
@@ -1289,6 +1291,77 @@ class PlanningStages:
             supplemented = self._restore_missing_implementation_refs(plan=supplemented, current_plan=plan)
         return self._restore_required_refinement_sections(plan=supplemented, current_plan=plan)
 
+    @staticmethod
+    def _merge_revision_result_with_plan(
+        revision_result: RevisionResult,
+        current_plan_doc: PlanDocument,
+        final_plan: PlanDocument,
+    ) -> RevisionResult:
+        """Fold full plan diff into revision_result.updates so downstream saves match final_plan."""
+        merged_updates = dict(revision_result.updates)
+        for field in current_plan_doc.__dataclass_fields__.keys():
+            if str(getattr(current_plan_doc, field, "")) != str(getattr(final_plan, field, "")):
+                merged_updates[field] = str(getattr(final_plan, field, ""))
+        return RevisionResult(
+            problem_understanding=revision_result.problem_understanding,
+            updates=merged_updates,
+            justification=dict(revision_result.justification),
+            what_changed=dict(revision_result.what_changed),
+            review_prediction=revision_result.review_prediction,
+        )
+
+    def _autofix_refinement_plan_to_valid(
+        self,
+        *,
+        updated_plan: PlanDocument,
+        current_plan_doc: PlanDocument,
+        revision_result: RevisionResult,
+        ctx: PlanningRoundContext,
+        revision_repo_understanding: RepoUnderstanding,
+        verified_paths: set[str],
+        supplemental_evidence: dict[str, Any] | None,
+        max_rounds: int = 6,
+    ) -> tuple[PlanDocument, str, RevisionResult]:
+        """
+        Stabilize + patch + validate; on retryable failures, run supplement (same as in-loop repair)
+        until the draft passes or we exhaust rounds. Avoids surfacing command_failed for fixable gates.
+        """
+        plan = updated_plan
+        rr = revision_result
+        last_detail = ""
+        for _ in range(max_rounds):
+            plan = self._stabilize_refinement_plan(
+                plan=plan,
+                current_plan=current_plan_doc,
+                requirements=ctx.requirements,
+                localized_detail_preserver=self._preserve_localized_refinement_detail,
+                verified_paths=verified_paths,
+                supplemental_evidence=supplemental_evidence,
+            )
+            plan = patch_plan_document_localized_backend_grounding(plan, revision_repo_understanding, ctx.requirements)
+            # Patch only mutates Files Changed; re-sync Implementation Steps so validation cannot
+            # fail with "missing from Implementation Steps" for paths added here.
+            plan = self._restore_missing_implementation_refs(plan=plan, current_plan=current_plan_doc)
+            md = render_markdown(plan)
+            val = self._author.validate_refinement_result(
+                plan_content=md,
+                repo_understanding=revision_repo_understanding,
+                verified_paths_extra=verified_paths,
+                requirements_text=ctx.requirements,
+            )
+            if not val.failure_messages:
+                rr = self._merge_revision_result_with_plan(rr, current_plan_doc, plan)
+                return plan, md, rr
+            last_detail = "; ".join(val.failure_messages)
+            if not val.retryable:
+                raise ValueError(last_detail)
+            plan = self._supplement_refinement_plan(
+                plan=plan,
+                failures=list(val.failure_messages),
+                requirements=ctx.requirements,
+            )
+        raise ValueError("Plan draft could not be auto-repaired to pass validation checks. " + last_detail)
+
     def _confirmed_constraint_violations(
         self,
         *,
@@ -1377,6 +1450,7 @@ class PlanningStages:
             round_number=ctx.round_number,
             parse_error=review_result.parse_error,
         )
+        ctx.state.last_critic_turn_plan_fingerprint = plan_content_fingerprint(current_plan_content)
         for item in [*review_result.blocking_issues, *review_result.architectural_concerns]:
             if item.strip():
                 kind = "blocking_issue" if item in review_result.blocking_issues else "architectural_concern"
@@ -1728,6 +1802,10 @@ class PlanningStages:
                 verified_paths=verified_paths,
                 supplemental_evidence=supplemental_evidence,
             )
+            updated_plan = patch_plan_document_localized_backend_grounding(
+                updated_plan, revision_repo_understanding, ctx.requirements
+            )
+            updated_plan = self._restore_missing_implementation_refs(plan=updated_plan, current_plan=current_plan_doc)
             preliminary_markdown = render_markdown(updated_plan)
             grounding_failures = self._author.incremental_grounding_failures(
                 previous_plan_content=previous_plan_content,
@@ -1798,23 +1876,15 @@ class PlanningStages:
             revision_hints = [*base_revision_hints, *retryable_failures]
         previous_version = ctx.core.get_current_plan()
         updated_plan = apply_section_updates(current_plan_doc, revision_result.updates)
-        updated_plan = self._stabilize_refinement_plan(
-            plan=updated_plan,
-            current_plan=current_plan_doc,
-            requirements=ctx.requirements,
-            localized_detail_preserver=self._preserve_localized_refinement_detail,
+        updated_plan, preliminary_markdown, revision_result = self._autofix_refinement_plan_to_valid(
+            updated_plan=updated_plan,
+            current_plan_doc=current_plan_doc,
+            revision_result=revision_result,
+            ctx=ctx,
+            revision_repo_understanding=revision_repo_understanding,
             verified_paths=verified_paths,
             supplemental_evidence=supplemental_evidence,
         )
-        preliminary_markdown = render_markdown(updated_plan)
-        final_validation = self._author.validate_refinement_result(
-            plan_content=preliminary_markdown,
-            repo_understanding=revision_repo_understanding,
-            verified_paths_extra=verified_paths,
-            requirements_text=ctx.requirements,
-        )
-        if final_validation.retryable:
-            raise ValueError("; ".join(final_validation.failure_messages))
         previous_graph = decision_graph_from_json(getattr(previous_version, "decision_graph_json", None))
         candidate_graph = decision_graph_from_plan(
             open_questions=updated_plan.open_questions,
@@ -1835,6 +1905,13 @@ class PlanningStages:
             section
             for section in current_plan_doc.__dataclass_fields__.keys()
             if str(getattr(current_plan_doc, section, "")) != str(getattr(updated_plan, section, ""))
+        )
+        # Graph reconciliation may update open_questions without an author model edit; do not
+        # claim that section in chat when it was not part of revision_result.updates.
+        chat_changed_sections = sorted(
+            s
+            for s in changed_sections
+            if not (s == "open_questions" and "open_questions" not in revision_result.updates)
         )
         version = ctx.core.save_plan_version(
             updated_markdown,
@@ -1858,8 +1935,8 @@ class PlanningStages:
         summary_bits: list[str] = []
         if review_result.primary_issue:
             summary_bits.append(f"Primary issue: {review_result.primary_issue}")
-        if changed_sections:
-            summary_bits.append(f"Updated: {', '.join(changed_sections)}")
+        if chat_changed_sections:
+            summary_bits.append(f"Updated: {', '.join(chat_changed_sections)}")
         await emit_tool(
             "apply_critique",
             "done",
@@ -1868,7 +1945,7 @@ class PlanningStages:
             query=" | ".join(summary_bits) if summary_bits else None,
         )
         resolution_bits: list[str] = []
-        for sec in changed_sections:
+        for sec in chat_changed_sections:
             concrete = revision_result.what_changed.get(sec, "").strip()
             if concrete:
                 resolution_bits.append(f"{sec}: {concrete}")
@@ -1878,7 +1955,7 @@ class PlanningStages:
                     resolution_bits.append(f"{sec}: {why}")
         resolution_block = "\n".join(resolution_bits) if resolution_bits else ""
         turn_lines = [
-            f"Updated sections: {', '.join(changed_sections) if changed_sections else '(none)'}",
+            f"Updated sections: {', '.join(chat_changed_sections) if chat_changed_sections else '(none)'}",
             f"Problem understanding: {revision_result.problem_understanding}",
             f"Review prediction: {revision_result.review_prediction}",
         ]

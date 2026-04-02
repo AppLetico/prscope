@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -67,7 +68,7 @@ class PlanDocument:
     implementation_steps: str
     test_strategy: str
     rollback_plan: str
-    # Legacy/internal-only source field. New rendered plans should not emit this section.
+    # Decision-graph / follow-up field; rendered only when non-trivial (see render_markdown).
     open_questions: str
 
 
@@ -159,6 +160,18 @@ PLAN_SECTION_TITLES: dict[str, str] = {
 }
 
 
+def open_questions_visible_in_markdown(open_questions: str) -> bool:
+    """Whether open_questions should appear as a ## Open Questions section in the plan panel."""
+    s = str(open_questions or "").strip()
+    if not s:
+        return False
+    if re.match(r"^-\s*None\.?\s*$", s, flags=re.IGNORECASE):
+        return False
+    if s.casefold() in {"none", "n/a", "—", "-"}:
+        return False
+    return True
+
+
 def render_markdown(plan: PlanDocument) -> str:
     lines: list[str] = [f"# {plan.title.strip() or 'Plan'}", ""]
     for section_id in PLAN_SECTION_ORDER:
@@ -167,6 +180,11 @@ def render_markdown(plan: PlanDocument) -> str:
             continue
         lines.append(f"## {PLAN_SECTION_TITLES[section_id]}")
         lines.append(content)
+        lines.append("")
+    oq = str(getattr(plan, "open_questions", "") or "").strip()
+    if open_questions_visible_in_markdown(oq):
+        lines.append(f"## {PLAN_SECTION_TITLES['open_questions']}")
+        lines.append(oq)
         lines.append("")
     return "\n".join(lines).strip() + "\n"
 

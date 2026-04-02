@@ -25,6 +25,9 @@ export interface PlanningSession {
   updated_at: string;
   session_total_cost_usd?: number | null;
   max_prompt_tokens?: number | null;
+  /** Present on GET session when max_prompt_tokens and models allow derivation (peak prompt / context window). */
+  context_window_tokens?: number | null;
+  context_usage_ratio?: number | null;
 }
 
 export interface DraftTimingDiagnostics {

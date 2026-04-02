@@ -3,7 +3,8 @@ import { useState, useRef, useEffect } from "react";
 import { clsx } from "clsx";
 import type { ToolCallEntry } from "../types";
 
-const PLAN_PHASE_NAMES: Record<string, { label: string; icon: "draft" | "critique" | "refine" | "search" }> = {
+/** Plan-phase tool names (synthetic tool rows) — shared with Agent Activity status text. */
+export const PLAN_PHASE_NAMES: Record<string, { label: string; icon: "draft" | "critique" | "refine" | "search" }> = {
   draft_plan: { label: "Drafting plan", icon: "draft" },
   design_review: { label: "Design review", icon: "critique" },
   repair_planning: { label: "Planning repair", icon: "draft" },

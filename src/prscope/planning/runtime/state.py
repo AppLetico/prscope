@@ -40,6 +40,8 @@ class PlanningState:
     design_record: DesignRecord | None = None
     architecture: ArchitectureDesign | None = None
     plan_markdown: str | None = None
+    # SHA-256 hex digest of plan markdown last reviewed in design_review (critic turn).
+    last_critic_turn_plan_fingerprint: str = ""
     review: ReviewResult | None = None
     constraint_eval: ReviewResult | ImplementabilityResult | None = None
 

@@ -35,6 +35,7 @@ from ..planning.core import (
 from ..planning.executor import CommandConflictError, CommandContext, HandlerResult, execute_command
 from ..planning.runtime import PlanningRuntime
 from ..planning.runtime.review import build_impact_view
+from ..pricing import context_window_for_model
 from ..store import Store
 from .events import SessionEventEmitter
 
@@ -782,6 +783,20 @@ def _session_to_dict(session: Any) -> dict[str, Any]:
     data["is_processing"] = bool(data.get("is_processing", 0))
     data["active_tool_calls"] = active_tool_calls
     data["completed_tool_call_groups"] = completed_tool_call_groups
+    # Help the UI show context fill after reload (SSE may not have fired yet).
+    author_m = str(data.get("author_model") or "").strip()
+    critic_m = str(data.get("critic_model") or "").strip()
+    max_prompt = int(data.get("max_prompt_tokens") or 0)
+    windows: list[int] = []
+    if author_m:
+        windows.append(context_window_for_model(author_m))
+    if critic_m:
+        windows.append(context_window_for_model(critic_m))
+    if windows and max_prompt > 0:
+        cw = min(windows)
+        if cw > 0:
+            data["context_window_tokens"] = cw
+            data["context_usage_ratio"] = round(min(1.0, float(max_prompt) / float(cw)), 4)
     return data
 
 

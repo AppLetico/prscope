@@ -15,6 +15,7 @@ from .decision_graph import (
     followups_from_json,
     followups_to_json,
     graph_to_followup_questions,
+    infer_followup_options,
     merge_decision_graphs,
 )
 from .engine import FollowupEngine
@@ -37,5 +38,6 @@ __all__ = [
     "followups_from_json",
     "followups_to_json",
     "graph_to_followup_questions",
+    "infer_followup_options",
     "merge_decision_graphs",
 ]

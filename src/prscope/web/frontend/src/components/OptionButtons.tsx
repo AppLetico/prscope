@@ -1,6 +1,19 @@
 import type { DiscoveryQuestion } from "../types";
 import { HelpCircle } from "lucide-react";
 
+/** Strip common markdown from option text for display (matches discovery option rendering). */
+export function formatOptionDisplayText(value: string): string {
+  return value
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/__([^_]+)__/g, "$1")
+    .replace(/\*([^*]+)\*/g, "$1")
+    .replace(/_([^_]+)_/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
 interface OptionButtonsProps {
   questions: DiscoveryQuestion[];
   selectedAnswers: Record<number, string>;
@@ -18,16 +31,6 @@ export function OptionButtons({
   onSelect,
   onOtherInputChange,
 }: OptionButtonsProps) {
-  const toDisplayText = (value: string): string => value
-    .replace(/`([^`]+)`/g, "$1")
-    .replace(/\*\*([^*]+)\*\*/g, "$1")
-    .replace(/__([^_]+)__/g, "$1")
-    .replace(/\*([^*]+)\*/g, "$1")
-    .replace(/_([^_]+)_/g, "$1")
-    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
-    .replace(/\s+/g, " ")
-    .trim();
-
   if (questions.length === 0) return null;
 
   return (
@@ -41,7 +44,7 @@ export function OptionButtons({
               </div>
             </div>
             <p className="text-sm font-medium text-zinc-200 leading-relaxed mt-1.5">
-              {toDisplayText(q.text)}
+              {formatOptionDisplayText(q.text)}
             </p>
           </div>
           
@@ -74,7 +77,7 @@ export function OptionButtons({
                         : "text-zinc-300 group-hover:text-zinc-100"
                     }`}
                   >
-                    {opt.is_other ? "Other (Type your answer below...)" : toDisplayText(opt.text)}
+                    {opt.is_other ? "Other (Type your answer below...)" : formatOptionDisplayText(opt.text)}
                   </span>
                 </div>
               </button>

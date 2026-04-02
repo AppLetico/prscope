@@ -50,11 +50,28 @@ class AdversarialPlanningLoop:
             ctx.event_callback, event, ctx.session_id
         )
 
-        review_result = await self.runtime._stage_design_review(  # noqa: SLF001
-            ctx=ctx,
-            current_plan_content=current_plan.plan_content,
-            emit_tool=emit_tool,
-        )
+        st = ctx.state
+        # Chat messages (user_input set) should drive author revision against the last critique.
+        # Fresh design review runs from the Review button (user_input is None), not from chat.
+        skip_redundant_review = bool(user_input and st.review is not None)
+        if skip_redundant_review:
+            # User sent a refinement message and we already have a critic review — do not
+            # re-run design review (avoids duplicate CRITIC REVIEW chat bubbles). Use Review
+            # for a new scored critique of the current plan.
+            snapshot = ctx.core.transition_and_snapshot(
+                "refining",
+                phase_message="Applying feedback to the plan (reusing last design review)",
+                current_round=ctx.round_number,
+            )
+            await self.runtime._emit_event(ctx.event_callback, snapshot, ctx.session_id)  # noqa: SLF001
+            await emit_tool("design_review", "done", stage="reviewer", duration_ms=0)
+            review_result = st.review
+        else:
+            review_result = await self.runtime._stage_design_review(  # noqa: SLF001
+                ctx=ctx,
+                current_plan_content=current_plan.plan_content,
+                emit_tool=emit_tool,
+            )
         current_plan_doc = self.runtime._plan_document_from_version(  # noqa: SLF001
             current_plan.plan_content, getattr(current_plan, "plan_json", None)
         )

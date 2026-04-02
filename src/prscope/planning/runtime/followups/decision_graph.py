@@ -448,12 +448,122 @@ def decision_graph_from_plan(*, open_questions: str | None, plan_content: str) -
     return graph
 
 
+def infer_followup_options(question: str) -> list[str]:
+    """
+    When the decision graph has no catalog-backed options, synthesize a small set of
+    actionable suggested answers so the UI can offer one-click choices plus write-in.
+    """
+    q = question.strip().lower()
+    if not q:
+        return _generic_followup_options()
+
+    def jwt_auth_errors() -> list[str]:
+        return [
+            "Use distinct machine-readable codes per failure mode (e.g. token_expired vs "
+            "invalid_signature) with a documented HTTP status mapping.",
+            "Return a single opaque authentication error for all JWT failures (no detail to clients).",
+            "Align with RFC 6750 / OAuth2 bearer error shapes for interoperability.",
+        ]
+
+    def error_shape() -> list[str]:
+        return [
+            "Use explicit error codes and messages per failure mode (best for API clients).",
+            "Use a small fixed set of codes with shared user-facing messaging.",
+            "Document the contract in the API spec only; leave implementation flexible.",
+        ]
+
+    def jwt_session_lifecycle_options() -> list[str]:
+        return [
+            "Short-lived access tokens plus refresh with rotation; allow server-side revocation.",
+            "Prefer opaque server-side sessions (or a session store); JWTs are optional.",
+            "JWTs valid until expiry only; document max session length; no mid-session revocation in scope.",
+        ]
+
+    # Token/JWT *lifecycle* (renewal, sessions, revocation) — not API error-shape; must not reuse jwt_auth_errors().
+    _lifecycle_kw = (
+        "expiration",
+        "expiry",
+        "renewal",
+        "refresh",
+        "session",
+        "termination",
+        "terminate",
+        "logout",
+        "revoke",
+        "revocation",
+        "persist",
+        "lifetime",
+        "ttl",
+    )
+    _auth_error_kw = (
+        "error",
+        "failure",
+        "invalid",
+        "opaque",
+        "rfc",
+        "oauth",
+        "status",
+        "response",
+        "message",
+        "verification fail",
+    )
+    if ("token" in q or "jwt" in q) and any(k in q for k in _lifecycle_kw):
+        if not any(k in q for k in _auth_error_kw):
+            return jwt_session_lifecycle_options()
+
+    if any(k in q for k in ("jwt", "jws", "jwe", "bearer token")) or (
+        "token" in q and any(k in q for k in ("invalid", "verif", "sign"))
+    ):
+        return jwt_auth_errors()
+    if "error" in q and any(k in q for k in ("message", "messages", "code", "codes", "status", "return", "response")):
+        return error_shape()
+    if any(k in q for k in ("password", "credential", "secret", "api key", "apikey")):
+        return [
+            "Never return secrets in error bodies; use generic failure messages.",
+            "Allow configurable verbosity (dev vs prod) behind a feature flag.",
+            "Follow existing security review / compliance requirements for this repo.",
+        ]
+    if any(k in q for k in ("migration", "schema", "rollback")):
+        return [
+            "Expand forward-only migration steps with a tested rollback path.",
+            "Use feature flags to gate schema-dependent behavior during rollout.",
+            "Defer schema details; capture as a follow-up task with owners.",
+        ]
+    if any(k in q for k in ("performance", "latency", "slow", "timeout", "cache")):
+        return [
+            "Set explicit SLOs and add benchmarking before rollout.",
+            "Prefer caching / async work where safe; document tradeoffs.",
+            "Keep current behavior; optimize only if metrics show a problem.",
+        ]
+    if any(k in q for k in ("test", "coverage", "verify", "assert")):
+        return [
+            "Add automated tests at the lowest practical level (unit + integration).",
+            "Rely on manual verification for this iteration; automate later.",
+            "Define acceptance checks in the plan and assign an owner.",
+        ]
+    return _generic_followup_options()
+
+
+def _generic_followup_options() -> list[str]:
+    return [
+        "Follow the team's existing standards and reference them in the plan.",
+        "Pick a concrete policy in one paragraph and proceed with that assumption.",
+        "Mark as out of scope for this plan; track as a separate follow-up.",
+    ]
+
+
+def _resolved_followup_options(node: DecisionNode) -> list[str]:
+    if node.options:
+        return list(node.options)
+    return infer_followup_options(node.description)
+
+
 def graph_to_followup_questions(graph: DecisionGraph) -> list[FollowupQuestionArtifact]:
     return [
         FollowupQuestionArtifact(
             id=node.id,
             question=node.description,
-            options=node.options,
+            options=_resolved_followup_options(node),
             target_sections=[node.section],
             concept=node.concept or node.id,
             resolved=bool(str(node.value or "").strip()),

@@ -108,6 +108,7 @@ INTELLIGENCE = {
     "planning.runtime.events.tool_event_state",
     "planning.runtime.pipeline",
     "planning.runtime.pipeline.adversarial_loop",
+    "planning.runtime.pipeline.plan_fingerprint",
     "planning.runtime.pipeline.round_context",
     "planning.runtime.pipeline.stages",
     "planning.runtime.review",

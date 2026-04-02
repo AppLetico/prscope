@@ -1,9 +1,26 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ClarificationPrompt, DiscoveryQuestion, LiveActivityEntry, PlanFollowups, PlanningTurn, ToolCallEntry } from "../types";
-import { OptionButtons } from "./OptionButtons";
-import { ToolCallStream } from "./ToolCallStream";
+import { OptionButtons, formatOptionDisplayText } from "./OptionButtons";
+import { PLAN_PHASE_NAMES, ToolCallStream } from "./ToolCallStream";
 import { ModelSelector } from "./ModelSelector";
-import { Send, Bot, User, Sparkles, Microscope, CheckCircle2, Copy, Check, Square, Loader2, ArrowRight, Zap, MessageSquare, X, ChevronDown, ChevronRight } from "lucide-react";
+import {
+  Send,
+  Bot,
+  User,
+  Sparkles,
+  Microscope,
+  CheckCircle2,
+  Copy,
+  Check,
+  Square,
+  Loader2,
+  ArrowRight,
+  Zap,
+  MessageSquare,
+  X,
+  ChevronDown,
+  ChevronRight,
+} from "lucide-react";
 import { clsx } from "clsx";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -69,7 +86,6 @@ interface ChatPanelProps {
   canApprove?: boolean;
   critiquePending?: boolean;
   contextPercent?: number | null;
-  contextWindowTokens?: number | null;
   onCritique?: () => void;
   onApprove?: () => void;
   onStop?: () => void;
@@ -109,7 +125,6 @@ export function ChatPanel({
   canApprove = false,
   critiquePending = false,
   contextPercent = null,
-  contextWindowTokens = null,
   onCritique,
   onApprove,
   onStop,
@@ -357,10 +372,22 @@ export function ChatPanel({
     if (!selectedIsOther[q.index]) return true;
     return Boolean((otherInputs[q.index] ?? "").trim());
   }).length;
-  const visiblePlanFollowups = useMemo(
-    () => (planFollowups?.questions ?? []).filter((question) => !question.resolved),
-    [planFollowups],
-  );
+  const visiblePlanFollowups = useMemo(() => {
+    const raw = (planFollowups?.questions ?? []).filter((question) => !question.resolved);
+    const seenIds = new Set<string>();
+    const seenQuestions = new Set<string>();
+    return raw.filter((item) => {
+      const id = (item.id ?? "").trim();
+      if (id) {
+        if (seenIds.has(id)) return false;
+        seenIds.add(id);
+      }
+      const norm = item.question.trim().toLowerCase().replace(/\s+/g, " ");
+      if (seenQuestions.has(norm)) return false;
+      seenQuestions.add(norm);
+      return true;
+    });
+  }, [planFollowups]);
   const hasPlanFollowupPanel = visiblePlanFollowups.length > 0 || (planFollowups?.suggestions?.length ?? 0) > 0;
   const canSendMessage = Boolean(input.trim() || focusPrompt?.text.trim());
   const displayedTimeline = useMemo(
@@ -402,11 +429,9 @@ export function ChatPanel({
     if (looksLikeFullPlan) {
       return "Plan updated. Review the full plan in the left panel.";
     }
+    // Critic design reviews: show full text in chat (issue lists, recommendations, etc.).
     if (turn.role === "critic" && raw.toLowerCase().startsWith("design review:")) {
-      const primaryIssueLine = raw
-        .split("\n")
-        .find((line) => line.toLowerCase().startsWith("primary issue:"));
-      return primaryIssueLine ? `${raw.split("\n")[0]}\n\n${primaryIssueLine}` : raw.split("\n")[0];
+      return raw;
     }
     if (turn.role === "author" && raw.startsWith("Repair planning complete.")) {
       return "Prepared the next revision based on the review feedback.";
@@ -507,10 +532,18 @@ export function ChatPanel({
   }, [displayedTimeline]);
   const liveStatusMessage = useMemo(() => {
     if (questions.length > 0 || pendingClarification) return null;
-    const hasRunning = activeToolCalls.some((c) => c.status === "running");
+    const runningCalls = activeToolCalls.filter((c) => c.status === "running");
+    const hasRunning = runningCalls.length > 0;
+    const runningPlanPhase = runningCalls.find((c) => c.name in PLAN_PHASE_NAMES);
     if (animatedThinkingMessage) return animatedThinkingMessage;
     if (phaseMessage && isProcessing && !hasRunning) return phaseMessage;
-    if (hasRunning) return "Running tools...";
+    if (hasRunning) {
+      if (runningPlanPhase) {
+        const label = PLAN_PHASE_NAMES[runningPlanPhase.name]?.label ?? "Working";
+        return `${label}...`;
+      }
+      return "Running tools...";
+    }
     if (isProcessing) return "Working...";
     return null;
   }, [questions.length, pendingClarification, phaseMessage, animatedThinkingMessage, activeToolCalls, isProcessing]);
@@ -757,50 +790,84 @@ export function ChatPanel({
                 <p className="text-xs text-zinc-400">{pendingClarification.context}</p>
               )}
               {clarificationRecommendations.length > 0 && (
-                <div className="space-y-2">
-                  <p className="text-[11px] uppercase tracking-wide text-zinc-400">
-                    Recommended answers
-                  </p>
-                  <div className="grid gap-2">
-                    {clarificationRecommendations.map((recommendation) => {
-                      const isSelected = !useCustomClarification
-                        && selectedClarificationRecommendation === recommendation;
-                      return (
-                        <button
-                          key={recommendation}
-                          type="button"
-                          onClick={() => {
-                            setUseCustomClarification(false);
-                            setClarificationInput("");
-                            setSelectedClarificationRecommendation(recommendation);
-                          }}
-                          className={clsx(
-                            "w-full rounded-md border px-3 py-2 text-left text-xs transition-colors",
-                            isSelected
-                              ? "border-indigo-400 bg-indigo-500/20 text-indigo-100"
-                              : "border-zinc-700 bg-zinc-900/50 text-zinc-300 hover:border-zinc-500 hover:text-zinc-100",
-                          )}
-                        >
-                          {recommendation}
-                        </button>
-                      );
-                    })}
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setUseCustomClarification(true);
-                        setSelectedClarificationRecommendation(null);
-                      }}
-                      className={clsx(
-                        "w-full rounded-md border px-3 py-2 text-left text-xs transition-colors",
-                        useCustomClarification
-                          ? "border-indigo-400 bg-indigo-500/20 text-indigo-100"
-                          : "border-zinc-700 bg-zinc-900/50 text-zinc-300 hover:border-zinc-500 hover:text-zinc-100",
-                      )}
-                    >
-                      Other (custom answer)
-                    </button>
-                  </div>
+                <div className="flex flex-col gap-2">
+                  {clarificationRecommendations.map((recommendation, recIdx) => {
+                    const letter = String.fromCharCode(65 + recIdx);
+                    const isSelected = !useCustomClarification
+                      && selectedClarificationRecommendation === recommendation;
+                    return (
+                      <button
+                        key={recommendation}
+                        type="button"
+                        onClick={() => {
+                          setUseCustomClarification(false);
+                          setClarificationInput("");
+                          setSelectedClarificationRecommendation(recommendation);
+                        }}
+                        className={clsx(
+                          "w-full text-left p-3 rounded-lg border transition-all group shadow-sm",
+                          isSelected
+                            ? "border-indigo-500/50 bg-indigo-500/10"
+                            : "border-zinc-800 bg-zinc-900/50 hover:bg-zinc-800 hover:border-zinc-700",
+                        )}
+                      >
+                        <div className="flex items-start">
+                          <span
+                            className={clsx(
+                              "inline-flex items-center justify-center w-6 h-6 rounded mr-3 text-xs font-mono shrink-0 transition-colors",
+                              isSelected
+                                ? "bg-indigo-500/30 text-indigo-200"
+                                : "bg-zinc-800 text-zinc-400 group-hover:text-zinc-200 group-hover:bg-zinc-700",
+                            )}
+                          >
+                            {letter}
+                          </span>
+                          <span
+                            className={clsx(
+                              "text-sm transition-colors mt-0.5",
+                              isSelected ? "text-indigo-100" : "text-zinc-300 group-hover:text-zinc-100",
+                            )}
+                          >
+                            {formatOptionDisplayText(recommendation)}
+                          </span>
+                        </div>
+                      </button>
+                    );
+                  })}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setUseCustomClarification(true);
+                      setSelectedClarificationRecommendation(null);
+                    }}
+                    className={clsx(
+                      "w-full text-left p-3 rounded-lg border transition-all group shadow-sm",
+                      useCustomClarification
+                        ? "border-indigo-500/50 bg-indigo-500/10"
+                        : "border-zinc-800 bg-zinc-900/50 hover:bg-zinc-800 hover:border-zinc-700",
+                    )}
+                  >
+                    <div className="flex items-start">
+                      <span
+                        className={clsx(
+                          "inline-flex items-center justify-center w-6 h-6 rounded mr-3 text-xs font-mono shrink-0 transition-colors",
+                          useCustomClarification
+                            ? "bg-indigo-500/30 text-indigo-200"
+                            : "bg-zinc-800 text-zinc-400 group-hover:text-zinc-200 group-hover:bg-zinc-700",
+                        )}
+                      >
+                        {String.fromCharCode(65 + clarificationRecommendations.length)}
+                      </span>
+                      <span
+                        className={clsx(
+                          "text-sm transition-colors mt-0.5",
+                          useCustomClarification ? "text-indigo-100" : "text-zinc-300 group-hover:text-zinc-100",
+                        )}
+                      >
+                        Other (Type your answer below...)
+                      </span>
+                    </div>
+                  </button>
                 </div>
               )}
               <div className="flex gap-2">
@@ -853,11 +920,17 @@ export function ChatPanel({
                 </div>
 
                 <div className="p-5 space-y-5">
-                  {/* Followups */}
+                  {/* Followups — progress comes from Agent Activity; no per-option spinners */}
                   {visiblePlanFollowups.length > 0 && (
                     <div className="space-y-4">
-                      {visiblePlanFollowups.map((followup) => (
-                        <div key={followup.id} className="group relative overflow-hidden rounded-xl border border-zinc-800 bg-zinc-900/40 p-4 transition-all duration-300 hover:border-emerald-500/30 hover:bg-zinc-900/60 hover:shadow-md hover:shadow-emerald-900/5">
+                      {visiblePlanFollowups.map((followup) => {
+                        const decisionsLocked = inputDisabled || submittingFollowupId !== null;
+                        return (
+                        <div
+                          key={followup.id}
+                          className="group relative overflow-hidden rounded-xl border border-zinc-800 bg-zinc-900/40 p-4 transition-all duration-300 hover:border-emerald-500/30 hover:bg-zinc-900/60 hover:shadow-md hover:shadow-emerald-900/5"
+                          aria-busy={submittingFollowupId === followup.id}
+                        >
                           <div className="mb-3 space-y-1">
                             <p className="text-sm font-medium text-zinc-100 leading-relaxed">{followup.question}</p>
                             {followup.target_sections.length > 0 && (
@@ -868,48 +941,75 @@ export function ChatPanel({
                           </div>
                           
                           {followup.options && followup.options.length > 0 ? (
-                            <div className="flex flex-wrap gap-2">
-                              {followup.options.map((option) => (
-                                <button
-                                  key={`${followup.id}-${option}`}
-                                  type="button"
-                                  disabled={Boolean(submittingFollowupId) || inputDisabled}
-                                  onClick={() => void handleFollowupSubmit(followup.id, option)}
-                                  className={clsx(
-                                    "relative overflow-hidden rounded-lg border px-3.5 py-2 text-xs font-medium transition-all duration-200 active:scale-95",
-                                    submittingFollowupId === followup.id
-                                      ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-300 cursor-wait"
-                                      : "border-zinc-700/50 bg-zinc-800/50 text-zinc-300 hover:border-emerald-500/40 hover:bg-emerald-500/10 hover:text-emerald-300 hover:shadow-[0_0_10px_rgba(16,185,129,0.1)]"
-                                  )}
-                                >
-                                  {submittingFollowupId === followup.id ? (
-                                    <span className="flex items-center gap-1.5">
-                                      <Loader2 className="h-3 w-3 animate-spin" />
-                                      Applying...
-                                    </span>
-                                  ) : (
-                                    option
-                                  )}
-                                </button>
-                              ))}
+                            <div className="space-y-2.5">
+                              <div className="flex flex-col gap-2">
+                                {followup.options.map((option, optIdx) => {
+                                  const letter = String.fromCharCode(65 + optIdx);
+                                  return (
+                                    <button
+                                      key={`${followup.id}-${option}`}
+                                      type="button"
+                                      disabled={decisionsLocked}
+                                      onClick={() => void handleFollowupSubmit(followup.id, option)}
+                                      className={clsx(
+                                        "w-full text-left p-3 rounded-lg border transition-all group shadow-sm active:scale-[0.99]",
+                                        decisionsLocked
+                                          ? "cursor-not-allowed border-zinc-800/80 bg-zinc-900/30 opacity-60"
+                                          : "border-zinc-800 bg-zinc-900/50 hover:bg-zinc-800 hover:border-emerald-500/30",
+                                      )}
+                                    >
+                                      <div className="flex items-start">
+                                        <span
+                                          className={clsx(
+                                            "inline-flex items-center justify-center w-6 h-6 rounded mr-3 text-xs font-mono shrink-0 transition-colors",
+                                            decisionsLocked
+                                              ? "bg-zinc-800/80 text-zinc-500"
+                                              : "bg-zinc-800 text-zinc-400 group-hover:text-emerald-200 group-hover:bg-emerald-500/15",
+                                          )}
+                                        >
+                                          {letter}
+                                        </span>
+                                        <span className="text-sm text-zinc-300 transition-colors mt-0.5 group-hover:text-zinc-100">
+                                          {formatOptionDisplayText(option)}
+                                        </span>
+                                      </div>
+                                    </button>
+                                  );
+                                })}
+                              </div>
+                              <p className="text-[10px] uppercase tracking-wide text-zinc-600">Or</p>
+                              <button
+                                type="button"
+                                disabled={decisionsLocked}
+                                onClick={() => {
+                                  const seeded = `Follow-up: ${followup.question}`;
+                                  setInput((prev) => (prev.trim() ? `${prev}\n\n${seeded}` : seeded));
+                                  inputRef.current?.focus();
+                                }}
+                                className="flex items-center gap-2 rounded-lg border border-zinc-700/50 bg-zinc-800/30 px-3 py-2 text-xs font-medium text-zinc-400 transition-colors hover:bg-zinc-800 hover:text-zinc-200 disabled:cursor-not-allowed disabled:opacity-50"
+                              >
+                                <MessageSquare className="h-3.5 w-3.5" />
+                                Describe in chat
+                              </button>
                             </div>
                           ) : (
                             <button
                               type="button"
-                              disabled={inputDisabled}
+                              disabled={decisionsLocked}
                               onClick={() => {
                                 const seeded = `Follow-up: ${followup.question}`;
                                 setInput((prev) => (prev.trim() ? `${prev}\n\n${seeded}` : seeded));
                                 inputRef.current?.focus();
                               }}
-                              className="flex items-center gap-2 rounded-lg border border-zinc-700/50 bg-zinc-800/30 px-3 py-2 text-xs font-medium text-zinc-400 transition-colors hover:bg-zinc-800 hover:text-zinc-200"
+                              className="flex items-center gap-2 rounded-lg border border-zinc-700/50 bg-zinc-800/30 px-3 py-2 text-xs font-medium text-zinc-400 transition-colors hover:bg-zinc-800 hover:text-zinc-200 disabled:cursor-not-allowed disabled:opacity-50"
                             >
                               <MessageSquare className="h-3.5 w-3.5" />
                               Describe in chat
                             </button>
                           )}
                         </div>
-                      ))}
+                        );
+                      })}
                     </div>
                   )}
 
@@ -927,21 +1027,12 @@ export function ChatPanel({
                           <button
                             key={suggestion.id}
                             type="button"
-                            disabled={inputDisabled || Boolean(submittingSuggestionId)}
+                            disabled={inputDisabled || submittingSuggestionId !== null}
                             onClick={() => void handleSuggestionSubmit(suggestion.id, suggestion.suggestion)}
-                            className="group flex items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-900/50 px-3 py-2 text-xs text-zinc-300 transition-all hover:border-zinc-600 hover:bg-zinc-800 hover:text-zinc-100 active:scale-95"
+                            className="group flex items-center gap-2 rounded-lg border border-zinc-800 bg-zinc-900/50 px-3 py-2 text-xs text-zinc-300 transition-all hover:border-zinc-600 hover:bg-zinc-800 hover:text-zinc-100 active:scale-95 disabled:cursor-not-allowed disabled:opacity-50"
                           >
-                            {submittingSuggestionId === suggestion.id ? (
-                              <>
-                                <Loader2 className="h-3 w-3 animate-spin" />
-                                <span>Applying...</span>
-                              </>
-                            ) : (
-                              <>
-                                <span>{suggestion.suggestion}</span>
-                                <ArrowRight className="h-3 w-3 text-zinc-500 opacity-0 transition-all group-hover:translate-x-0.5 group-hover:text-zinc-400 group-hover:opacity-100" />
-                              </>
-                            )}
+                            <span>{suggestion.suggestion}</span>
+                            <ArrowRight className="h-3 w-3 text-zinc-500 opacity-0 transition-all group-hover:translate-x-0.5 group-hover:text-zinc-400 group-hover:opacity-100 group-disabled:opacity-0" />
                           </button>
                         ))}
                         {!isProcessing && canCritique && onCritique && (
@@ -978,7 +1069,7 @@ export function ChatPanel({
       </div>
 
       {/* Floating Input Area */}
-      <div className="absolute bottom-6 left-1/2 -translate-x-1/2 w-full max-w-3xl px-4 z-[80]">
+      <div className="absolute bottom-6 left-1/2 -translate-x-1/2 w-full max-w-3xl px-4 z-[80] space-y-2">
         <div className={clsx(
           "bg-zinc-900 border rounded-2xl transition-all duration-300 chat-input-container",
           isProcessing
@@ -990,31 +1081,47 @@ export function ChatPanel({
             <button
               type="button"
               onClick={() => setAgentActivityExpanded((v) => !v)}
-              className="w-full flex items-center gap-2 px-4 py-2.5 text-left hover:bg-zinc-800/50 transition-colors"
+              className="w-full flex items-center gap-2 px-4 py-2.5 text-left hover:bg-zinc-800/50 transition-colors min-w-0"
               aria-expanded={agentActivityExpanded}
             >
-              {agentActivityExpanded ? (
-                <ChevronDown className="h-3.5 w-3.5 text-zinc-500 shrink-0" />
-              ) : (
-                <ChevronRight className="h-3.5 w-3.5 text-zinc-500 shrink-0" />
-              )}
-              <Sparkles className="h-3.5 w-3.5 text-indigo-300 shrink-0" />
-              <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-zinc-400">
-                Agent Activity
-              </span>
-              {visibleLiveActivities.length > 0 && (
-                <span className="rounded-full border border-zinc-700 bg-zinc-800 px-1.5 py-0.5 text-[10px] text-zinc-500">
-                  {visibleLiveActivities.length} task{visibleLiveActivities.length !== 1 ? "s" : ""}
+              <div className="flex items-center gap-2 shrink-0 min-w-0">
+                {agentActivityExpanded ? (
+                  <ChevronDown className="h-3.5 w-3.5 text-zinc-500 shrink-0" />
+                ) : (
+                  <ChevronRight className="h-3.5 w-3.5 text-zinc-500 shrink-0" />
+                )}
+                <Sparkles className="h-3.5 w-3.5 text-indigo-300 shrink-0" />
+                <span className="text-[11px] font-semibold uppercase tracking-[0.18em] text-zinc-400">
+                  Agent Activity
                 </span>
-              )}
+                {visibleLiveActivities.length > 0 && (
+                  <span className="rounded-full border border-zinc-700 bg-zinc-800 px-1.5 py-0.5 text-[10px] text-zinc-500">
+                    {visibleLiveActivities.length} task{visibleLiveActivities.length !== 1 ? "s" : ""}
+                  </span>
+                )}
+              </div>
               {liveStatusMessage && (
-                <Loader2 className="h-3.5 w-3.5 text-indigo-400 animate-spin shrink-0 ml-auto" />
+                <div
+                  className="flex flex-1 min-w-0 items-center justify-end gap-2 pl-2"
+                  aria-live="polite"
+                  aria-busy="true"
+                >
+                  <span className="llm-status-motion min-w-0 text-xs font-medium truncate text-right">
+                    {liveStatusMessage}
+                  </span>
+                  <Loader2
+                    className={clsx(
+                      "h-4 w-4 animate-spin shrink-0",
+                      isProcessing ? "text-amber-400 drop-shadow-[0_0_6px_rgba(251,191,36,0.45)]" : "text-indigo-400",
+                    )}
+                  />
+                </div>
               )}
             </button>
             {agentActivityExpanded && (
               <div className="border-t border-zinc-800/80 px-4 py-3">
-                {liveStatusMessage && (
-                  <div className={clsx("flex items-center gap-2 text-sm text-zinc-200", visibleLiveActivities.length > 0 && "mb-2")}>
+                {liveStatusMessage && visibleLiveActivities.length === 0 && (
+                  <div className="flex items-center gap-2 text-sm text-zinc-200">
                     <span className="llm-status-motion">{liveStatusMessage}</span>
                   </div>
                 )}
@@ -1130,34 +1237,47 @@ export function ChatPanel({
                 </div>
             </div>
 
-            {/* Center: context dial */}
+            {/* Center: context gauge — prompt vs model window (token_usage SSE + session hydrate) */}
             <div className="flex items-center justify-end shrink-0 order-1 sm:order-2 mr-auto sm:mr-0 sm:flex-1 pr-1">
-              <Tooltip content={`Context usage: ${(contextPercent ?? 0).toFixed(1)}%${contextWindowTokens ? ` of ${contextWindowTokens} max` : ''}`}>
-                <div className="relative w-5 h-5 flex items-center justify-center">
-                  <svg className="w-full h-full -rotate-90" viewBox="0 0 36 36">
-                    {/* Background track */}
+              <Tooltip
+                content={
+                  contextPercent == null
+                    ? "Context fill updates after model calls or when the session loads usage data."
+                    : "Prompt size vs model context window (updates after each LLM call)."
+                }
+              >
+                <div
+                  className="relative w-6 h-6 flex items-center justify-center shrink-0"
+                  role="img"
+                  aria-label={
+                    contextPercent == null
+                      ? "Context usage unknown"
+                      : `Context usage about ${Math.round(contextPercent)} percent`
+                  }
+                >
+                  <svg className="w-full h-full -rotate-90" viewBox="0 0 36 36" aria-hidden>
                     <circle
                       cx="18"
                       cy="18"
                       r="14"
                       fill="none"
-                      className={clsx(
-                        "transition-all duration-500",
-                        isProcessing ? "stroke-amber-500/20 animate-pulse" : "stroke-zinc-700/50"
-                      )}
-                      strokeWidth="4"
+                      className="stroke-zinc-700/60 transition-colors duration-300"
+                      strokeWidth="3.5"
                     />
-                    {/* Progress arc */}
                     <circle
                       cx="18"
                       cy="18"
                       r="14"
                       fill="none"
                       className={clsx(
-                        "transition-all duration-500 ease-out",
-                        (contextPercent ?? 0) >= 85 ? "stroke-rose-500" : (contextPercent ?? 0) >= 70 ? "stroke-amber-500" : "stroke-zinc-400"
+                        "transition-[stroke-dashoffset,stroke] duration-500 ease-out",
+                        (contextPercent ?? 0) >= 85
+                          ? "stroke-rose-500"
+                          : (contextPercent ?? 0) >= 70
+                            ? "stroke-amber-500"
+                            : "stroke-sky-500/90",
                       )}
-                      strokeWidth="4"
+                      strokeWidth="3.5"
                       strokeDasharray="88"
                       strokeDashoffset={88 - (88 * Math.min(100, contextPercent ?? 0)) / 100}
                       strokeLinecap="round"

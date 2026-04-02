@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "r
 import { useLocation, useParams, useNavigate } from "react-router-dom";
 import { ActionBar } from "../components/ActionBar";
 import { ChatPanel } from "../components/ChatPanel";
+import { PlanValidationToast } from "../components/PlanValidationToast";
 import { PlanPanel } from "../components/PlanPanel";
 import { ResizableLayout } from "../components/ResizableLayout";
 import { useSessionEvents } from "../hooks/useSessionEvents";
@@ -196,6 +197,8 @@ export function PlanningViewPage() {
     is_processing: boolean;
   } | null>(null);
   const [chatInputAppendRequest, setChatInputAppendRequest] = useState<{ id: number; text: string } | null>(null);
+  /** Plan draft failed validation (distinct from critic chat turns); shown next to composer, not top banner. */
+  const [planValidationBlock, setPlanValidationBlock] = useState<string | null>(null);
   const [latestResponseMode, setLatestResponseMode] = useState<"author_chat" | "refine_round" | null>(null);
   const lastEventAtMs = useRef<number>(0);
   const lastRefetchAtMs = useRef<number>(0);
@@ -214,6 +217,7 @@ export function PlanningViewPage() {
     setSetupSteps([]);
     setInitialSetupDone(false);
     setLiveActivities([]);
+    setPlanValidationBlock(null);
     lastVersionSeen.current = 0;
   }, [id]);
 
@@ -296,6 +300,12 @@ export function PlanningViewPage() {
     });
     if (session.session_total_cost_usd != null) setSessionCostUsd(session.session_total_cost_usd);
     if (session.max_prompt_tokens != null) setMaxPromptTokens(session.max_prompt_tokens);
+    if (typeof session.context_window_tokens === "number") {
+      setContextWindowTokens(session.context_window_tokens);
+    }
+    if (typeof session.context_usage_ratio === "number") {
+      setContextUsageRatio(session.context_usage_ratio);
+    }
     if ((sessionQuery.data?.conversation?.length ?? 0) > 0) {
       setInitialSetupDone(true);
     }
@@ -311,6 +321,8 @@ export function PlanningViewPage() {
     session?.completed_tool_call_groups,
     session?.session_total_cost_usd,
     session?.max_prompt_tokens,
+    session?.context_window_tokens,
+    session?.context_usage_ratio,
     sessionQuery.data?.conversation?.length,
   ]);
 
@@ -345,7 +357,8 @@ export function PlanningViewPage() {
 
   const showConflictBanner = useCallback((err: ConflictError) => {
     if (err.reason === "command_failed") {
-      showBanner(`Review blocked this update: ${err.message}`, "warning");
+      setPlanValidationBlock(err.message);
+      setError(null);
       return;
     }
     if (err.reason === "processing_lock") {
@@ -775,9 +788,22 @@ export function PlanningViewPage() {
   const constraintViolationsCount = Array.isArray(snapshot?.constraint_eval?.constraint_violations)
     ? snapshot?.constraint_eval?.constraint_violations.length
     : 0;
-  const effectiveRoundMetrics = (sessionQuery.data?.round_metrics?.length ?? 0) > 0
-    ? sessionQuery.data?.round_metrics
-    : fallbackReviewData.roundMetrics;
+  const effectiveRoundMetrics = useMemo((): RoundMetric[] => {
+    const api = sessionQuery.data?.round_metrics;
+    const fallback = fallbackReviewData.roundMetrics;
+    if (!api || api.length === 0) return fallback;
+    const byRound = new Map(fallback.map((m) => [m.round, m]));
+    return api.map((m) => {
+      const fill = byRound.get(m.round);
+      return {
+        ...m,
+        convergence_score: m.convergence_score ?? fill?.convergence_score ?? null,
+        critic_confidence: m.critic_confidence ?? fill?.critic_confidence ?? null,
+        major_issues: m.major_issues ?? fill?.major_issues ?? null,
+        minor_issues: m.minor_issues ?? fill?.minor_issues ?? null,
+      };
+    });
+  }, [sessionQuery.data?.round_metrics, fallbackReviewData.roundMetrics]);
   const versionedTitle = useMemo(() => {
     if (!session) return "";
     return cleanPlanTitle(session.title);
@@ -877,6 +903,7 @@ export function PlanningViewPage() {
             title={versionedTitle}
             round={session.current_round}
             status={session.status}
+            isProcessing={Boolean(session.is_processing)}
             convergenceScore={undefined}
             sessionCostUsd={0}
             maxPromptTokens={0}
@@ -930,6 +957,7 @@ export function PlanningViewPage() {
             title={versionedTitle}
             round={effectiveRound}
             status={effectiveStatus ?? session.status}
+            isProcessing={sessionState?.is_processing ?? false}
             convergenceScore={sessionQuery.data?.current_plan?.convergence_score ?? undefined}
             sessionCostUsd={sessionCostUsd}
             maxPromptTokens={maxPromptTokens}
@@ -959,6 +987,13 @@ export function PlanningViewPage() {
                 Dismiss
               </button>
             </div>
+          )}
+
+          {planValidationBlock && (
+            <PlanValidationToast
+              rawMessage={planValidationBlock}
+              onDismiss={() => setPlanValidationBlock(null)}
+            />
           )}
 
           <div className="flex-1 min-h-0 relative">
@@ -1022,7 +1057,6 @@ export function PlanningViewPage() {
                   canApprove={!isProcessing && effectiveStatus === "converged"}
                   critiquePending={showCritiquePrompt}
                   contextPercent={contextPercent}
-                  contextWindowTokens={contextWindowTokens}
                   onCritique={() => void onCritique()}
                   onApprove={() => void onApprove()}
                   onStop={() => void onStop()}
