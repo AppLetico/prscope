@@ -104,6 +104,16 @@ function normalizeEvent(rawType: string, rawPayload: Record<string, unknown>): U
           : undefined,
     };
   }
+  if (rawType === "plan_handoff") {
+    return {
+      type: "plan_handoff",
+      message: String(rawPayload.message ?? ""),
+      summary_preview:
+        rawPayload.summary_preview !== undefined && rawPayload.summary_preview !== null
+          ? String(rawPayload.summary_preview)
+          : undefined,
+    };
+  }
   if (rawType === "context_compaction") {
     return {
       type: "context_compaction",
@@ -250,6 +260,7 @@ export function useSessionEvents(
     bind("tool_update");
     bind("routing_decision");
     bind("refinement_investigation");
+    bind("plan_handoff");
     bind("context_compaction");
     bind("plan_ready");
     bind("complete");

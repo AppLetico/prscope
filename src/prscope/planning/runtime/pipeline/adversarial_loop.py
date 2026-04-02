@@ -21,6 +21,11 @@ class AdversarialPlanningLoop:
         if user_input:
             ctx.core.add_turn("user", user_input, round_number=ctx.round_number)
 
+        await self.runtime._prepare_adversarial_compaction_context(  # noqa: SLF001
+            ctx=ctx,
+            plan_content=str(getattr(current_plan, "plan_content", "") or ""),
+        )
+
         async def emit_tool(
             name: str,
             status: str,

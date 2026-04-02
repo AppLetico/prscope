@@ -31,3 +31,33 @@ Seeded from: `{{ session.seed_ref }}`
 
 - [ ] Plan approved
 - [ ] Plan reviewed
+
+## After approval (handoff)
+
+Prscope **does not modify your repository**. This export is the durable artifact: share `PRD.md`, review in your editor, then implement using your normal workflow (branch, code review, CI).
+
+Typical next steps:
+
+1. Export or copy this `PRD.md` into your task tracker or design review.
+2. Implement changes in your IDE; run your project’s tests and lint locally.
+3. Open a pull request when ready.
+
+## Suggested verification
+
+Run checks **outside** Prscope that match your stack. Replace the examples below with commands from your repo (see `CONTRIBUTING.md`, `Makefile`, or `package.json`).
+
+{% if critic_acceptance_bullets %}
+Critic-stated criteria (from the latest structured review, when available):
+
+{% for line in critic_acceptance_bullets %}
+- {{ line }}
+{% endfor %}
+
+{% endif %}
+Examples teams often use:
+
+- `make check` or `make ci` (if your repo defines them)
+- `pytest -q` or `npm test` (pick what your project documents)
+- `ruff check .` / `eslint` / `tsc --noEmit` (as appropriate)
+
+If a command is slow, run the narrowest check that still validates your change.

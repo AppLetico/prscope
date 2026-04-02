@@ -104,6 +104,7 @@ Typical flow:
 4. SSE emits `session_state` snapshot immediately on connect
 5. Runtime emits progress/tool events while persisting state transitions
 6. Plan versions are saved by round and exposed via session + export endpoints
+7. **Export (PRD)**: `export_plan_documents` writes `PRD.md` (and a stub `conversation.md`) under `{repo.output_dir or ./plans}/{sanitized_session_title}/`. The PRD template includes an **After approval (handoff)** section: Prscope does not edit the repo; teams implement and run CI outside the harness. **Suggested verification** lists example commands; when `plan_json` on the current version includes `acceptance_criteria`, those lines are inlined for traceability.
 
 Key design guarantees:
 
@@ -130,6 +131,20 @@ Expected behavior:
 - If framework evidence is present, discovery should avoid asking "which backend/framework?".
 - Clarifying questions should be batched and non-duplicative in UI rendering.
 - `discovery_support/*` may collect and score evidence, but should not directly choose discovery routes.
+
+### Codebase tools: `grep_code` and `glob_files`
+
+- **`grep_code`** searches under the repo sandbox. When `ripgrep` (`rg`) is on `PATH` and `planning.tools.grep_backend` is `auto` (default) or `ripgrep`, searches use **ripgrep** for speed and `.gitignore`-aware exclusions (configurable via `planning.tools.ripgrep_respect_ignore_files`). If `rg` is missing or ripgrep errors, execution falls back to the built-in Python line scan.
+- Use **`output_mode: content`** (default) when you need matching lines for evidence (discovery and feature verification). Use **`output_mode: files_with_matches`** to list only file paths and save tokens when you only need to know where a pattern appears before opening files with `read_file`.
+- Optional **`glob`**, **`type`**, and **`case_insensitive`** apply to the ripgrep path; the Python fallback ignores `glob`/`type` (a note is included in the tool result).
+- **`glob_files`** finds paths by wildcard under a directory (for example `**/*.py`). Prefer **`list_files`** for a single directory listing; use **`glob_files`** for recursive filename patterns.
+
+### Prompt context budgeting
+
+- **Initial draft** (`AuthorAgent.run_initial_draft`) sizes the **user-visible** planning blob with `TokenBudgetManager`. The effective context window comes from `MODEL_CONTEXT_WINDOWS` for the draft model (`initial_draft_model` or `author_model` override), falling back to a conservative default when the model id is unknown.
+- **Reserved space**: `planning.context_tool_overhead_tokens` is subtracted from the prompt budget to leave room for tool definitions, system wrappers, and completion (`planning.author_prompt_completion_reserve_tokens`). The budget targets what we assemble in the user message, not the full wire prompt to the provider.
+- **Token estimates**: `planning.token_budget_estimator` is `heuristic` (default, char-based) or `tiktoken` when the optional `tiktoken` package is installed (better for OpenAI-style tokenization).
+- **Discovery tool loops**: `planning.discovery_conversation_max_chars` caps the transcript before each LLM call (drops oldest `tool` messages first). `planning.tools.tool_result_max_chars` caps a single tool payload before artifact offload; discovery may further wrap oversized JSON with a truncated preview.
 
 ## Refinement Behavior Contract
 
@@ -329,11 +344,48 @@ python3 -m prscope.benchmark \
 - Check `status`, `is_processing`, and `processing_started_at`.
 - Restart server and verify startup reconciliation logs for stale-session recovery.
 
+## Context compaction strategy catalog
+
+Each path below is **independent**; see `PlanningConfig` in `src/prscope/config.py` for YAML keys.
+
+### Discovery transcript trim
+
+- **Where:** [`DiscoveryLLMClient.llm_call_with_tools`](src/prscope/planning/runtime/discovery_support/llm.py) calls `trim_discovery_messages_for_budget` before **each** LiteLLM completion inside the discovery tool loop.
+- **Config:** `planning.discovery_conversation_max_chars` (runtime enforces a minimum of 8192 characters). Tool results are also capped per round (`per_tool_cap = max(4096, max_conv // 8)`).
+- **What survives:** Recent messages and tool-output text within the budget; older content is dropped by the trim helper.
+- **SSE:** `context_compaction` with `reason: "discovery_transcript_trim"` and `session_stage: "discovery"`.
+
+### Prior-critique compaction (adversarial refinement)
+
+- **When:** [`PlanningRuntime._should_compact_context`](src/prscope/planning/runtime/orchestration.py) returns true if **any** of: adversarial `round_number >= 2`, at least **four** critic turns in the conversation, **recent peak** `max_prompt_tokens` above **65%** of the min author/critic context window, or current plan text length **≥ 14_000** characters.
+- **Entry:** [`PlanningRuntime._prepare_adversarial_compaction_context`](src/prscope/planning/runtime/orchestration.py) runs at the start of each adversarial round ([`adversarial_loop.py`](src/prscope/planning/runtime/pipeline/adversarial_loop.py)); it sets `state.working_summary` when compaction is needed.
+- **Heuristic summary:** [`CritiqueCompressor`](src/prscope/planning/runtime/context/compression.py) — knobs `planning.critique_compress_max_recent_chars` and `planning.critique_compress_max_summary_chars`. Produces a short “older rounds” digest plus the latest critique excerpt.
+- **Optional LLM summary:** If `planning.critique_llm_summarize_enabled` is true **and** `max_prompt_tokens >= planning.critique_llm_summarize_prompt_tokens_threshold`, prior critiques are summarized with the author LLM (`planning.critique_llm_summarize_model` or `critic_model`).
+- **SSE:** `context_compaction` with `reason: "critique_heuristic_summary"` or `"critique_llm_summary"` and `session_stage: "refinement"`.
+
+### Token budgeting elsewhere
+
+Initial draft and refinement prompts use `TokenBudgetManager` and memory block caps (`planning.memory_block_max_chars`, repo overrides). That is **budgeting**, not the same as “compaction” above; see [`docs/memory-context-manifesto.md`](memory-context-manifesto.md).
+
+## Prompt construction and provider cache boundaries (audit)
+
+- **Relatively stable (good cache prefix candidates):** fixed system prompts (e.g. reviewer system prompt in `src/prscope/planning/runtime/critic.py`), tool schemas in `src/prscope/planning/runtime/tools.py`, manifesto/skills text when unchanged per `instruction_context_refresh`.
+- **Volatile (per turn):** user requirements, current plan markdown, discovery transcript, tool results, memory blocks pulled on demand, critic/author turn history.
+- **Author path:** [`AuthorLLMClient`](src/prscope/planning/runtime/transport/llm_client.py) uses LiteLLM `completion` (or OpenAI Responses API for `gpt-5-*`). Message order is **system + user/tool messages** as assembled by callers.
+- **Critic path:** [`CriticAgent._llm_call`](src/prscope/planning/runtime/critic.py) builds `system` + a large `user` blob (requirements, plan, constraints, etc.).
+- **Provider cache hints:** LiteLLM and each provider differ (e.g. Anthropic prompt caching, OpenAI prompt caching). Prscope does **not** attach `cache_control` or other provider-specific fields by default; enable only after measuring cost/latency on your target model. Prefer **deduplicating** identical large strings in prompts before adding provider extras.
+
+## Long-phase SSE pings
+
+When discovery or design review runs longer than **`planning.long_phase_ping_first_after_seconds`** (default **45**), the runtime emits additional **`thinking`** events every **`planning.long_phase_ping_interval_seconds`** (default **35**). Set **`long_phase_ping_first_after_seconds`** to **0** to disable.
+
+**Limitation:** This only helps while the **async** phase is awaiting work. A blocking call inside `asyncio.to_thread` (e.g. a long synchronous LiteLLM completion) cannot be interrupted mid-flight; the UI may still look quiet until the call returns or times out.
+
 ## Planning harness invariants (critic + convergence)
 
 Refinement convergence is gated by **feasibility**, not only “review complete”:
 
-- **`plan_rubric`**: four axes (`specificity`, `testability`, `coherence`, `evidence_alignment`) in [0,10]. Convergence requires `min(axis scores) >= planning.plan_rubric_floor` (default **7.25**, configurable in `prscope.yml`). Missing axes default to `MISSING_RUBRIC_SCORE` (0) and set **`rubric_incomplete`**, which **blocks** convergence.
+- **`plan_rubric`**: five axes (`specificity`, `testability`, `coherence`, `evidence_alignment`, `intent_alignment`) in [0,10]. Convergence requires `min(axis scores) >= planning.plan_rubric_floor` (default **7.0**, configurable in `prscope.yml`). Missing axes default to `MISSING_RUBRIC_SCORE` (0) and set **`rubric_incomplete`**, which **blocks** convergence.
 - **`blocking_categories`**: closed vocabulary `testability` | `evidence` | `vagueness` | `scope`. Unknown tokens **fail closed** (convergence blocked). Empty `[]` means no category blockers. **`_apply_scope_discipline` does not strip issues** when any category blocker is present or the list is invalid.
 - **`acceptance_criteria`**: falsifiable bullets; a structural check rejects vague wording. Satisfaction is computed from **plan markdown evidence** (shallow text overlap), not a critic self-report flag.
 - **`stalled_refinement`** shortcut was **removed**; convergence must satisfy the full legacy stability checks **and** the harness gates above. A **postcondition** assert runs after each convergence decision (see `acceptance_contract.verify_convergence_postcondition`).

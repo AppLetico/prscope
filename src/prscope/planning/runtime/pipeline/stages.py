@@ -21,6 +21,7 @@ from ..acceptance_contract import (
 from ..author import PlanDocument, RepairPlan, RepoUnderstanding, RevisionResult, apply_section_updates, render_markdown
 from ..authoring.discovery import is_localized_frontend_request
 from ..critic import ImplementabilityResult, ReviewResult
+from ..elapsed_ping import run_with_elapsed_thinking
 from ..followups import decision_graph_from_json, decision_graph_from_plan, merge_decision_graphs
 from ..reasoning import (
     ConvergenceReasoner,
@@ -144,6 +145,17 @@ class PlanningStages:
         if ctx.model_policy is None:
             return None
         return ctx.model_policy.author_refine.first_fallback_model
+
+    @staticmethod
+    def _compose_prior_critique(ctx: PlanningRoundContext) -> str:
+        distilled = ctx.issue_tracker.distilled_context()
+        compact = (ctx.state.working_summary or "").strip()
+        if not compact:
+            return distilled
+        block = f"## Prior rounds (compact)\n{compact}"
+        if distilled and distilled != "(none)":
+            return f"{distilled}\n\n{block}"
+        return block
 
     @staticmethod
     def _load_graph_payload(raw: str | None) -> dict[str, Any] | None:
@@ -1315,21 +1327,32 @@ class PlanningStages:
         await emit_tool("design_review", "running", stage="reviewer")
         review_started = time.perf_counter()
         blocks = self._repo_memory(ctx.state)
-        review_payload = await self._critic.run_design_review(
-            requirements=ctx.requirements,
-            plan_content=current_plan_content,
-            manifesto=ctx.state.manifesto,
-            architecture=blocks.get("architecture", ""),
-            design_record=json.dumps(self._design_record_payload(ctx.state.design_record) or {}, indent=2),
-            modules=blocks.get("modules", ""),
-            patterns=blocks.get("patterns", ""),
-            constraints=ctx.state.constraints,
-            prior_critique=ctx.issue_tracker.distilled_context(),
-            model_override=ctx.selected_critic_model,
-            fallback_model_override=self._critic_fallback_model(ctx),
-            session_id=ctx.session_id,
-            round_number=ctx.round_number,
-            mode=review_mode,
+
+        async def _emit_thinking(payload: dict[str, Any]) -> None:
+            await self._emit_event(ctx.event_callback, payload, ctx.session_id)
+
+        cfg = self._planning_config
+        review_payload = await run_with_elapsed_thinking(
+            self._critic.run_design_review(
+                requirements=ctx.requirements,
+                plan_content=current_plan_content,
+                manifesto=ctx.state.manifesto,
+                architecture=blocks.get("architecture", ""),
+                design_record=json.dumps(self._design_record_payload(ctx.state.design_record) or {}, indent=2),
+                modules=blocks.get("modules", ""),
+                patterns=blocks.get("patterns", ""),
+                constraints=ctx.state.constraints,
+                prior_critique=self._compose_prior_critique(ctx),
+                model_override=ctx.selected_critic_model,
+                fallback_model_override=self._critic_fallback_model(ctx),
+                session_id=ctx.session_id,
+                round_number=ctx.round_number,
+                mode=review_mode,
+            ),
+            emit=_emit_thinking,
+            first_after_s=float(cfg.long_phase_ping_first_after_seconds),
+            interval_s=float(cfg.long_phase_ping_interval_seconds),
+            message="Still running design review...",
         )
         if not isinstance(review_payload, ReviewResult):
             raise RuntimeError("Expected ReviewResult from design review phase")
@@ -1694,6 +1717,7 @@ class PlanningStages:
                 revision_hints=revision_hints,
                 reconsideration_candidates=reconsideration_candidates,
                 supplemental_evidence=supplemental_evidence,
+                prior_rounds_compact=((ctx.state.working_summary or "").strip() or None),
             )
             updated_plan = apply_section_updates(current_plan_doc, revision_result.updates)
             updated_plan = self._stabilize_refinement_plan(
@@ -1903,7 +1927,7 @@ class PlanningStages:
             modules=blocks.get("modules", ""),
             patterns=blocks.get("patterns", ""),
             constraints=ctx.state.constraints,
-            prior_critique=ctx.issue_tracker.distilled_context(),
+            prior_critique=self._compose_prior_critique(ctx),
             model_override=ctx.selected_critic_model,
             fallback_model_override=self._critic_fallback_model(ctx),
             session_id=ctx.session_id,
@@ -2020,7 +2044,7 @@ class PlanningStages:
                 modules=blocks.get("modules", ""),
                 patterns=blocks.get("patterns", ""),
                 constraints=ctx.state.constraints,
-                prior_critique=ctx.issue_tracker.distilled_context(),
+                prior_critique=self._compose_prior_critique(ctx),
                 model_override=ctx.selected_critic_model,
                 fallback_model_override=self._critic_fallback_model(ctx),
                 session_id=ctx.session_id,

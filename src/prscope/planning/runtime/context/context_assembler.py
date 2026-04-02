@@ -118,7 +118,7 @@ class ContextAssembler:
                 continue
             desc = descriptions.get(key, "repo memory block")
             lines.append(f"- {key} memory ({len(value)} chars): {desc}")
-        lines.append("- Entire repo via grep_code, list_files, read_file")
+        lines.append("- Entire repo via grep_code, glob_files, list_files, read_file")
         return "\n".join(lines)
 
     def memory_block_for_tool(self, key: str, allowed_keys: set[str]) -> dict[str, Any]:

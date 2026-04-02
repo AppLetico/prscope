@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 
+import { isConvergedOrApproved, scoreColor } from "./actionBarUi";
 import { formatDiagnosticsSource, formatInvestigationDensity } from "./actionBarDiagnostics";
 
 describe("formatDiagnosticsSource", () => {
@@ -15,6 +16,27 @@ describe("formatDiagnosticsSource", () => {
       label: "Saved",
       detail: "Loaded from the persisted session record after refresh.",
     });
+  });
+});
+
+describe("isConvergedOrApproved", () => {
+  it("is true for converged and approved", () => {
+    expect(isConvergedOrApproved("converged")).toBe(true);
+    expect(isConvergedOrApproved("approved")).toBe(true);
+  });
+
+  it("is false for draft and refining", () => {
+    expect(isConvergedOrApproved("draft")).toBe(false);
+    expect(isConvergedOrApproved("refining")).toBe(false);
+  });
+});
+
+describe("scoreColor", () => {
+  it("maps score bands to tailwind color classes", () => {
+    expect(scoreColor(undefined)).toBe("text-zinc-500");
+    expect(scoreColor(0.9)).toBe("text-emerald-400");
+    expect(scoreColor(0.7)).toBe("text-amber-400");
+    expect(scoreColor(0.5)).toBe("text-rose-400");
   });
 });
 

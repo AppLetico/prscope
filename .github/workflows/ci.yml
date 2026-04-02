@@ -38,6 +38,8 @@ jobs:
         run: ruff check .
       - name: Run tests
         run: pytest
+      - name: Doc link check
+        run: python scripts/check_doc_links.py
 
   frontend-checks:
     name: Frontend Checks

@@ -1,0 +1,50 @@
+# Manual-only: runs HTTP benchmark health checks against a locally started API.
+# Requires no API keys for /health + list sessions; chat session create/delete may need
+# provider keys depending on environment — run locally if CI fails on session steps.
+name: Benchmark health (manual)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  benchmark-health:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Start API server
+        run: |
+          python -m uvicorn prscope.web.api:create_app --factory --host 127.0.0.1 --port 8420 &
+          echo $! > /tmp/prscope_uvicorn.pid
+          for i in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:8420/health; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Server failed to start"
+          exit 1
+      - name: Run benchmark health check
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: |
+          python -m prscope.benchmark \
+            --base-url http://127.0.0.1:8420 \
+            --repo prscope \
+            --config-root "${{ github.workspace }}" \
+            --health-check-only
+      - name: Stop API server
+        if: always()
+        run: |
+          if [ -f /tmp/prscope_uvicorn.pid ]; then
+            kill "$(cat /tmp/prscope_uvicorn.pid)" 2>/dev/null || true
+          fi

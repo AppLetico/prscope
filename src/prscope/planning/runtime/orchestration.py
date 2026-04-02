@@ -14,8 +14,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ...config import PlanningConfig, PrscopeConfig, RepoProfile
-from ...memory import MemoryStore, ParsedConstraint
-from ...pricing import MODEL_CONTEXT_WINDOWS
+from ...memory import MemoryStore, ParsedConstraint, instruction_context_fingerprint
 from ...store import PlanningSession, PullRequest, Store
 from ..core import ConvergenceResult, PlanningCore
 from ..render import export_plan_documents
@@ -50,6 +49,7 @@ from .orchestration_support import (
     RuntimeSessionStarts,
     RuntimeStateSnapshots,
 )
+from .orchestration_support.adversarial_compaction import AdversarialCompaction
 from .pipeline import AdversarialPlanningLoop, PlanningRoundContext, PlanningStages
 from .review import (
     IssueCausalityExtractor,
@@ -99,6 +99,7 @@ class PlanningRuntime:
         self.tools = ToolExecutor(
             repo.resolved_path,
             memory_block_callback=self._memory_block_for_tool,
+            tools_config=self.planning_config.tools,
         )
         self.tools.maybe_cleanup_artifacts(max_age_days=7)
         self.author = AuthorAgent(self.planning_config, self.tools)
@@ -113,7 +114,18 @@ class PlanningRuntime:
         self._session_version: dict[str, int] = {}
         self._clarification_gates: dict[str, ClarificationGate] = {}
         self._manifesto_checker = ManifestoChecker()
-        self._compressor = CritiqueCompressor()
+        self._compressor = CritiqueCompressor(
+            max_recent_chars=self.planning_config.critique_compress_max_recent_chars,
+            max_summary_chars=self.planning_config.critique_compress_max_summary_chars,
+        )
+        self._adversarial_compaction = AdversarialCompaction(
+            planning_config=self.planning_config,
+            compressor=self._compressor,
+            state_getter=self._state,
+            author=self.author,
+            emit_event=self._emit_event,
+            single_line=PlanningRuntime._single_line,
+        )
         self._issue_similarity = IssueSimilarityService(self.planning_config.issue_dedupe)
         self._causality_extractor = IssueCausalityExtractor(self.planning_config.issue_graph)
         self._tool_event_state = ToolEventStateManager(
@@ -213,6 +225,26 @@ class PlanningRuntime:
     def _session_lock(self, session_id: str) -> asyncio.Lock:
         return self._locks.setdefault(session_id, asyncio.Lock())
 
+    def _instruction_context_fingerprint(self) -> str:
+        return instruction_context_fingerprint(self.memory.manifesto_path, self.repo.skills_dir)
+
+    def _maybe_refresh_instruction_context(self, state: PlanningState) -> None:
+        mode = self.planning_config.instruction_context_refresh
+        if mode == "off":
+            return
+        if mode == "each_turn":
+            state.manifesto = ""
+            state.skills_context = ""
+            state.constraints = []
+            return
+        fp = self._instruction_context_fingerprint()
+        if state.instruction_context_fingerprint == fp:
+            return
+        state.manifesto = ""
+        state.skills_context = ""
+        state.constraints = []
+        state.instruction_context_fingerprint = fp
+
     def cleanup_session_resources(self, session_id: str) -> None:
         self._locks.pop(session_id, None)
         self._clarification_gates.pop(session_id, None)
@@ -285,6 +317,7 @@ class PlanningRuntime:
             if len(self._states) > MAX_STATE_CACHE:
                 oldest_session_id = next(iter(self._states))
                 self._states.pop(oldest_session_id, None)
+        self._maybe_refresh_instruction_context(state)
         if not state.manifesto:
             state.manifesto = self.memory.load_manifesto()
         if not state.constraints:
@@ -524,18 +557,7 @@ class PlanningRuntime:
         return round(max(0.0, min(1.0, score)), 4)
 
     def _extract_critic_turns(self, turns: list[Any]) -> list[str]:
-        return [t.content for t in turns if t.role == "critic" and t.content]
-
-    @staticmethod
-    def _context_window_limit(config: PlanningConfig) -> int:
-        windows: list[int] = []
-        for model in {config.author_model, config.critic_model}:
-            window = MODEL_CONTEXT_WINDOWS.get(model)
-            if isinstance(window, int) and window > 0:
-                windows.append(window)
-        if windows:
-            return min(windows)
-        return 128_000
+        return self._adversarial_compaction.extract_critic_turns(turns)
 
     def _should_compact_context(
         self,
@@ -545,17 +567,12 @@ class PlanningRuntime:
         critic_turns: list[str],
         current_plan: str,
     ) -> bool:
-        if round_number < 2:
-            return False
-        if len(critic_turns) >= 4:
-            return True
-        context_window = self._context_window_limit(self.planning_config)
-        recent_peak = int(self._state(session_id).max_prompt_tokens or 0)
-        if recent_peak > int(context_window * 0.65):
-            return True
-        if len(current_plan) >= 14_000:
-            return True
-        return False
+        return self._adversarial_compaction.should_compact_context(
+            session_id=session_id,
+            round_number=round_number,
+            critic_turns=critic_turns,
+            current_plan=current_plan,
+        )
 
     def _build_working_summary(
         self,
@@ -564,20 +581,44 @@ class PlanningRuntime:
         critic_turns: list[str],
         current_plan: str,
     ) -> str:
-        critique_summary = "(none yet)"
-        if critic_turns:
-            try:
-                critique_summary = self._compressor.summarize(critic_turns)
-            except Exception:  # noqa: BLE001
-                critique_summary = critic_turns[-1][:1200]
-        objective = self._single_line(requirements or "Refine plan against critique.", limit=280)
-        summary = (
-            "WORKING SUMMARY (compact prior rounds)\n\n"
-            f"Objective: {objective}\n\n"
-            f"Current plan snapshot (excerpt):\n{current_plan[:1800]}\n\n"
-            f"Prior critique trajectory:\n{critique_summary}"
+        return self._adversarial_compaction.build_working_summary(
+            requirements=requirements,
+            critic_turns=critic_turns,
+            current_plan=current_plan,
         )
-        return summary[:5000]
+
+    async def summarize_critiques_for_compaction(
+        self,
+        *,
+        session_id: str,
+        critic_turns: list[str],
+        requirements: str,
+        current_plan: str,
+        event_callback: Any | None = None,
+    ) -> str:
+        """
+        Build a compact working summary for refinement; may call an LLM when configured
+        and session prompt usage exceeds the threshold.
+        """
+        return await self._adversarial_compaction.summarize_critiques_for_compaction(
+            session_id=session_id,
+            critic_turns=critic_turns,
+            requirements=requirements,
+            current_plan=current_plan,
+            event_callback=event_callback,
+        )
+
+    async def _prepare_adversarial_compaction_context(
+        self,
+        *,
+        ctx: PlanningRoundContext,
+        plan_content: str,
+    ) -> None:
+        """Populate state.working_summary when long-running refinement should compact prior critiques."""
+        await self._adversarial_compaction.prepare_adversarial_compaction_context(
+            ctx=ctx,
+            plan_content=plan_content,
+        )
 
     @staticmethod
     def _single_line(text: str, limit: int = 220) -> str:

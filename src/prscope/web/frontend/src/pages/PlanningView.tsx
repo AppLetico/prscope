@@ -512,6 +512,14 @@ export function PlanningViewPage() {
       }
       return;
     }
+    if (event.type === "plan_handoff") {
+      const preview =
+        typeof event.summary_preview === "string" && event.summary_preview.trim() !== ""
+          ? ` (${event.summary_preview.slice(0, 120)}${event.summary_preview.length > 120 ? "…" : ""})`
+          : "";
+      setWarnings((prev) => [...prev, `${event.message}${preview}`].slice(-12));
+      return;
+    }
     if (event.type === "context_compaction") {
       setContextCompactionEnabled(event.enabled);
       return;

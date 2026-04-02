@@ -133,6 +133,157 @@ CODE_SIGNALS = [
 ]
 
 INTENT_STOP_WORDS = {"a", "an", "the", "new", "feature", "endpoint", "support", "system", "api"}
+
+# Extra stop words for feature-intent extraction only. Two-letter words like "to" must never
+# become grep patterns (\bto\b matches almost every sentence). Ultra-common 3-letter tokens
+# like "get"/"set" match huge swaths of code.
+FEATURE_INTENT_EXTRA_STOP_WORDS: frozenset[str] = frozenset(
+    {
+        "to",
+        "or",
+        "in",
+        "on",
+        "at",
+        "for",
+        "and",
+        "but",
+        "not",
+        "with",
+        "from",
+        "into",
+        "over",
+        "out",
+        "off",
+        "per",
+        "via",
+        "nor",
+        "yet",
+        "of",
+        "is",
+        "it",
+        "as",
+        "be",
+        "do",
+        "no",
+        "so",
+        "go",
+        "up",
+        "by",
+        "if",
+        "we",
+        "can",
+        "our",
+        "us",
+        "me",
+        "my",
+        "he",
+        "she",
+        "him",
+        "her",
+        "his",
+        "they",
+        "them",
+        "their",
+        "you",
+        "your",
+        "was",
+        "were",
+        "has",
+        "had",
+        "are",
+        "been",
+        "being",
+        "get",
+        "set",
+        "use",
+        "let",
+        "try",
+        "way",
+        "may",
+        "own",
+        "one",
+        "two",
+        "six",
+        "ten",
+        "all",
+        "any",
+        "each",
+        "few",
+        "both",
+        "some",
+        "such",
+        "very",
+        "more",
+        "most",
+        "much",
+        "same",
+        "here",
+        "there",
+        "where",
+        "when",
+        "what",
+        "which",
+        "who",
+        "how",
+        "why",
+        "this",
+        "that",
+        "these",
+        "those",
+        "than",
+        "then",
+        "well",
+        "too",
+        "also",
+        "only",
+        "just",
+        "now",
+        "old",
+        "end",
+    }
+)
+
+# Generic nouns that appear constantly in UI/backend code; keep them only when no clearer
+# keywords remain (e.g. "ask mode" -> prefer patterns for "ask" + "prscope", not lone "mode").
+FEATURE_INTENT_AMBIGUOUS_TOKENS: frozenset[str] = frozenset(
+    {
+        "mode",
+        "type",
+        "kind",
+        "state",
+        "item",
+        "data",
+        "view",
+        "page",
+        "form",
+        "list",
+        "grid",
+        "table",
+        "field",
+        "name",
+        "key",
+        "value",
+        "row",
+        "col",
+        "map",
+        "array",
+        "handler",
+        "route",
+        "routes",
+        "api",
+        "endpoint",
+        "code",
+        "file",
+        "path",
+        "side",
+        "case",
+        "user",
+        "time",
+        "day",
+    }
+)
+
+MIN_FEATURE_KEYWORD_LEN = 3
 VENDOR_DIRS = {"node_modules", "venv", ".env", "dist", "build", "__pycache__", ".git", ".tox", "egg-info"}
 BACKEND_DIR_NAMES = {"backend", "api", "server", "src", "services", "web", "app", "lib"}
 LOW_SIGNAL_DIRS = {"benchmarks", "coverage", "docs", "examples", "fixtures", "plans", "public", "static"}
@@ -226,16 +377,22 @@ def extract_feature_intent(user_message: str) -> FeatureIntent | None:
     if not tail:
         return None
     words = re.findall(r"[a-z0-9][a-z0-9._-]*", tail)
+    stop = INTENT_STOP_WORDS | FEATURE_INTENT_EXTRA_STOP_WORDS
     keywords: list[str] = []
     for word in words:
         normalized = word.strip("-_.")
-        if not normalized or normalized in INTENT_STOP_WORDS:
+        if not normalized or normalized in stop:
+            continue
+        if len(normalized) < MIN_FEATURE_KEYWORD_LEN:
             continue
         keywords.append(normalized)
         if len(keywords) >= MAX_INTENT_KEYWORDS:
             break
     if not keywords:
         return None
+    non_ambiguous = [kw for kw in keywords if kw not in FEATURE_INTENT_AMBIGUOUS_TOKENS]
+    if non_ambiguous:
+        keywords = non_ambiguous
     patterns: list[str] = []
     for keyword in keywords:
         patterns.append(pattern_for_word(keyword))

@@ -1097,7 +1097,27 @@ def create_app() -> FastAPI:
                 session_id=ctx.session_id,
                 unverified_references=set(payload.get("unverified_references") or []),
             )
-            return HandlerResult(metadata={"approved": True})
+            summary_preview: str | None = None
+            try:
+                versions = ctx.store.get_plan_versions(ctx.session_id, limit=1)
+                if versions:
+                    pc = (versions[0].plan_content or "").strip()
+                    if pc:
+                        summary_preview = (pc[:600] + "…") if len(pc) > 600 else pc
+            except Exception:
+                summary_preview = None
+            return HandlerResult(
+                metadata={"approved": True},
+                events=[
+                    {
+                        "type": "plan_handoff",
+                        "message": (
+                            "Plan approved. Export PRD from the repo when ready; implementation runs outside Prscope."
+                        ),
+                        "summary_preview": summary_preview,
+                    }
+                ],
+            )
 
         async def _followup_answer(ctx: CommandContext) -> HandlerResult:
             session = ctx.store.get_planning_session(ctx.session_id)

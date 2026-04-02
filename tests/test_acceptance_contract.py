@@ -13,7 +13,7 @@ from prscope.planning.runtime.acceptance_contract import (
     harness_failure_delta,
     verify_convergence_postcondition,
 )
-from prscope.planning.runtime.critic import ReviewResult
+from prscope.planning.runtime.critic import PLAN_RUBRIC_AXIS_KEYS, ReviewResult
 
 
 def test_acceptance_structural_rejects_vague_criteria() -> None:
@@ -57,10 +57,7 @@ def _minimal_review(**kwargs: object) -> ReviewResult:
         constraint_violations=[],
         issue_priority=[],
         prose="",
-        plan_rubric=dict.fromkeys(
-            ("specificity", "testability", "coherence", "evidence_alignment"),
-            8.0,
-        ),
+        plan_rubric=dict.fromkeys(PLAN_RUBRIC_AXIS_KEYS, 8.0),
         rubric_incomplete=False,
         blocking_categories=[],
         blocking_categories_invalid=False,
@@ -82,10 +79,7 @@ def test_harness_failed_gate_label_priority() -> None:
 
 def test_build_convergence_debug_payload() -> None:
     review = _minimal_review(
-        plan_rubric=dict.fromkeys(
-            ("specificity", "testability", "coherence", "evidence_alignment"),
-            6.0,
-        ),
+        plan_rubric=dict.fromkeys(PLAN_RUBRIC_AXIS_KEYS, 6.0),
         blocking_categories=["testability"],
         acceptance_criteria=["Document the rollback procedure step by step"],
     )
@@ -138,6 +132,7 @@ def test_compute_harness_gates_rubric_floor() -> None:
             "testability": 6.0,
             "coherence": 8.0,
             "evidence_alignment": 8.0,
+            "intent_alignment": 8.0,
         },
         rubric_incomplete=False,
         blocking_categories=[],
@@ -167,10 +162,7 @@ def test_verify_convergence_postcondition_passes() -> None:
         constraint_violations=[],
         issue_priority=[],
         prose="",
-        plan_rubric=dict.fromkeys(
-            ("specificity", "testability", "coherence", "evidence_alignment"),
-            8.0,
-        ),
+        plan_rubric=dict.fromkeys(PLAN_RUBRIC_AXIS_KEYS, 8.0),
         rubric_incomplete=False,
         blocking_categories=[],
         blocking_categories_invalid=False,
@@ -197,10 +189,7 @@ def test_verify_convergence_postcondition_raises() -> None:
         constraint_violations=[],
         issue_priority=[],
         prose="",
-        plan_rubric=dict.fromkeys(
-            ("specificity", "testability", "coherence", "evidence_alignment"),
-            5.0,
-        ),
+        plan_rubric=dict.fromkeys(PLAN_RUBRIC_AXIS_KEYS, 5.0),
         rubric_incomplete=False,
         blocking_categories=[],
         blocking_categories_invalid=False,

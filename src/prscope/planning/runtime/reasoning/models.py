@@ -173,7 +173,7 @@ class ConvergenceSignals:
     implementable: bool = True
     # Harness gates (defaults permissive for unit tests that omit them).
     plan_rubric_min: float = 10.0
-    plan_rubric_floor: float = 7.25
+    plan_rubric_floor: float = 7.0
     rubric_floor_ok: bool = True
     rubric_incomplete: bool = False
     blockers_ok: bool = True

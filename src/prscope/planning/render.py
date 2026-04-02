@@ -4,6 +4,7 @@ Plan export renderers for plan markdown documents.
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
@@ -11,6 +12,29 @@ from jinja2 import Environment, FileSystemLoader
 
 from ..config import RepoProfile
 from ..store import PlanningSession, PlanVersion
+
+
+def _critic_acceptance_bullets_from_plan_json(plan_json: str | None, *, max_items: int = 12) -> list[str]:
+    """Extract critic acceptance lines from plan_json when stored (optional)."""
+    if not plan_json or not str(plan_json).strip():
+        return []
+    try:
+        payload = json.loads(plan_json)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, dict):
+        return []
+    raw = payload.get("acceptance_criteria")
+    if raw is None:
+        raw = payload.get("critic_acceptance_criteria")
+    if not isinstance(raw, list):
+        return []
+    out: list[str] = []
+    for item in raw[:max_items]:
+        text = str(item).strip()
+        if text:
+            out.append(text)
+    return out
 
 
 def _template_env() -> Environment:
@@ -32,10 +56,12 @@ def _sanitize_title(value: str) -> str:
 def render_prd(session: PlanningSession, plan: PlanVersion, repo: RepoProfile) -> str:
     env = _template_env()
     template = env.get_template("plan.md.j2")
+    critic_acceptance_bullets = _critic_acceptance_bullets_from_plan_json(getattr(plan, "plan_json", None))
     return template.render(
         session=session,
         plan=plan,
         repo=repo,
+        critic_acceptance_bullets=critic_acceptance_bullets,
     )
 
 

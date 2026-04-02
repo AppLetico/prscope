@@ -5,8 +5,15 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
 
+from ....config import LlmRetryConfig
 from ....model_catalog import litellm_model_name, model_provider
 from ....pricing import MODEL_CONTEXT_WINDOWS
+from ..llm_retry import (
+    async_sleep,
+    compute_retry_delay_seconds,
+    is_non_chat_model_hint,
+    is_transient_llm_failure,
+)
 from ..telemetry import completion_telemetry
 from ..tools import CODEBASE_TOOLS
 
@@ -169,6 +176,147 @@ class AuthorLLMClient:
             tool_calls.append(ToolCall(id=call_id, function=FunctionCall(name=name, arguments=arguments)))
         return tool_calls
 
+    async def _author_completion_attempt(
+        self,
+        *,
+        litellm: Any,
+        litellm_model: str,
+        model: str,
+        messages: list[dict[str, Any]],
+        allow_tools: bool,
+        output_cap: int,
+        per_call_timeout_seconds: int,
+    ) -> tuple[Any, str]:
+        if self.prefer_responses_api(model):
+            from openai import OpenAI
+
+            client = OpenAI()
+            responses_kwargs: dict[str, Any] = {
+                "model": model,
+                "input": self.as_responses_input(messages),
+                "max_output_tokens": output_cap,
+            }
+            if allow_tools:
+                responses_kwargs["tools"] = self.responses_tools()
+                responses_kwargs["tool_choice"] = "auto"
+            llm_started = asyncio.get_running_loop().time()
+            response = await asyncio.wait_for(
+                asyncio.to_thread(client.responses.create, **responses_kwargs),
+                timeout=per_call_timeout_seconds,
+            )
+            llm_elapsed_ms = (asyncio.get_running_loop().time() - llm_started) * 1000.0
+            text = self.extract_responses_text(response)
+            tool_calls = self.extract_responses_tool_calls(response)
+            chat_like = ChatLikeResponse(
+                choices=[Choice(message=Message(content=text, tool_calls=tool_calls))],
+                usage=getattr(response, "usage", None),
+            )
+            telemetry = completion_telemetry(response, model=model)
+            context_window = MODEL_CONTEXT_WINDOWS.get(model)
+            if model not in MODEL_CONTEXT_WINDOWS:
+                await self._emit(
+                    {
+                        "type": "warning",
+                        "message": f"Unknown model '{model}' - context window tracking disabled",
+                    }
+                )
+            if model not in MODEL_CONTEXT_WINDOWS:
+                await self._emit(
+                    {
+                        "type": "warning",
+                        "message": f"Unknown model '{model}' - cost tracking disabled for this call",
+                    }
+                )
+            await self._emit(
+                {
+                    "type": "token_usage",
+                    "session_stage": "author",
+                    "model": model,
+                    "model_provider": model_provider(model),
+                    "prompt_tokens": telemetry.usage.prompt_tokens,
+                    "completion_tokens": telemetry.usage.completion_tokens,
+                    "call_cost_usd": telemetry.cost.total_cost_usd,
+                    "llm_call_latency_ms": round(llm_elapsed_ms, 2),
+                    "context_window_tokens": context_window,
+                    "context_usage_ratio": (
+                        round(float(telemetry.usage.prompt_tokens) / float(context_window), 4)
+                        if context_window and context_window > 0
+                        else None
+                    ),
+                }
+            )
+            if context_window and telemetry.usage.prompt_tokens > int(context_window * 0.75):
+                await self._emit(
+                    {
+                        "type": "warning",
+                        "message": (
+                            f"Prompt tokens {telemetry.usage.prompt_tokens} exceed "
+                            f"75% of context window ({context_window}) for {model}"
+                        ),
+                    }
+                )
+            return chat_like, model
+
+        completion_kwargs: dict[str, Any] = {
+            "model": litellm_model,
+            "messages": messages,
+            "max_tokens": output_cap,
+        }
+        if allow_tools:
+            completion_kwargs["tools"] = CODEBASE_TOOLS
+            completion_kwargs["tool_choice"] = "auto"
+        llm_started = asyncio.get_running_loop().time()
+        response = await asyncio.wait_for(
+            asyncio.to_thread(litellm.completion, **completion_kwargs),
+            timeout=per_call_timeout_seconds,
+        )
+        llm_elapsed_ms = (asyncio.get_running_loop().time() - llm_started) * 1000.0
+        telemetry = completion_telemetry(response, model=model)
+        context_window = MODEL_CONTEXT_WINDOWS.get(model)
+        if model not in MODEL_CONTEXT_WINDOWS:
+            await self._emit(
+                {
+                    "type": "warning",
+                    "message": f"Unknown model '{model}' - context window tracking disabled",
+                }
+            )
+        if model not in MODEL_CONTEXT_WINDOWS:
+            await self._emit(
+                {
+                    "type": "warning",
+                    "message": f"Unknown model '{model}' - cost tracking disabled for this call",
+                }
+            )
+        await self._emit(
+            {
+                "type": "token_usage",
+                "session_stage": "author",
+                "model": model,
+                "model_provider": model_provider(model),
+                "prompt_tokens": telemetry.usage.prompt_tokens,
+                "completion_tokens": telemetry.usage.completion_tokens,
+                "call_cost_usd": telemetry.cost.total_cost_usd,
+                "llm_call_latency_ms": round(llm_elapsed_ms, 2),
+                "context_window_tokens": context_window,
+                "context_usage_ratio": (
+                    round(float(telemetry.usage.prompt_tokens) / float(context_window), 4)
+                    if context_window and context_window > 0
+                    else None
+                ),
+            }
+        )
+        if context_window and telemetry.usage.prompt_tokens > int(context_window * 0.75):
+            await self._emit(
+                {
+                    "type": "warning",
+                    "message": (
+                        f"Prompt tokens {telemetry.usage.prompt_tokens} exceed "
+                        f"75% of context window ({context_window}) for {model}"
+                    ),
+                }
+            )
+        return response, model
+
     async def safe_completion_call(
         self,
         *,
@@ -179,7 +327,11 @@ class AuthorLLMClient:
         model_override: str | None,
         timeout_seconds_override: int | Callable[[], int] | None,
     ) -> tuple[Any, str]:
-        fallback_model = "gpt-4o"
+        policy = getattr(self._config, "llm_retry", None) or LlmRetryConfig()
+        max_attempts = max(1, int(policy.max_attempts)) if policy.enabled else 1
+        fallback_model = (
+            str(getattr(self._config, "author_completion_fallback_model", None) or "gpt-4o").strip() or "gpt-4o"
+        )
         configured_timeout_seconds = max(5, int(self._config.author_call_timeout_seconds))
         if callable(timeout_seconds_override):
             per_call_timeout_seconds = max(5, min(configured_timeout_seconds, int(timeout_seconds_override())))
@@ -196,161 +348,88 @@ class AuthorLLMClient:
         last_error: Exception | None = None
         for idx, model in enumerate(models_to_try):
             litellm_model = litellm_model_name(model)
-            try:
-                if self.prefer_responses_api(model):
-                    from openai import OpenAI
-
-                    client = OpenAI()
-                    responses_kwargs: dict[str, Any] = {
-                        "model": model,
-                        "input": self.as_responses_input(messages),
-                        "max_output_tokens": output_cap,
-                    }
-                    if allow_tools:
-                        responses_kwargs["tools"] = self.responses_tools()
-                        responses_kwargs["tool_choice"] = "auto"
-                    llm_started = asyncio.get_running_loop().time()
-                    response = await asyncio.wait_for(
-                        asyncio.to_thread(client.responses.create, **responses_kwargs),
-                        timeout=per_call_timeout_seconds,
+            fatal_for_models = False
+            for attempt in range(max_attempts):
+                try:
+                    return await self._author_completion_attempt(
+                        litellm=litellm,
+                        litellm_model=litellm_model,
+                        model=model,
+                        messages=messages,
+                        allow_tools=allow_tools,
+                        output_cap=output_cap,
+                        per_call_timeout_seconds=per_call_timeout_seconds,
                     )
-                    llm_elapsed_ms = (asyncio.get_running_loop().time() - llm_started) * 1000.0
-                    text = self.extract_responses_text(response)
-                    tool_calls = self.extract_responses_tool_calls(response)
-                    chat_like = ChatLikeResponse(
-                        choices=[Choice(message=Message(content=text, tool_calls=tool_calls))],
-                        usage=getattr(response, "usage", None),
-                    )
-                    telemetry = completion_telemetry(response, model=model)
-                    context_window = MODEL_CONTEXT_WINDOWS.get(model)
-                    if model not in MODEL_CONTEXT_WINDOWS:
+                except asyncio.TimeoutError as exc:
+                    last_error = RuntimeError(f"Model '{model}' timed out after {per_call_timeout_seconds}s")
+                    if attempt < max_attempts - 1 and policy.enabled:
+                        delay = compute_retry_delay_seconds(
+                            attempt_index=attempt,
+                            initial_delay_seconds=policy.initial_delay_seconds,
+                            max_delay_seconds=policy.max_delay_seconds,
+                            backoff_multiplier=policy.backoff_multiplier,
+                            respect_retry_after=policy.respect_retry_after,
+                            exc=exc,
+                        )
                         await self._emit(
                             {
-                                "type": "warning",
-                                "message": f"Unknown model '{model}' - context window tracking disabled",
+                                "type": "llm_retry",
+                                "session_stage": "author",
+                                "model": model,
+                                "attempt": attempt + 1,
+                                "max_attempts": max_attempts,
+                                "delay_seconds": round(delay, 2),
+                                "reason": "timeout",
                             }
                         )
-                    if model not in MODEL_CONTEXT_WINDOWS:
-                        await self._emit(
-                            {
-                                "type": "warning",
-                                "message": f"Unknown model '{model}' - cost tracking disabled for this call",
-                            }
-                        )
-                    await self._emit(
-                        {
-                            "type": "token_usage",
-                            "session_stage": "author",
-                            "model": model,
-                            "model_provider": model_provider(model),
-                            "prompt_tokens": telemetry.usage.prompt_tokens,
-                            "completion_tokens": telemetry.usage.completion_tokens,
-                            "call_cost_usd": telemetry.cost.total_cost_usd,
-                            "llm_call_latency_ms": round(llm_elapsed_ms, 2),
-                            "context_window_tokens": context_window,
-                            "context_usage_ratio": (
-                                round(float(telemetry.usage.prompt_tokens) / float(context_window), 4)
-                                if context_window and context_window > 0
-                                else None
-                            ),
-                        }
-                    )
-                    if context_window and telemetry.usage.prompt_tokens > int(context_window * 0.75):
-                        await self._emit(
-                            {
-                                "type": "warning",
-                                "message": (
-                                    f"Prompt tokens {telemetry.usage.prompt_tokens} exceed "
-                                    f"75% of context window ({context_window}) for {model}"
-                                ),
-                            }
-                        )
-                    return chat_like, model
-
-                completion_kwargs: dict[str, Any] = {
-                    "model": litellm_model,
-                    "messages": messages,
-                    "max_tokens": output_cap,
-                }
-                if allow_tools:
-                    completion_kwargs["tools"] = CODEBASE_TOOLS
-                    completion_kwargs["tool_choice"] = "auto"
-                llm_started = asyncio.get_running_loop().time()
-                response = await asyncio.wait_for(
-                    asyncio.to_thread(litellm.completion, **completion_kwargs),
-                    timeout=per_call_timeout_seconds,
-                )
-                llm_elapsed_ms = (asyncio.get_running_loop().time() - llm_started) * 1000.0
-                telemetry = completion_telemetry(response, model=model)
-                context_window = MODEL_CONTEXT_WINDOWS.get(model)
-                if model not in MODEL_CONTEXT_WINDOWS:
-                    await self._emit(
-                        {
-                            "type": "warning",
-                            "message": f"Unknown model '{model}' - context window tracking disabled",
-                        }
-                    )
-                if model not in MODEL_CONTEXT_WINDOWS:
-                    await self._emit(
-                        {
-                            "type": "warning",
-                            "message": f"Unknown model '{model}' - cost tracking disabled for this call",
-                        }
-                    )
-                await self._emit(
-                    {
-                        "type": "token_usage",
-                        "session_stage": "author",
-                        "model": model,
-                        "model_provider": model_provider(model),
-                        "prompt_tokens": telemetry.usage.prompt_tokens,
-                        "completion_tokens": telemetry.usage.completion_tokens,
-                        "call_cost_usd": telemetry.cost.total_cost_usd,
-                        "llm_call_latency_ms": round(llm_elapsed_ms, 2),
-                        "context_window_tokens": context_window,
-                        "context_usage_ratio": (
-                            round(float(telemetry.usage.prompt_tokens) / float(context_window), 4)
-                            if context_window and context_window > 0
-                            else None
-                        ),
-                    }
-                )
-                if context_window and telemetry.usage.prompt_tokens > int(context_window * 0.75):
+                        await async_sleep(delay)
+                        continue
                     await self._emit(
                         {
                             "type": "warning",
                             "message": (
-                                f"Prompt tokens {telemetry.usage.prompt_tokens} exceed "
-                                f"75% of context window ({context_window}) for {model}"
+                                f"Author call timeout on {model} after {per_call_timeout_seconds}s"
+                                + ("; trying fallback model." if idx < len(models_to_try) - 1 else ".")
                             ),
                         }
                     )
-                return response, model
-            except asyncio.TimeoutError as exc:
-                last_error = RuntimeError(f"Model '{model}' timed out after {per_call_timeout_seconds}s")
-                await self._emit(
-                    {
-                        "type": "warning",
-                        "message": (
-                            f"Author call timeout on {model} after {per_call_timeout_seconds}s; trying fallback model."
-                        ),
-                    }
-                )
-                if idx == len(models_to_try) - 1:
-                    raise RuntimeError(
-                        "Configured planning author model timed out and fallback also timed out."
-                    ) from exc
-                continue
-            except Exception as exc:  # noqa: BLE001
-                last_error = exc
-                err_text = str(exc).lower()
-                non_chat_model = (
-                    "not a chat model" in err_text
-                    or "v1/chat/completions" in err_text
-                    or "did you mean to use v1/completions" in err_text
-                )
-                if not non_chat_model or idx == len(models_to_try) - 1:
+                    if idx == len(models_to_try) - 1:
+                        raise RuntimeError(
+                            "Configured planning author model timed out and fallback also timed out."
+                        ) from exc
                     break
+                except Exception as exc:  # noqa: BLE001
+                    last_error = exc
+                    if is_non_chat_model_hint(exc) and idx < len(models_to_try) - 1:
+                        break
+                    if is_transient_llm_failure(exc) and attempt < max_attempts - 1 and policy.enabled:
+                        delay = compute_retry_delay_seconds(
+                            attempt_index=attempt,
+                            initial_delay_seconds=policy.initial_delay_seconds,
+                            max_delay_seconds=policy.max_delay_seconds,
+                            backoff_multiplier=policy.backoff_multiplier,
+                            respect_retry_after=policy.respect_retry_after,
+                            exc=exc,
+                        )
+                        await self._emit(
+                            {
+                                "type": "llm_retry",
+                                "session_stage": "author",
+                                "model": model,
+                                "attempt": attempt + 1,
+                                "max_attempts": max_attempts,
+                                "delay_seconds": round(delay, 2),
+                                "reason": "transient",
+                            }
+                        )
+                        await async_sleep(delay)
+                        continue
+                    if not is_non_chat_model_hint(exc) or idx == len(models_to_try) - 1:
+                        fatal_for_models = True
+                        break
+
+            if fatal_for_models:
+                break
 
         if last_error is not None:
             raise RuntimeError(f"Configured planning author model failed. Last error: {last_error}") from last_error

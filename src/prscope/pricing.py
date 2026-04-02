@@ -52,6 +52,9 @@ MODEL_PRICING: dict[str, tuple[float, float]] = {
     "gemini-3.1-pro-preview": (2.00, 12.00),
 }
 
+# When a model id is missing from MODEL_CONTEXT_WINDOWS, planning budgets fall back to this.
+DEFAULT_CONTEXT_WINDOW_FALLBACK: int = 128_000
+
 MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "gpt-4o": 128_000,
     "gpt-4o-mini": 128_000,
@@ -90,6 +93,14 @@ MODEL_CONTEXT_WINDOWS: dict[str, int] = {
     "gemini-3.1-flash-lite-preview": 1_048_576,
     "gemini-3.1-pro-preview": 1_048_576,
 }
+
+
+def context_window_for_model(model: str) -> int:
+    """Return provider context window for budgeting; unknown models use DEFAULT_CONTEXT_WINDOW_FALLBACK."""
+    window = MODEL_CONTEXT_WINDOWS.get(model.strip())
+    if isinstance(window, int) and window > 0:
+        return window
+    return DEFAULT_CONTEXT_WINDOW_FALLBACK
 
 
 @dataclass

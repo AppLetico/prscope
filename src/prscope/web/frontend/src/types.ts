@@ -355,6 +355,11 @@ export type UIEvent = UIEventBase & (
       session_stage?: string;
     }
   | {
+      type: "plan_handoff";
+      message: string;
+      summary_preview?: string | null;
+    }
+  | {
       type: "context_compaction";
       enabled: boolean;
       reason?: string;

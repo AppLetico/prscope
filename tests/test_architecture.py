@@ -79,6 +79,7 @@ INTELLIGENCE = {
     "planning.runtime.orchestration_support.session_starts",
     "planning.runtime.orchestration_support.chat_flow",
     "planning.runtime.orchestration_support.round_entry",
+    "planning.runtime.orchestration_support.adversarial_compaction",
     "planning.runtime.author",
     "planning.runtime.authoring",
     "planning.runtime.authoring.models",
@@ -88,6 +89,8 @@ INTELLIGENCE = {
     "planning.runtime.authoring.pipeline",
     "planning.runtime.critic",
     "planning.runtime.tools",
+    "planning.runtime.llm_retry",
+    "planning.runtime.ripgrep_search",
     "planning.runtime.budget",
     "planning.runtime.telemetry",
     "planning.runtime.clarification",
@@ -140,6 +143,8 @@ APPROVED_LEAF_HELPERS = {
     "planning.runtime.tools",
     "planning.runtime.telemetry",
     "planning.runtime.events.analytics_emitter",
+    "planning.runtime.ripgrep_search",
+    "planning.runtime.llm_retry",
 }
 
 

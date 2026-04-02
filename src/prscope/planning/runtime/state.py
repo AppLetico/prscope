@@ -32,6 +32,8 @@ class PlanningState:
     skills_context: str = ""
     recall_context: str = ""
     no_recall: bool = False
+    # Last seen disk fingerprint for manifesto + skills (see PlanningConfig.instruction_context_refresh)
+    instruction_context_fingerprint: str = ""
 
     # Pipeline artifacts
     repo_understanding: RepoUnderstanding | None = None

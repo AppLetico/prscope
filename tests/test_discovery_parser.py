@@ -59,6 +59,18 @@ def test_extract_feature_intent_various_requests():
     assert manager._extract_feature_intent("create the new feature") is None
 
 
+def test_extract_feature_intent_drops_noisy_and_ambiguous_tokens_for_ask_mode() -> None:
+    """Regression: 'add ... ask mode' must not emit \\bto\\b or lone \\bmode\\b patterns (huge false positives)."""
+    manager = DiscoveryManager.__new__(DiscoveryManager)
+    intent = manager._extract_feature_intent("Can we add a ask mode to prscope?")
+    assert intent is not None
+    joined = " ".join(intent.patterns)
+    assert r"\bto\b" not in joined
+    assert r"\bmode\b" not in joined
+    assert "ask" in intent.keywords
+    assert "prscope" in intent.keywords
+
+
 def test_should_bootstrap_scan_has_guard():
     manager = DiscoveryManager.__new__(DiscoveryManager)
     assert manager._should_bootstrap_scan("add documentation pages") is False

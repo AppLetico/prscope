@@ -105,6 +105,36 @@ class IssueGraphConfig:
 
 
 @dataclass
+class LlmRetryConfig:
+    """Retries for transient LLM failures (rate limits, overload, timeouts)."""
+
+    enabled: bool = True
+    max_attempts: int = 4
+    initial_delay_seconds: float = 1.0
+    max_delay_seconds: float = 60.0
+    backoff_multiplier: float = 2.0
+    respect_retry_after: bool = True
+
+
+@dataclass
+class PlanningToolsConfig:
+    """Runtime codebase tool behavior (grep_code, glob_files)."""
+
+    # auto: use ripgrep when `ripgrep_command` is on PATH, else Python scan
+    grep_backend: str = "auto"  # auto | ripgrep | python
+    ripgrep_command: str = "rg"
+    ripgrep_timeout_seconds: float = 45.0
+    ripgrep_max_columns: int = 500
+    ripgrep_respect_ignore_files: bool = True
+    glob_max_results: int = 100
+    # Max JSON size for a single tool result before artifact offload (grep/read_file payloads)
+    tool_result_max_chars: int = 8000
+    # Optional per-tool path prefixes (repo-relative). Omitted tool names = no extra restriction.
+    # Empty list for a tool = deny all paths for that tool.
+    path_allowlist: dict[str, list[str]] = field(default_factory=dict)
+
+
+@dataclass
 class PlanningConfig:
     """Planning mode configuration."""
 
@@ -116,6 +146,10 @@ class PlanningConfig:
     author_refine_model: str | None = None
     critic_review_model: str | None = None
     structured_output_fallback_model: str = "gpt-4o-mini"
+    # Chat completion fallbacks when primary model fails (see planning.llm_retry and docs)
+    author_completion_fallback_model: str = "gpt-4o"
+    discovery_completion_fallback_model: str = "gpt-4o-mini"
+    llm_retry: LlmRetryConfig = field(default_factory=LlmRetryConfig)
     author_call_timeout_seconds: int = 50
     memory_prep_timeout_seconds: int = 120
     initial_draft_timeout_seconds: int = 45
@@ -148,7 +182,27 @@ class PlanningConfig:
     issue_graph: IssueGraphConfig = field(default_factory=IssueGraphConfig)
     clarification_timeout_seconds: int = 600
     # Minimum score on each plan_rubric axis (0–10) required for convergence; min(axis scores) must be >= this.
-    plan_rubric_floor: float = 7.25
+    # Default 7.0 (was 7.25) accounts for the fifth rubric axis (intent_alignment).
+    plan_rubric_floor: float = 7.0
+    tools: PlanningToolsConfig = field(default_factory=PlanningToolsConfig)
+    # Prompt budgeting for initial author draft (user-visible blob vs wire prompt + completion reserve)
+    author_prompt_completion_reserve_tokens: int = 4000
+    context_tool_overhead_tokens: int = 1000
+    # heuristic | tiktoken — tiktoken is optional (improves OpenAI-family estimates when installed)
+    token_budget_estimator: str = "heuristic"
+    # Cap discovery tool-loop transcript before each LLM call (system + user + tool history)
+    discovery_conversation_max_chars: int = 120_000
+    # Prior-critique compaction (adversarial refinement helpers)
+    critique_compress_max_recent_chars: int = 5000
+    critique_compress_max_summary_chars: int = 1200
+    critique_llm_summarize_enabled: bool = False
+    critique_llm_summarize_prompt_tokens_threshold: int = 120_000
+    critique_llm_summarize_model: str | None = None
+    # off | on_change | each_turn — reload manifesto/skills/constraints from disk
+    instruction_context_refresh: str = "off"
+    # SSE "thinking" pings during long discovery / design_review phases (0 disables)
+    long_phase_ping_first_after_seconds: float = 45.0
+    long_phase_ping_interval_seconds: float = 35.0
 
 
 @dataclass
@@ -404,6 +458,43 @@ class PrscopeConfig:
             "modules": int(memory_caps_raw.get("modules", 2000)),
             "manifesto": int(memory_caps_raw.get("manifesto", 1500)),
         }
+        tools_raw = planning_data.get("tools") or {}
+        grep_backend = str(tools_raw.get("grep_backend", "auto")).strip().lower()
+        if grep_backend not in {"auto", "ripgrep", "python"}:
+            grep_backend = "auto"
+        pal_raw = tools_raw.get("path_allowlist")
+        path_allowlist: dict[str, list[str]] = {}
+        if isinstance(pal_raw, dict):
+            for tk, tv in pal_raw.items():
+                key = str(tk).strip()
+                if not key:
+                    continue
+                if isinstance(tv, list):
+                    path_allowlist[key] = [str(x).strip() for x in tv if str(x).strip()]
+                else:
+                    path_allowlist[key] = [str(tv).strip()] if str(tv).strip() else []
+        planning_tools = PlanningToolsConfig(
+            grep_backend=grep_backend,
+            ripgrep_command=str(tools_raw.get("ripgrep_command", "rg")).strip() or "rg",
+            ripgrep_timeout_seconds=float(tools_raw.get("ripgrep_timeout_seconds", 45.0)),
+            ripgrep_max_columns=max(8, int(tools_raw.get("ripgrep_max_columns", 500))),
+            ripgrep_respect_ignore_files=bool(tools_raw.get("ripgrep_respect_ignore_files", True)),
+            glob_max_results=max(1, int(tools_raw.get("glob_max_results", 100))),
+            tool_result_max_chars=max(1024, int(tools_raw.get("tool_result_max_chars", 8000))),
+            path_allowlist=path_allowlist,
+        )
+        lr_raw = planning_data.get("llm_retry")
+        if isinstance(lr_raw, dict):
+            llm_retry_cfg = LlmRetryConfig(
+                enabled=bool(lr_raw.get("enabled", True)),
+                max_attempts=max(1, int(lr_raw.get("max_attempts", 4))),
+                initial_delay_seconds=max(0.0, float(lr_raw.get("initial_delay_seconds", 1.0))),
+                max_delay_seconds=max(0.0, float(lr_raw.get("max_delay_seconds", 60.0))),
+                backoff_multiplier=max(1.0, float(lr_raw.get("backoff_multiplier", 2.0))),
+                respect_retry_after=bool(lr_raw.get("respect_retry_after", True)),
+            )
+        else:
+            llm_retry_cfg = LlmRetryConfig()
         author_model = planning_data.get("author_model", "gpt-4o-mini")
         memory_model = planning_data.get("memory_model", author_model)
         config.planning = PlanningConfig(
@@ -418,6 +509,15 @@ class PrscopeConfig:
                 planning_data.get("structured_output_fallback_model", "gpt-4o-mini")
             ).strip()
             or "gpt-4o-mini",
+            author_completion_fallback_model=str(
+                planning_data.get("author_completion_fallback_model", "gpt-4o")
+            ).strip()
+            or "gpt-4o",
+            discovery_completion_fallback_model=str(
+                planning_data.get("discovery_completion_fallback_model", "gpt-4o-mini")
+            ).strip()
+            or "gpt-4o-mini",
+            llm_retry=llm_retry_cfg,
             author_call_timeout_seconds=int(planning_data.get("author_call_timeout_seconds", 50)),
             memory_prep_timeout_seconds=int(planning_data.get("memory_prep_timeout_seconds", 120)),
             initial_draft_timeout_seconds=int(planning_data.get("initial_draft_timeout_seconds", 45)),
@@ -445,7 +545,45 @@ class PrscopeConfig:
             issue_dedupe=dedupe_config,
             issue_graph=issue_graph_config,
             clarification_timeout_seconds=int(planning_data.get("clarification_timeout_seconds", 600)),
-            plan_rubric_floor=float(planning_data.get("plan_rubric_floor", 7.25)),
+            plan_rubric_floor=float(planning_data.get("plan_rubric_floor", 7.0)),
+            tools=planning_tools,
+            author_prompt_completion_reserve_tokens=max(
+                512, int(planning_data.get("author_prompt_completion_reserve_tokens", 4000))
+            ),
+            context_tool_overhead_tokens=max(0, int(planning_data.get("context_tool_overhead_tokens", 1000))),
+            token_budget_estimator=(
+                te
+                if (te := str(planning_data.get("token_budget_estimator", "heuristic")).strip().lower() or "heuristic")
+                in {"heuristic", "tiktoken"}
+                else "heuristic"
+            ),
+            discovery_conversation_max_chars=max(
+                8_192,
+                int(planning_data.get("discovery_conversation_max_chars", 120_000)),
+            ),
+            critique_compress_max_recent_chars=max(
+                500,
+                int(planning_data.get("critique_compress_max_recent_chars", 5000)),
+            ),
+            critique_compress_max_summary_chars=max(
+                200,
+                int(planning_data.get("critique_compress_max_summary_chars", 1200)),
+            ),
+            critique_llm_summarize_enabled=bool(planning_data.get("critique_llm_summarize_enabled", False)),
+            critique_llm_summarize_prompt_tokens_threshold=max(
+                1, int(planning_data.get("critique_llm_summarize_prompt_tokens_threshold", 120_000))
+            ),
+            critique_llm_summarize_model=(
+                str(m).strip() if (m := planning_data.get("critique_llm_summarize_model")) else None
+            ),
+            instruction_context_refresh=(
+                icr
+                if (icr := str(planning_data.get("instruction_context_refresh", "off")).strip().lower() or "off")
+                in {"off", "on_change", "each_turn"}
+                else "off"
+            ),
+            long_phase_ping_first_after_seconds=float(planning_data.get("long_phase_ping_first_after_seconds", 45.0)),
+            long_phase_ping_interval_seconds=float(planning_data.get("long_phase_ping_interval_seconds", 35.0)),
         )
 
         repos_data = data.get("repos", {})

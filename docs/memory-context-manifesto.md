@@ -117,6 +117,18 @@ Manifesto and memory sections are truncated by configurable char caps before bud
 
 The runtime builds a short context index that tells the model what memory is available and how to fetch more through tools. This keeps initial prompts compact while preserving discoverability.
 
+### Index discipline (memory as index, not a dump)
+
+Some harnesses treat “always-on” context as a **small index**: pointers, policy, and short summaries, with detail pulled from the repo via tools when needed. **Entropy control** matters: stuffing large, re-derivable blobs (full file trees, paste-heavy logs, redundant code excerpts) into manifesto, skills, or recall blocks **bloats** every planning turn and can drown out the real requirements.
+
+**Practical guidance for Prscope:**
+
+- Keep **manifesto** and **skills** as concise, actionable rules; use `get_memory_block` / `grep_code` / `read_file` for evidence instead of duplicating the codebase in prose.
+- Treat **session recall** as a **hint**, not ground truth—re-verify against the repo when the plan depends on it.
+- Prefer **rebuild** or **refresh** (`instruction_context_refresh`) when project files change; avoid maintaining two competing sources of truth.
+
+This aligns with the “index vs storage” ideas in [`harness-comparison-checklist.md`](harness-comparison-checklist.md) §2b without requiring new runtime features.
+
 ### On-Demand Memory Pull
 
 The tool surface includes `get_memory_block(key)` so the model can fetch targeted memory only when needed, rather than front-loading all memory into every call.
@@ -158,6 +170,7 @@ Relevant knobs:
 - `planning.memory_concurrency`
 - `planning.memory_block_max_chars`
 - `planning.scanner` (`grep`, `repomap`, `repomix`)
+- `planning.long_phase_ping_first_after_seconds` / `planning.long_phase_ping_interval_seconds` (SSE “thinking” during long discovery or design review; set first to `0` to disable)
 - repo-level `memory_block_max_chars` overrides
 - repo-level `manifesto_file` override
 

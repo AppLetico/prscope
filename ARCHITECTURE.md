@@ -94,6 +94,15 @@ Minimal dependency direction within runtime:
 - reasoning remains policy-oriented and does not depend on review state or persisted critique artifacts
 - leaf/context/event utilities remain reusable helpers rather than mini-controllers
 
+### Incremental refactors (large coordinators)
+
+`planning/runtime/orchestration.py` and `web/api.py` are **facades**: they remain the public entrypoints, but they should **lose lines over time** when you touch related code—not in a dedicated “rewrite” PR.
+
+- **Rule:** one change set = **one** cohesive extraction (helpers, serializers, or a delegated helper class). Avoid big-bang splits that only move code without a behavior trigger.
+- **Orchestration:** move logic into `planning/runtime/orchestration_support/*`, matching existing patterns (`RuntimeChatFlow`, `RuntimeSessionStarts`, `adversarial_compaction`, etc.). Prefer pure functions or small classes that take explicit dependencies; keep `PlanningRuntime` as the coordinator that calls them.
+- **Web API:** move route-agnostic helpers out of `api.py` into focused modules under `web/` (for example serialization of sessions/turns/versions, or background failure surfacing), and keep `create_app()` as the wiring layer that imports and registers routes.
+- **Guardrails:** new modules must obey the same **downward-only** import rules; extend `tests/test_architecture.py` allowlists when adding new `orchestration_support` (or other structural) packages.
+
 ### Web Sublayers
 
 ```

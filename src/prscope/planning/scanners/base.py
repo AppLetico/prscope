@@ -5,7 +5,7 @@ A scanner's job is to produce a *context string* describing the repository
 structure.  That string is injected into the LLM system prompt as static
 memory before any planning conversation starts.
 
-Dynamic tool calls (list_files / read_file / grep_code) are handled
+Dynamic tool calls (list_files / glob_files / read_file / grep_code) are handled
 separately by ToolExecutor and are NOT the scanner's responsibility.
 """
 

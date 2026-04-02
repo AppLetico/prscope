@@ -4,10 +4,56 @@ import asyncio
 import json
 from typing import Any
 
+from ....config import LlmRetryConfig
 from ....model_catalog import litellm_model_name, model_provider
-from ....pricing import MODEL_CONTEXT_WINDOWS
+from ....pricing import context_window_for_model
+from ..llm_retry import (
+    async_sleep,
+    compute_retry_delay_seconds,
+    is_non_chat_model_hint,
+    is_transient_llm_failure,
+)
 from ..telemetry import completion_telemetry
 from ..tools import CODEBASE_TOOLS
+
+
+def _discovery_message_chars(messages: list[dict[str, Any]]) -> int:
+    return sum(len(str(m.get("content", ""))) for m in messages)
+
+
+def trim_discovery_messages_for_budget(
+    messages: list[dict[str, Any]],
+    max_chars: int,
+) -> list[dict[str, Any]]:
+    """Drop oldest tool messages until the transcript fits the budget (system + user preserved)."""
+    if max_chars <= 0 or _discovery_message_chars(messages) <= max_chars:
+        return messages
+    out = list(messages)
+    guard = 0
+    while _discovery_message_chars(out) > max_chars and len(out) > 2 and guard < 1000:
+        guard += 1
+        removed = False
+        for i in range(1, len(out)):
+            if out[i].get("role") == "tool":
+                del out[i]
+                removed = True
+                break
+        if not removed:
+            break
+    return out
+
+
+def _cap_tool_json_content(raw: str, max_chars: int) -> str:
+    if len(raw) <= max_chars:
+        return raw
+    return json.dumps(
+        {
+            "truncated": True,
+            "preview": raw[: max(0, max_chars - 240)],
+            "note": "Tool JSON truncated for discovery context budget.",
+        },
+        ensure_ascii=False,
+    )
 
 
 class DiscoveryLLMClient:
@@ -30,7 +76,23 @@ class DiscoveryLLMClient:
         active_feature = self._manager._extract_feature_intent(self._manager._latest_user_message(messages))
         announced_scanning = False
 
+        cfg = self._manager.config
+        max_conv = max(8_192, int(getattr(cfg, "discovery_conversation_max_chars", 120_000)))
+        per_tool_cap = max(4096, max_conv // 8)
+
         for _ in range(max_tool_rounds):
+            before_len = len(conversation)
+            before_chars = _discovery_message_chars(conversation)
+            conversation = trim_discovery_messages_for_budget(conversation, max_conv)
+            if len(conversation) < before_len or _discovery_message_chars(conversation) < before_chars:
+                await self._manager._emit(
+                    {
+                        "type": "context_compaction",
+                        "enabled": True,
+                        "reason": "discovery_transcript_trim",
+                        "session_stage": "discovery",
+                    }
+                )
             response = await self.safe_completion_call(
                 litellm=litellm,
                 messages=self._manager._normalize_roles(conversation),
@@ -113,6 +175,7 @@ class DiscoveryLLMClient:
                         tool_result_payload=result["result"] if isinstance(result, dict) else {},
                     )
                     raw_content = json.dumps(result["result"])
+                    raw_content = _cap_tool_json_content(raw_content, per_tool_cap)
                     conversation.append(
                         {
                             "role": "tool",
@@ -158,8 +221,13 @@ class DiscoveryLLMClient:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = "auto"
 
-        primary_model = model_override or self._manager.config.author_model
-        fallback_model = "gpt-4o-mini"
+        cfg = self._manager.config
+        policy = getattr(cfg, "llm_retry", None) or LlmRetryConfig()
+        max_attempts = max(1, int(policy.max_attempts)) if policy.enabled else 1
+        primary_model = model_override or cfg.author_model
+        fallback_model = (
+            str(getattr(cfg, "discovery_completion_fallback_model", None) or "gpt-4o-mini").strip() or "gpt-4o-mini"
+        )
         models_to_try = [primary_model]
         if fallback_model != primary_model:
             models_to_try.append(fallback_model)
@@ -167,45 +235,69 @@ class DiscoveryLLMClient:
         last_error: Exception | None = None
         for idx, model in enumerate(models_to_try):
             litellm_model = litellm_model_name(model)
-            try:
-                llm_started = asyncio.get_running_loop().time()
-                response = await asyncio.to_thread(
-                    litellm.completion,
-                    model=litellm_model,
-                    **kwargs,
-                )
-                llm_elapsed_ms = (asyncio.get_running_loop().time() - llm_started) * 1000.0
-                telemetry = completion_telemetry(response, model=model)
-                context_window = MODEL_CONTEXT_WINDOWS.get(model)
-                await self._manager._emit(
-                    {
-                        "type": "token_usage",
-                        "session_stage": "discovery",
-                        "model": model,
-                        "model_provider": model_provider(model),
-                        "prompt_tokens": telemetry.usage.prompt_tokens,
-                        "completion_tokens": telemetry.usage.completion_tokens,
-                        "call_cost_usd": telemetry.cost.total_cost_usd,
-                        "llm_call_latency_ms": round(llm_elapsed_ms, 2),
-                        "context_window_tokens": context_window,
-                        "context_usage_ratio": (
-                            round(float(telemetry.usage.prompt_tokens) / float(context_window), 4)
-                            if context_window and context_window > 0
-                            else None
-                        ),
-                    }
-                )
-                return response
-            except Exception as exc:  # noqa: BLE001
-                last_error = exc
-                err_text = str(exc).lower()
-                non_chat_model = (
-                    "not a chat model" in err_text
-                    or "v1/chat/completions" in err_text
-                    or "did you mean to use v1/completions" in err_text
-                )
-                if not non_chat_model or idx == len(models_to_try) - 1:
-                    break
+            fatal_for_models = False
+            for attempt in range(max_attempts):
+                try:
+                    llm_started = asyncio.get_running_loop().time()
+                    response = await asyncio.to_thread(
+                        litellm.completion,
+                        model=litellm_model,
+                        **kwargs,
+                    )
+                    llm_elapsed_ms = (asyncio.get_running_loop().time() - llm_started) * 1000.0
+                    telemetry = completion_telemetry(response, model=model)
+                    context_window = context_window_for_model(model)
+                    await self._manager._emit(
+                        {
+                            "type": "token_usage",
+                            "session_stage": "discovery",
+                            "model": model,
+                            "model_provider": model_provider(model),
+                            "prompt_tokens": telemetry.usage.prompt_tokens,
+                            "completion_tokens": telemetry.usage.completion_tokens,
+                            "call_cost_usd": telemetry.cost.total_cost_usd,
+                            "llm_call_latency_ms": round(llm_elapsed_ms, 2),
+                            "context_window_tokens": context_window,
+                            "context_usage_ratio": (
+                                round(float(telemetry.usage.prompt_tokens) / float(context_window), 4)
+                                if context_window > 0
+                                else None
+                            ),
+                        }
+                    )
+                    return response
+                except Exception as exc:  # noqa: BLE001
+                    last_error = exc
+                    if is_non_chat_model_hint(exc) and idx < len(models_to_try) - 1:
+                        break
+                    if is_transient_llm_failure(exc) and attempt < max_attempts - 1 and policy.enabled:
+                        delay = compute_retry_delay_seconds(
+                            attempt_index=attempt,
+                            initial_delay_seconds=policy.initial_delay_seconds,
+                            max_delay_seconds=policy.max_delay_seconds,
+                            backoff_multiplier=policy.backoff_multiplier,
+                            respect_retry_after=policy.respect_retry_after,
+                            exc=exc,
+                        )
+                        await self._manager._emit(
+                            {
+                                "type": "llm_retry",
+                                "session_stage": "discovery",
+                                "model": model,
+                                "attempt": attempt + 1,
+                                "max_attempts": max_attempts,
+                                "delay_seconds": round(delay, 2),
+                                "reason": "transient",
+                            }
+                        )
+                        await async_sleep(delay)
+                        continue
+                    if not is_non_chat_model_hint(exc) or idx == len(models_to_try) - 1:
+                        fatal_for_models = True
+                        break
+
+            if fatal_for_models:
+                break
 
         if last_error is not None:
             raise RuntimeError(

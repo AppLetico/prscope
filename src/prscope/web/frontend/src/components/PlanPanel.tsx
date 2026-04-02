@@ -11,6 +11,7 @@ import { preprocessPlanMarkdown } from "../lib/markdown";
 import { planMarkdownComponents } from "../lib/markdownComponents";
 import { augmentPlanMarkdownWithDecisionGraph } from "../lib/decisionGraphRender";
 import type { ArchitectureImpactView, DecisionGraph, IssueGraphNode, IssueGraphSnapshot, SessionStatus } from "../types";
+import { getPlanPanelEmptyCopy } from "./planPanelUi";
 
 interface PlanPanelProps {
   content: string;
@@ -77,25 +78,12 @@ export function PlanPanel({
   }, [content]);
 
   if (!content) {
-    const isInProgress = isProcessing && (status === "draft" || status === "refining");
+    const emptyCopy = getPlanPanelEmptyCopy(isProcessing, status);
     return (
       <div className="h-full flex flex-col items-center justify-center text-zinc-500 bg-zinc-900">
         <FileText className="w-12 h-12 mb-4 opacity-20" />
-        {isInProgress ? (
-          <>
-            <p className="text-sm">Generating plan...</p>
-            <p className="text-xs opacity-60 mt-1">
-              Drafting and validation are in progress.
-            </p>
-          </>
-        ) : (
-          <>
-            <p className="text-sm">No plan generated yet.</p>
-            <p className="text-xs opacity-60 mt-1">
-              Add requirements or run discovery-style chat to begin.
-            </p>
-          </>
-        )}
+        <p className="text-sm">{emptyCopy.title}</p>
+        <p className="text-xs opacity-60 mt-1">{emptyCopy.subtitle}</p>
       </div>
     );
   }

@@ -6,6 +6,7 @@ import { useRef, useEffect, useState, useMemo } from "react";
 import { Tooltip } from "./ui/Tooltip";
 
 import { formatDiagnosticsSource, formatInvestigationDensity } from "./actionBarDiagnostics";
+import { isConvergedOrApproved, scoreColor } from "./actionBarUi";
 import { ThemeToggle } from "./ThemeToggle";
 
 interface ActionBarProps {
@@ -23,13 +24,6 @@ interface ActionBarProps {
   routingDiagnosticsSource?: string | null;
   onDelete?: () => void;
   roundMetrics?: RoundMetric[];
-}
-
-function scoreColor(score: number | null | undefined): string {
-  if (score == null) return "text-zinc-500";
-  if (score >= 0.85) return "text-emerald-400";
-  if (score >= 0.65) return "text-amber-400";
-  return "text-rose-400";
 }
 
 function MetricRow({
@@ -131,7 +125,7 @@ export function ActionBar({
     () => sortedMetrics.reduce((sum, m) => sum + (m.call_cost_usd ?? 0), 0),
     [sortedMetrics],
   );
-  const isConverged = status === "converged" || status === "approved";
+  const isConverged = isConvergedOrApproved(status);
   const isRefining = status === "refining" || status === "draft";
   const statusTooltip = {
     draft: "Collecting requirements and preparing the first plan draft.",
@@ -161,7 +155,7 @@ export function ActionBar({
       </div>
 
       {/* Center: Status Pill */}
-      <div className="flex items-center justify-center flex-1">
+      <div className="flex flex-col items-center justify-center flex-1 min-w-0 gap-0.5">
         <div
           ref={convRef}
           role={(status === "refining" || status === "converged") ? "button" : undefined}
@@ -380,6 +374,14 @@ export function ActionBar({
             </Tooltip>
           </div>
         </div>
+        {isConverged && (
+          <p
+            className="text-[9px] sm:text-[10px] text-zinc-500 text-center px-2 leading-snug max-w-[min(32rem,85vw)]"
+            title="Prscope produces plans and evidence; implementation and CI run in your environment."
+          >
+            Export PRD to share — implementation runs outside Prscope.
+          </p>
+        )}
       </div>
 
       {/* Right: Actions */}

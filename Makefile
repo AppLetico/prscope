@@ -4,7 +4,7 @@
 # Prefer repo .venv so `make web-backend` etc. work even when another venv is activated.
 PYTHON := $(shell test -x "$(CURDIR)/.venv/bin/python" && echo "$(CURDIR)/.venv/bin/python" || (command -v python3 2>/dev/null || echo python))
 
-.PHONY: install dev test lint format check lint-typecheck ci clean help web web-backend web-frontend web-kill sessions-delete reset
+.PHONY: install dev test lint format check lint-typecheck ci clean help web web-backend web-frontend web-kill sessions-delete reset benchmark-health benchmark-smoke docs-linkcheck
 
 # Default target
 help:
@@ -15,7 +15,7 @@ help:
 	@echo "  make test         Run unit tests"
 	@echo "  make lint         Run linter (ruff check)"
 	@echo "  make format       Format code (ruff format)"
-	@echo "  make check        Run lint + format check + tests"
+	@echo "  make check        Run lint + format check + tests + doc link check"
 	@echo "  make lint-typecheck  Run lint + format check + typecheck (backend + frontend, no tests)"
 	@echo "  make ci            Same as CI: lint + format check + tests + frontend lint + frontend build"
 	@echo "  make clean         Remove build artifacts"
@@ -39,6 +39,12 @@ help:
 	@echo "  make sessions-delete  Delete all planning sessions and session cache (prompts for confirmation)"
 	@echo "  make reset            Blank slate: delete sessions + clear all planning cache (prompts; use -y to skip)"
 	@echo "  make web           Show instructions to run backend + frontend"
+	@echo ""
+	@echo "Benchmarks (require API; see CONTRIBUTING.md)"
+	@echo ""
+	@echo "  make benchmark-health   Cheap API health check only"
+	@echo "  make benchmark-smoke    Full prompts suite vs http://127.0.0.1:8420"
+	@echo "  make docs-linkcheck     Validate relative links in docs + key root markdown"
 	@echo ""
 
 # Install package in editable mode
@@ -69,6 +75,7 @@ format:
 check: lint
 	ruff format --check .
 	$(PYTHON) -m pytest -q
+	$(PYTHON) scripts/check_doc_links.py
 
 # Lint and typecheck only (no tests): backend ruff + frontend eslint + tsc
 lint-typecheck: lint
@@ -79,6 +86,7 @@ lint-typecheck: lint
 ci: lint
 	ruff format --check .
 	$(PYTHON) -m pytest -q
+	$(PYTHON) scripts/check_doc_links.py
 	@cd src/prscope/web/frontend && npm run lint && npm run build
 	@cd src/prscope/web/frontend && npx playwright install chromium && npx playwright test --project=chromium
 
@@ -131,6 +139,17 @@ run: profile sync evaluate
 # Full workflow: profile -> sync (full) -> evaluate (all)
 run-full: profile sync-full evaluate-all
 	@echo "Prscope full workflow complete"
+
+# --- Benchmarks (planning harness / API) ---
+
+benchmark-health:
+	$(PYTHON) -m prscope.benchmark --base-url http://127.0.0.1:8420 --repo prscope --config-root $(CURDIR) --health-check-only
+
+benchmark-smoke:
+	$(PYTHON) -m prscope.benchmark --base-url http://127.0.0.1:8420 --repo prscope --config-root $(CURDIR) --prompts-file benchmarks/prompts.json
+
+docs-linkcheck:
+	$(PYTHON) scripts/check_doc_links.py
 
 # --- Web app ---
 

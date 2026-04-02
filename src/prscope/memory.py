@@ -61,6 +61,29 @@ class ParsedConstraint:
     evidence_keywords: list[str] = field(default_factory=list)
 
 
+def instruction_context_fingerprint(manifesto_path: Path, skills_dir: Path) -> str:
+    """Stable fingerprint from manifesto + skills *.md mtimes/sizes for cache invalidation."""
+    parts: list[str] = []
+    if manifesto_path.exists():
+        st = manifesto_path.stat()
+        parts.append(f"m:{st.st_mtime_ns}:{st.st_size}")
+    else:
+        parts.append("m:missing")
+    if skills_dir.exists():
+        files = sorted(skills_dir.glob("*.md"))
+        if not files:
+            parts.append("s:empty")
+        else:
+            sigs: list[str] = []
+            for f in files:
+                st = f.stat()
+                sigs.append(f"{f.name}:{st.st_mtime_ns}:{st.st_size}")
+            parts.append("s:" + "|".join(sigs))
+    else:
+        parts.append("s:missing")
+    return "|".join(parts)
+
+
 def load_skills(skills_dir: Path, max_chars: int) -> str:
     """Load repo-local skill files with deterministic, boundary-safe truncation."""
     if not skills_dir.exists():

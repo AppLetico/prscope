@@ -67,7 +67,13 @@ LOCALIZED_REUSE_SCOPE_PATTERNS = (
 )
 
 # Plan harness: rubric axes, blocking categories (closed vocabulary), missing rubric fill.
-PLAN_RUBRIC_AXIS_KEYS: tuple[str, ...] = ("specificity", "testability", "coherence", "evidence_alignment")
+PLAN_RUBRIC_AXIS_KEYS: tuple[str, ...] = (
+    "specificity",
+    "testability",
+    "coherence",
+    "evidence_alignment",
+    "intent_alignment",
+)
 VALID_BLOCKING_CATEGORIES: frozenset[str] = frozenset({"testability", "evidence", "vagueness", "scope"})
 MISSING_RUBRIC_SCORE: float = 0.0
 
@@ -213,6 +219,10 @@ Gatekeeper standards:
 - Prefer false positives over silent misses.
 - Never downgrade a serious gap to "architectural_concern" to avoid conflict.
 
+Scope drift vs original requirements:
+- Explicitly compare the plan to the user's stated requirements. If the plan adds major work not asked for (unrelated subsystems, broad refactors, extra deliverables) or omits a core part of the ask without evidence-backed justification, call it out in blocking_issues or recommended_changes.
+- Use blocking_categories "scope" when the mismatch is over- or under-shooting the user's goals. Lower intent_alignment when the plan diverges from what was requested.
+
 Scope discipline rules (still apply when they do not contradict the gatekeeper standards above):
 - Preserve the user's requested scope unless broader changes are clearly required by repository evidence or explicit constraints.
 - Do not recommend authentication, authorization, cross-service dependency checks, or major contract expansion for a simple health/status endpoint unless the requirements explicitly ask for them or the design would otherwise expose sensitive data.
@@ -239,6 +249,7 @@ plan_rubric object (required): scores 0–10 for EACH key exactly:
 - testability: verifiable steps / tests / acceptance
 - coherence: the plan hangs together
 - evidence_alignment: claims tied to repo paths, constraints, manifesto, or recorded decisions; low if claims lack linkage
+- intent_alignment: plan matches the user's stated goals and scope; low when the plan drifts, gold-plates, or misses the core ask
 
 blocking_categories (required): list[str], each MUST be one of: testability | evidence | vagueness | scope
 Use [] only when no category applies. Do NOT invent new category strings.
@@ -269,7 +280,7 @@ Required JSON fields:
 - resolved_issues: list[str]
 - constraint_violations: list[str] (constraint IDs violated)
 - issue_priority: list[str] (issues ranked highest impact first)
-- plan_rubric: object with keys specificity, testability, coherence, evidence_alignment (numbers [0,10])
+- plan_rubric: object with keys specificity, testability, coherence, evidence_alignment, intent_alignment (numbers [0,10])
 - blocking_categories: list[str] (subset of testability|evidence|vagueness|scope, or [])
 - acceptance_criteria: list[str] (falsifiable bullets; use [] if none this round)
 
@@ -291,6 +302,7 @@ Review process (perform in order):
 15) Ask reviewer questions
 16) Recommend concrete improvements
 17) Evaluate constraints and rank issue priority
+17b) Compare plan scope to stated requirements; assign intent_alignment and scope-related blocking_categories when drift exists
 18) Assign plan_rubric, blocking_categories, acceptance_criteria consistent with blocking_issues
 
 If a significantly simpler architecture can solve the problem, set simplest_possible_design.

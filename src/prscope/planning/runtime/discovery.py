@@ -59,6 +59,7 @@ from .discovery_support import (
     summarize_endpoint_snippet,
     try_extract_completion,
 )
+from .elapsed_ping import run_with_elapsed_thinking
 from .reasoning import (
     DiscoveryChoiceSignals,
     DiscoveryFollowupSignals,
@@ -75,7 +76,7 @@ DISCOVERY_SYSTEM_PROMPT = """You are a planning assistant helping scope a softwa
 ## Your Process
 
 **Step 1 — Research first (ALWAYS on the first user message):**
-Use list_files, read_file, and grep_code to understand the project before asking anything.
+Use list_files, glob_files, read_file, and grep_code to understand the project before asking anything.
 Read: README, key source files, package manifests, existing patterns relevant to the request.
 Do not skip this step. Hallucinating project structure is worse than asking.
 If the request mentions endpoints/routes/APIs, inspect backend route handlers (not only frontend files) before asking.
@@ -1085,10 +1086,20 @@ class DiscoveryManager:
         await self._emit({"type": "thinking", "message": "Refining questions from available context..."})
         self._active_discovery_session_id = session_id
         try:
-            response = await self._llm_call_with_tools(
-                messages,
-                max_tool_rounds=self.config.discovery_tool_rounds,
-                model_override=model_override,
+
+            async def _emit_ping(event: dict[str, Any]) -> None:
+                await self._emit(event)
+
+            response = await run_with_elapsed_thinking(
+                self._llm_call_with_tools(
+                    messages,
+                    max_tool_rounds=self.config.discovery_tool_rounds,
+                    model_override=model_override,
+                ),
+                emit=_emit_ping,
+                first_after_s=float(self.config.long_phase_ping_first_after_seconds),
+                interval_s=float(self.config.long_phase_ping_interval_seconds),
+                message="Still exploring the codebase...",
             )
         finally:
             self._active_discovery_session_id = None

@@ -4,12 +4,20 @@ Planning runtime tool definitions and sandboxed execution.
 
 from __future__ import annotations
 
+import glob as glob_std
 import json
+import logging
 import re
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
+
+from ...config import PlanningToolsConfig
+from .ripgrep_search import grep_code_python, grep_code_ripgrep, resolve_grep_backend
+
+logger = logging.getLogger(__name__)
 
 BLOCKED_PATTERNS = {".env", "id_rsa", "credentials", "token", ".secret"}
 IGNORED_DIRS = {".git", "node_modules", ".venv", "venv", "__pycache__", ".prscope"}
@@ -53,12 +61,23 @@ BINARY_EXTENSIONS = {
     ".lock",  # package lock files (huge, unreadable)
 }
 
-# Max chars for a single tool result injected into the LLM conversation
-TOOL_RESULT_MAX_CHARS = 8_000
-
 
 class ToolSafetyError(RuntimeError):
     """Raised when a tool invocation violates sandbox policy."""
+
+
+def _normalize_repo_rel(rel: str) -> str:
+    if not rel or str(rel).strip() in {".", ""}:
+        return "."
+    return Path(str(rel)).as_posix().strip("/")
+
+
+def _rel_under_prefix(rel_norm: str, prefix_norm: str) -> bool:
+    if prefix_norm in {".", ""}:
+        return True
+    if rel_norm == prefix_norm:
+        return True
+    return rel_norm.startswith(prefix_norm + "/")
 
 
 CODEBASE_TOOLS = [
@@ -96,7 +115,46 @@ CODEBASE_TOOLS = [
         "type": "function",
         "function": {
             "name": "grep_code",
-            "description": "Search the repository for a regex pattern",
+            "description": (
+                "Search the repository for a regex pattern. Uses ripgrep when available "
+                "(planning.tools.grep_backend) for speed and .gitignore-aware matching; "
+                "falls back to a Python scan otherwise. "
+                "Use output_mode 'files_with_matches' to list only paths (smaller payload); "
+                "default 'content' returns matching lines for evidence."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string"},
+                    "path": {"type": "string"},
+                    "max_results": {"type": "integer"},
+                    "head_limit": {"type": "integer"},
+                    "glob": {
+                        "type": "string",
+                        "description": 'Optional rg --glob filter (e.g. "*.py", "*.{ts,tsx}")',
+                    },
+                    "type": {
+                        "type": "string",
+                        "description": "Optional ripgrep --type (e.g. py, rust, js)",
+                    },
+                    "case_insensitive": {"type": "boolean"},
+                    "output_mode": {
+                        "type": "string",
+                        "enum": ["content", "files_with_matches"],
+                    },
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "glob_files",
+            "description": (
+                "Find files by glob pattern under a directory (recursive patterns like **/*.py). "
+                "Complements list_files (single-directory listing) for wide file discovery."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -112,7 +170,7 @@ CODEBASE_TOOLS = [
         "type": "function",
         "function": {
             "name": "ask_clarification",
-            "description": "Ask the user a clarification question that CANNOT be answered by scanning the codebase. Only call this AFTER you have used list_files, read_file, and grep_code to exhaust relevant file-based evidence. Never ask about directory structure, file locations, test frameworks, or naming conventions without first calling list_files('.') to inspect the root.",
+            "description": "Ask the user a clarification question that CANNOT be answered by scanning the codebase. Only call this AFTER you have used list_files, glob_files, read_file, and grep_code to exhaust relevant file-based evidence. Never ask about directory structure, file locations, test frameworks, or naming conventions without first calling list_files('.') to inspect the root.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -153,10 +211,13 @@ class ToolExecutor:
         repo_root: Path,
         clarification_callback: Callable[[str, str], list[str]] | None = None,
         memory_block_callback: Callable[[str], dict[str, Any]] | None = None,
+        tools_config: PlanningToolsConfig | None = None,
     ):
         self.repo_root = repo_root.resolve()
+        self.tools_config = tools_config or PlanningToolsConfig()
         self.accessed_paths: set[str] = set()
         self.read_history: dict[str, dict[str, int]] = {}
+        self._access_lock = threading.Lock()
         self.clarification_callback = clarification_callback
         self.memory_block_callback = memory_block_callback
         self.session_id: str | None = None
@@ -167,8 +228,9 @@ class ToolExecutor:
         # Avoid cross-session evidence leakage while preserving continuity
         # within the same session across discovery -> drafting transitions.
         if self.session_id is not None and self.session_id != session_id:
-            self.accessed_paths.clear()
-            self.read_history.clear()
+            with self._access_lock:
+                self.accessed_paths.clear()
+                self.read_history.clear()
         self.session_id = session_id
 
     def maybe_cleanup_artifacts(self, max_age_days: int = 7) -> None:
@@ -217,15 +279,40 @@ class ToolExecutor:
             raise ToolSafetyError(f"Blocked sensitive file: {raw_path}")
         return candidate
 
+    def _repo_rel_posix(self, safe: Path) -> str:
+        rel = safe.relative_to(self.repo_root).as_posix()
+        if rel in {".", ""}:
+            return "."
+        return rel
+
+    def _enforce_path_allowlist(self, tool_name: str, rel_posix: str) -> None:
+        cfg = self.tools_config.path_allowlist
+        if tool_name not in cfg:
+            return
+        rules = cfg[tool_name]
+        if not rules:
+            raise ToolSafetyError(f"Tool {tool_name} is disabled by planning.tools.path_allowlist (empty prefix list)")
+        rel_norm = _normalize_repo_rel(rel_posix)
+        for raw in rules:
+            pnorm = _normalize_repo_rel(str(raw))
+            if _rel_under_prefix(rel_norm, pnorm):
+                return
+        raise ToolSafetyError(
+            f"Path not allowed for {tool_name} by planning.tools.path_allowlist: {rel_posix!r} "
+            f"(allowed prefixes: {rules!r})"
+        )
+
     def list_files(self, path: str | None = None, max_entries: int = 200) -> dict[str, Any]:
         safe = self._safe_path(path)
+        self._enforce_path_allowlist("list_files", self._repo_rel_posix(safe))
         if not safe.exists() or not safe.is_dir():
             raise ToolSafetyError(f"Directory not found: {path or '.'}")
         entries = []
         for child in sorted(safe.iterdir(), key=lambda p: p.name)[:max_entries]:
             rel = str(child.relative_to(self.repo_root))
             entries.append({"path": rel, "type": "dir" if child.is_dir() else "file"})
-            self.accessed_paths.add(rel)
+            with self._access_lock:
+                self.accessed_paths.add(rel)
         return {"path": str(safe.relative_to(self.repo_root)), "entries": entries}
 
     def read_file(
@@ -237,6 +324,7 @@ class ToolExecutor:
         radius: int = 80,
     ) -> dict[str, Any]:
         safe = self._safe_path(path)
+        self._enforce_path_allowlist("read_file", self._repo_rel_posix(safe))
         if not safe.exists() or not safe.is_file():
             raise ToolSafetyError(f"File not found: {path}")
         if safe.suffix.lower() in BINARY_EXTENSIONS:
@@ -256,19 +344,62 @@ class ToolExecutor:
             end_idx = min(len(lines), max(1, int(max_lines)))
         snippet = lines[start_idx:end_idx]
         rel = str(safe.relative_to(self.repo_root))
-        self.accessed_paths.add(rel)
-        self.read_history[rel] = {
-            "line_count": len(lines),
-            "file_size_bytes": len(raw_text.encode("utf-8")),
-        }
+        file_size_bytes = len(raw_text.encode("utf-8"))
+        with self._access_lock:
+            self.accessed_paths.add(rel)
+            self.read_history[rel] = {
+                "line_count": len(lines),
+                "file_size_bytes": file_size_bytes,
+            }
         return {
             "path": rel,
             "truncated": start_idx > 0 or end_idx < len(lines),
             "line_count": len(lines),
-            "file_size_bytes": self.read_history[rel]["file_size_bytes"],
+            "file_size_bytes": file_size_bytes,
             "start_line": start_idx + 1,
             "end_line": end_idx,
             "content": "\n".join(snippet),
+        }
+
+    def glob_files(
+        self,
+        pattern: str,
+        path: str | None = None,
+        max_results: int | None = None,
+    ) -> dict[str, Any]:
+        """Find files matching a glob pattern under a sandboxed directory."""
+        max_r = max_results if max_results is not None else self.tools_config.glob_max_results
+        base = self._safe_path(path)
+        self._enforce_path_allowlist("glob_files", self._repo_rel_posix(base))
+        if not base.is_dir():
+            raise ToolSafetyError(f"Directory not found: {path or '.'}")
+        matches = glob_std.glob(str(base / pattern), recursive=True)
+        out: list[str] = []
+        truncated = False
+        for abs_path in sorted(matches):
+            if len(out) >= max_r:
+                truncated = True
+                break
+            p = Path(abs_path)
+            if not p.is_file():
+                continue
+            try:
+                rel = str(p.relative_to(self.repo_root))
+            except ValueError:
+                continue
+            if any(part in IGNORED_DIRS for part in Path(rel).parts):
+                continue
+            if p.suffix.lower() in BINARY_EXTENSIONS:
+                continue
+            with self._access_lock:
+                self.accessed_paths.add(rel)
+            out.append(rel)
+        return {
+            "pattern": pattern,
+            "path": str(base.relative_to(self.repo_root)),
+            "results": out,
+            "count": len(out),
+            "truncated": truncated,
         }
 
     def grep_code(
@@ -276,46 +407,112 @@ class ToolExecutor:
         pattern: str,
         path: str | None = None,
         max_results: int = 40,
+        *,
+        head_limit: int | None = None,
+        glob: str | None = None,
+        type_tag: str | None = None,
+        case_insensitive: bool = False,
+        output_mode: str = "content",
     ) -> dict[str, Any]:
-        root = self._safe_path(path)
-        if root.is_file():
-            candidates = [root]
-        else:
-            candidates = []
-            for file_path in root.rglob("*"):
-                if not file_path.is_file():
-                    continue
-                try:
-                    rel_parts = file_path.relative_to(self.repo_root).parts
-                except ValueError:
-                    continue
-                if any(part in IGNORED_DIRS for part in rel_parts):
-                    continue
-                candidates.append(file_path)
+        if output_mode not in {"content", "files_with_matches"}:
+            raise ToolSafetyError(f"Invalid output_mode: {output_mode}")
+        limit = int(head_limit) if head_limit is not None else int(max_results)
+        if limit < 1:
+            limit = 1
 
-        try:
-            regex = re.compile(pattern)
-        except re.error as exc:
-            raise ToolSafetyError(f"Invalid regex pattern: {pattern}") from exc
+        root = self._safe_path(path)
+        self._enforce_path_allowlist("grep_code", self._repo_rel_posix(root))
+        cfg = self.tools_config
+        backend = resolve_grep_backend(cfg.grep_backend, cfg.ripgrep_command)
 
         matches: list[dict[str, Any]] = []
-        for file_path in candidates:
-            if len(matches) >= max_results:
-                break
-            # Skip binary/non-text files entirely
-            if file_path.suffix.lower() in BINARY_EXTENSIONS:
-                continue
-            content = file_path.read_text(encoding="utf-8", errors="ignore")
-            for line_num, line in enumerate(content.splitlines(), start=1):
-                if regex.search(line):
-                    rel = str(file_path.relative_to(self.repo_root))
-                    self.accessed_paths.add(rel)
-                    # Truncate individual lines to avoid binary/minified blowup
-                    matches.append({"path": rel, "line": line_num, "text": line.strip()[:500]})
-                    if len(matches) >= max_results:
-                        break
+        used_backend = backend
+        rg_note: str | None = None
 
-        return {"pattern": pattern, "results": matches, "count": len(matches)}
+        def _as_files_with_matches(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            seen: set[str] = set()
+            slim: list[dict[str, Any]] = []
+            for item in rows:
+                pth = str(item.get("path", "")).strip()
+                if pth and pth not in seen:
+                    seen.add(pth)
+                    slim.append({"path": pth, "line": 0, "text": ""})
+            return slim
+
+        if backend == "ripgrep":
+            results, err = grep_code_ripgrep(
+                repo_root=self.repo_root,
+                search_root=root,
+                pattern=pattern,
+                max_results=limit,
+                command=cfg.ripgrep_command,
+                timeout_seconds=cfg.ripgrep_timeout_seconds,
+                max_columns=cfg.ripgrep_max_columns,
+                respect_ignore_files=cfg.ripgrep_respect_ignore_files,
+                output_mode=output_mode,
+                glob=glob,
+                type_tag=type_tag,
+                case_insensitive=case_insensitive,
+            )
+            if err:
+                logger.warning("grep_code ripgrep: %s — using Python fallback", err)
+                rg_note = err
+                used_backend = "python"
+                try:
+                    matches = grep_code_python(
+                        repo_root=self.repo_root,
+                        search_root=root,
+                        pattern=pattern,
+                        max_results=limit,
+                        ignored_dir_parts=frozenset(IGNORED_DIRS),
+                        binary_suffixes=frozenset(BINARY_EXTENSIONS),
+                        case_insensitive=case_insensitive,
+                    )
+                except ValueError as exc:
+                    raise ToolSafetyError(str(exc)) from exc
+                if output_mode == "files_with_matches":
+                    matches = _as_files_with_matches(matches)
+                if glob or type_tag:
+                    extra = "Python fallback ignores glob/type filters."
+                    rg_note = f"{rg_note} {extra}" if rg_note else extra
+            else:
+                matches = results
+        else:
+            if glob or type_tag:
+                rg_note = (
+                    "Python grep ignores glob/type filters; install ripgrep or set planning.tools.grep_backend=ripgrep."
+                )
+            try:
+                matches = grep_code_python(
+                    repo_root=self.repo_root,
+                    search_root=root,
+                    pattern=pattern,
+                    max_results=limit,
+                    ignored_dir_parts=frozenset(IGNORED_DIRS),
+                    binary_suffixes=frozenset(BINARY_EXTENSIONS),
+                    case_insensitive=case_insensitive,
+                )
+            except ValueError as exc:
+                raise ToolSafetyError(str(exc)) from exc
+            if output_mode == "files_with_matches":
+                matches = _as_files_with_matches(matches)
+
+        with self._access_lock:
+            for item in matches:
+                pth = str(item.get("path", "")).strip()
+                if pth:
+                    self.accessed_paths.add(pth)
+
+        payload: dict[str, Any] = {
+            "pattern": pattern,
+            "output_mode": output_mode,
+            "results": matches,
+            "count": len(matches),
+            "grep_backend": used_backend,
+        }
+        if rg_note:
+            payload["note"] = rg_note
+        return payload
 
     @staticmethod
     def _parse_tool_call(raw_call: Any) -> ToolCall:
@@ -356,10 +553,27 @@ class ToolExecutor:
                 radius=int(parsed.arguments.get("radius", 80)),
             )
         elif parsed.name == "grep_code":
+            args = parsed.arguments
+            hl = args.get("head_limit")
+            om = str(args.get("output_mode") or "content").strip().lower()
+            if om not in {"content", "files_with_matches"}:
+                om = "content"
             result = self.grep_code(
+                pattern=str(args.get("pattern", "")),
+                path=args.get("path"),
+                max_results=int(args.get("max_results", 40)),
+                head_limit=int(hl) if hl is not None else None,
+                glob=str(args.get("glob") or "").strip() or None,
+                type_tag=str(args.get("type") or "").strip() or None,
+                case_insensitive=bool(args.get("case_insensitive", False)),
+                output_mode=om,
+            )
+        elif parsed.name == "glob_files":
+            gr = parsed.arguments.get("max_results")
+            result = self.glob_files(
                 pattern=str(parsed.arguments.get("pattern", "")),
                 path=parsed.arguments.get("path"),
-                max_results=int(parsed.arguments.get("max_results", 40)),
+                max_results=int(gr) if gr is not None else None,
             )
         elif parsed.name == "ask_clarification":
             question = str(parsed.arguments.get("question", "")).strip()
@@ -436,11 +650,18 @@ class ToolExecutor:
             entries = payload.get("entries", [])
             summary["entry_count"] = len(entries) if isinstance(entries, list) else 0
             summary["path"] = str(payload.get("path", ""))
+        elif tool_name == "glob_files":
+            results = payload.get("results", [])
+            summary["match_count"] = int(payload.get("count", len(results)))
+            summary["truncated"] = bool(payload.get("truncated", False))
+            if isinstance(results, list):
+                summary["top_matches"] = [str(p) for p in results[:5]]
         return summary
 
     def _format_result_payload(self, call_id: str, tool_name: str, payload: dict[str, Any]) -> dict[str, Any]:
         encoded = json.dumps(payload, ensure_ascii=False)
-        if len(encoded) <= TOOL_RESULT_MAX_CHARS:
+        max_chars = max(1024, int(self.tools_config.tool_result_max_chars))
+        if len(encoded) <= max_chars:
             return {
                 "result": payload,
                 "note": "Tool result injected. If referencing these files, inspect them explicitly.",

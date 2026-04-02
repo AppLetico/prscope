@@ -11,6 +11,7 @@ from collections.abc import Awaitable
 from typing import Any, Callable, Literal
 
 from ...config import PlanningConfig
+from ...pricing import context_window_for_model
 from .authoring.discovery import (
     AuthorDesignService,
     AuthorDiscoveryService,
@@ -50,6 +51,19 @@ from .transport import AuthorLLMClient
 
 apply_section_updates = _apply_section_updates
 render_markdown = _render_markdown
+
+# Safe to run concurrently via asyncio.to_thread (see ToolExecutor._access_lock).
+_READ_ONLY_PARALLEL_TOOL_NAMES = frozenset({"list_files", "read_file", "grep_code", "glob_files"})
+
+
+def _tool_calls_parallel_safe(tool_calls: list[Any]) -> bool:
+    if len(tool_calls) < 2:
+        return False
+    for tc in tool_calls:
+        name = getattr(getattr(tc, "function", None), "name", "") or ""
+        if name not in _READ_ONLY_PARALLEL_TOOL_NAMES:
+            return False
+    return True
 
 
 class StageRunner:
@@ -123,8 +137,34 @@ class StageRunner:
                         "source": stage,
                     }
                 )
+
+        async def run_executor_tool(tc: Any) -> tuple[dict[str, Any], float]:
+            tool_started = asyncio.get_running_loop().time()
+            tool_name = getattr(getattr(tc, "function", None), "name", "")
             try:
-                tool_started = asyncio.get_running_loop().time()
+                result = await asyncio.to_thread(self._tool_executor.execute, tc)
+                tool_elapsed_ms = (asyncio.get_running_loop().time() - tool_started) * 1000.0
+                return result, tool_elapsed_ms
+            except Exception as exc:  # noqa: BLE001
+                tool_elapsed_ms = (asyncio.get_running_loop().time() - tool_started) * 1000.0
+                return (
+                    {
+                        "tool_call_id": getattr(tc, "id", ""),
+                        "name": tool_name,
+                        "result": {"error": str(exc)},
+                    },
+                    tool_elapsed_ms,
+                )
+
+        async def run_one(tc: Any) -> tuple[dict[str, Any], float]:
+            tool_name = getattr(getattr(tc, "function", None), "name", "")
+            raw_args = getattr(getattr(tc, "function", None), "arguments", "{}") or "{}"
+            try:
+                parsed_args = json.loads(raw_args) if isinstance(raw_args, str) else {}
+            except json.JSONDecodeError:
+                parsed_args = {}
+            tool_started = asyncio.get_running_loop().time()
+            try:
                 if tool_name == "ask_clarification" and clarification_handler is not None:
                     answers = await clarification_handler(
                         str(parsed_args.get("question", "")),
@@ -143,13 +183,25 @@ class StageRunner:
                 else:
                     result = await asyncio.to_thread(self._tool_executor.execute, tc)
                 tool_elapsed_ms = (asyncio.get_running_loop().time() - tool_started) * 1000.0
+                return result, tool_elapsed_ms
             except Exception as exc:  # noqa: BLE001
                 tool_elapsed_ms = (asyncio.get_running_loop().time() - tool_started) * 1000.0
-                result = {
-                    "tool_call_id": getattr(tc, "id", ""),
-                    "name": tool_name,
-                    "result": {"error": str(exc)},
-                }
+                return (
+                    {
+                        "tool_call_id": getattr(tc, "id", ""),
+                        "name": tool_name,
+                        "result": {"error": str(exc)},
+                    },
+                    tool_elapsed_ms,
+                )
+
+        if _tool_calls_parallel_safe(tool_calls):
+            packed = await asyncio.gather(*(run_executor_tool(tc) for tc in tool_calls))
+        else:
+            packed = [await run_one(tc) for tc in tool_calls]
+
+        for tc, (result, tool_elapsed_ms) in zip(tool_calls, packed):
+            tool_name = getattr(getattr(tc, "function", None), "name", "")
             await self._emit(
                 {
                     "type": "tool_result",
@@ -378,9 +430,20 @@ class AuthorAgent:
         timeout_seconds_override: int | Callable[[], int] | None = None,
     ) -> AuthorResult:
         manifesto_excerpt = self._excerpt(manifesto, max_lines=40)
-        budget = TokenBudgetManager(context_window=128_000, max_completion_tokens=4000)
+        model_for_budget = (model_override or self.config.initial_draft_model or self.config.author_model).strip()
+        budget = TokenBudgetManager(
+            context_window=context_window_for_model(model_for_budget),
+            max_completion_tokens=self.config.author_prompt_completion_reserve_tokens,
+            reserved_prompt_tokens=self.config.context_tool_overhead_tokens,
+            model_id=model_for_budget,
+            token_estimator=self.config.token_budget_estimator,
+        )
         budget.enforce_required([requirements, f"Manifesto:\n{manifesto_excerpt}"])
-        remaining = budget.available_prompt_tokens - estimate_tokens(requirements)
+        remaining = budget.available_prompt_tokens - estimate_tokens(
+            requirements,
+            model_id=model_for_budget,
+            estimator=self.config.token_budget_estimator,
+        )
         manifesto_block, used_manifesto = budget.allocate(
             f"PROJECT MANIFESTO (excerpt):\n{manifesto_excerpt}\n\n", remaining
         )
@@ -398,7 +461,15 @@ class AuthorAgent:
         )
         if initial_ratio > budget.enforce_ratio:
             target_tokens = int(budget.context_window * budget.enforce_ratio)
-            remaining = max(0, target_tokens - estimate_tokens(requirements))
+            remaining = max(
+                0,
+                target_tokens
+                - estimate_tokens(
+                    requirements,
+                    model_id=model_for_budget,
+                    estimator=self.config.token_budget_estimator,
+                ),
+            )
             manifesto_block, used_manifesto = budget.allocate(manifesto_block, remaining)
             remaining = max(0, remaining - used_manifesto)
             skills_allocated, used_skills = budget.allocate(skills_allocated, remaining)
@@ -851,6 +922,7 @@ class AuthorAgent:
         revision_hints: list[str] | None = None,
         reconsideration_candidates: list[dict[str, Any]] | None = None,
         supplemental_evidence: dict[str, Any] | None = None,
+        prior_rounds_compact: str | None = None,
     ) -> RevisionResult:
         return await AuthorRepairService(self._llm_call, self._emit).revise_plan(
             repair_plan=repair_plan,
@@ -864,6 +936,7 @@ class AuthorAgent:
             revision_hints=revision_hints,
             reconsideration_candidates=reconsideration_candidates,
             supplemental_evidence=supplemental_evidence,
+            prior_rounds_compact=prior_rounds_compact,
         )
 
     def incremental_grounding_failures(

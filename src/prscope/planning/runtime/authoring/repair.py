@@ -523,6 +523,7 @@ class AuthorRepairService:
         revision_hints: list[str] | None = None,
         reconsideration_candidates: list[dict[str, Any]] | None = None,
         supplemental_evidence: dict[str, Any] | None = None,
+        prior_rounds_compact: str | None = None,
     ) -> RevisionResult:
         simplification_hint = (
             "\nIf a simplification proposal is provided and sound, prefer it over incremental fixes."
@@ -581,6 +582,9 @@ class AuthorRepairService:
             "- what_changed: object {section_id: one_sentence_concrete_description}. For each updated section, describe in one sentence WHAT was added or changed (e.g. 'Added explicit dependency checks for DB, Redis, and external API health'). Be concrete and specific. Do not write meta-commentary like 'the reviewer will appreciate...'.\n"
             "- review_prediction: str"
         )
+        compact_tail = ""
+        if prior_rounds_compact:
+            compact_tail = f"\n\n## Prior rounds (compact)\n{prior_rounds_compact}"
         user_message = {
             "role": "user",
             "content": (
@@ -593,6 +597,7 @@ class AuthorRepairService:
                 f"## Revision Hints\n{json.dumps(revision_hints or [], indent=2)}\n\n"
                 f"## Reconsideration Candidates\n{json.dumps(reconsideration_candidates or [], indent=2)}\n\n"
                 f"## Bounded Refinement Evidence\n{json.dumps(supplemental_evidence or {}, indent=2)}"
+                f"{compact_tail}"
             ),
         }
         payload = await self._call_json_object(
