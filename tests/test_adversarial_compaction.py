@@ -4,10 +4,24 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from prscope.config import PlanningConfig, PrscopeConfig, RepoProfile
+from prscope.config import IssueDedupeConfig, PlanningConfig, PrscopeConfig, RepoProfile
+from prscope.planning.runtime.critic import ReviewResult
 from prscope.planning.runtime.orchestration import PlanningRuntime
 from prscope.planning.runtime.pipeline.stages import PlanningStages
+from prscope.planning.runtime.review import IssueGraphTracker, IssueSimilarityService
 from prscope.store import Store
+
+
+def _issue_tracker() -> IssueGraphTracker:
+    similarity = IssueSimilarityService(
+        IssueDedupeConfig(
+            embeddings_enabled="false",
+            embedding_model="unused",
+            similarity_threshold=0.95,
+            fallback_mode="none",
+        )
+    )
+    return IssueGraphTracker(similarity=similarity, max_nodes=50, max_edges=100)
 
 
 def test_compose_prior_critique_without_compact() -> None:
@@ -34,6 +48,78 @@ def test_compose_prior_critique_compact_only() -> None:
     out = PlanningStages._compose_prior_critique(ctx)
     assert out.startswith("## Prior rounds (compact)")
     assert "summary only" in out
+
+
+def test_open_tracked_issues_block_for_validation_lists_ids() -> None:
+    tracker = _issue_tracker()
+    tracker.add_issue("JWT middleware missing", 1, preferred_id="issue_1")
+    block = PlanningStages._open_tracked_issues_block_for_validation(tracker)
+    assert block is not None
+    assert "Open tracked issues" in block
+    assert "resolved_issues" in block
+    assert "`issue_1`" in block
+    assert "JWT middleware missing" in block
+
+
+def test_open_tracked_issues_block_for_validation_none_when_no_open_issues() -> None:
+    tracker = _issue_tracker()
+    assert PlanningStages._open_tracked_issues_block_for_validation(tracker) is None
+
+
+def test_merge_explicit_issue_ids_adds_resolution_when_not_blocked() -> None:
+    tracker = _issue_tracker()
+    tracker.add_issue("JWT middleware detail", 1, preferred_id="issue_1")
+    ctx = MagicMock()
+    ctx.requirements = "User input:\nPlease fix issue_1"
+    ctx.issue_tracker = tracker
+    review = ReviewResult(
+        strengths=[],
+        architectural_concerns=[],
+        risks=[],
+        simplification_opportunities=[],
+        blocking_issues=[],
+        reviewer_questions=[],
+        recommended_changes=[],
+        design_quality_score=7.0,
+        confidence="medium",
+        review_complete=True,
+        simplest_possible_design=None,
+        primary_issue=None,
+        resolved_issues=[],
+        constraint_violations=[],
+        issue_priority=[],
+        prose="",
+    )
+    PlanningStages._merge_explicit_issue_ids_into_validation_resolved(ctx, review)
+    assert review.resolved_issues == ["issue_1"]
+
+
+def test_merge_explicit_issue_ids_skips_when_blocking_repeats_description() -> None:
+    tracker = _issue_tracker()
+    tracker.add_issue("JWT middleware missing", 1, preferred_id="issue_1")
+    ctx = MagicMock()
+    ctx.requirements = "User input:\nissue_1"
+    ctx.issue_tracker = tracker
+    review = ReviewResult(
+        strengths=[],
+        architectural_concerns=[],
+        risks=[],
+        simplification_opportunities=[],
+        blocking_issues=["JWT middleware missing still"],
+        reviewer_questions=[],
+        recommended_changes=[],
+        design_quality_score=4.0,
+        confidence="medium",
+        review_complete=False,
+        simplest_possible_design=None,
+        primary_issue=None,
+        resolved_issues=[],
+        constraint_violations=[],
+        issue_priority=[],
+        prose="",
+    )
+    PlanningStages._merge_explicit_issue_ids_into_validation_resolved(ctx, review)
+    assert review.resolved_issues == []
 
 
 @pytest.mark.asyncio

@@ -9,7 +9,7 @@ import pytest
 from prscope.config import PlanningConfig
 from prscope.planning.runtime.author import AuthorAgent, RepoUnderstanding
 from prscope.planning.runtime.authoring import pipeline as pipeline_module
-from prscope.planning.runtime.authoring.discovery import requirement_search_patterns
+from prscope.planning.runtime.authoring.discovery import _grep_search_roots_for_repo, requirement_search_patterns
 from prscope.planning.runtime.authoring.models import (
     AttemptContext,
     AuthorResult,
@@ -20,7 +20,7 @@ from prscope.planning.runtime.authoring.models import (
     ValidationResult,
 )
 from prscope.planning.runtime.authoring.pipeline import AuthorPlannerPipeline
-from prscope.planning.runtime.authoring.repair import AuthorRepairService
+from prscope.planning.runtime.authoring.repair import AuthorRepairService, _max_revise_user_chars_for_window
 from prscope.planning.runtime.critic import ReviewResult
 from prscope.planning.runtime.tools import ToolExecutor
 
@@ -68,12 +68,40 @@ def test_explore_repo_reads_ranked_files(tmp_path: Path) -> None:
     assert isinstance(understanding.risks, list)
 
 
+def test_grep_search_roots_skips_bare_filenames_and_invalid_top_level_dirs(tmp_path: Path) -> None:
+    """Mental-model paths like `api.py` must not become ripgrep path roots (rg IO errors)."""
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "x.py").write_text("x", encoding="utf-8")
+    candidates = RepoCandidates(
+        entrypoints=["api.py"],
+        source_modules=["api.py", "src/x.py", "planning/core.py"],
+        tests_and_config=[],
+        all_paths=["api.py", "src/x.py", "planning/core.py"],
+    )
+    roots = _grep_search_roots_for_repo(candidates, tmp_path)
+    assert roots == ["src"]
+
+
 def test_requirement_search_patterns_prioritize_route_literals_and_keywords() -> None:
     patterns = requirement_search_patterns("Add a lightweight /health endpoint and tests for it.")
 
     assert r"/health" in patterns
     assert r"\bhealth\b" in patterns
     assert all("endpoint" not in pattern for pattern in patterns)
+
+
+def test_requirement_search_patterns_keeps_api_for_security_prompt() -> None:
+    patterns = requirement_search_patterns("create a plan to add api security")
+    assert r"\bapi\b" in patterns
+    assert r"\bsecurity\b" in patterns
+
+
+def test_requirement_search_patterns_prioritizes_specific_terms_across_domains() -> None:
+    """Longer domain terms (e.g. migration) should not be displaced by a fixed security-only list."""
+    patterns = requirement_search_patterns("create a plan to add sqlite migration for the users table and indexes")
+    assert r"\bmigration\b" in patterns
+    assert r"\bsqlite\b" in patterns
+    assert r"\bindexes\b" in patterns or r"\busers\b" in patterns
 
 
 def test_explore_repo_reads_around_grep_hits_for_deep_route_definitions(tmp_path: Path) -> None:
@@ -523,6 +551,22 @@ async def test_revise_plan_recovers_from_trailing_commas_in_json() -> None:
     assert "## Reconsideration Candidates" in user_prompt
     assert "architecture.database" in user_prompt
     assert "root issue:" in user_prompt
+
+
+def test_cap_revise_plan_user_content_truncates() -> None:
+    max_c = _max_revise_user_chars_for_window(128_000)
+    big = "x" * (max_c + 10_000)
+    out, trunc = AuthorRepairService._cap_revise_plan_user_content(big, "gpt-4o")
+    assert trunc is True
+    assert len(out) <= max_c + 600
+    assert "Truncated by Prscope" in out
+
+
+def test_cap_revise_plan_user_content_noop_when_small() -> None:
+    small = "hello"
+    out, trunc = AuthorRepairService._cap_revise_plan_user_content(small, "gpt-4o")
+    assert trunc is False
+    assert out == small
 
 
 def test_compact_json_retry_instruction_is_strict_for_anthropic_models() -> None:
@@ -1723,6 +1767,10 @@ async def test_run_initial_draft_passes_raw_requirements_to_planner_pipeline(tmp
     )
 
     assert captured["requirements"] == requirements
+    ctx = captured.get("initial_draft_context")
+    assert isinstance(ctx, str)
+    assert "PROJECT MANIFESTO" in ctx
+    assert ".prscope/manifesto.md" in ctx
 
 
 @pytest.mark.asyncio
@@ -3285,11 +3333,11 @@ async def test_draft_plan_uses_planner_specific_prompt(tmp_path: Path) -> None:
     assert "Produce a concise grounded planner draft" in str(messages[1]["content"])
     assert "## Verified File Paths" in str(messages[1]["content"])
     assert "`prscope/web/api.py`" in str(messages[1]["content"])
-    assert "minimal failure/error handling" in str(messages[0]["content"])
-    assert "do not turn them into explicit workstreams" in str(messages[0]["content"])
-    assert "do not add observability, logging, telemetry, rollout controls, or platform notes" in str(
-        messages[0]["content"]
-    )
+    assert "Cursor-quality" in str(messages[0]["content"])
+    assert "## Current baseline" in str(messages[0]["content"])
+    assert "## Goals" in str(messages[0]["content"])
+    assert "## Risks and constraints" in str(messages[0]["content"])
+    assert "EventSource" in str(messages[0]["content"])
 
 
 @pytest.mark.asyncio
@@ -3339,12 +3387,8 @@ async def test_draft_plan_prioritizes_relevant_verified_paths_and_existing_guida
     assert "`useState`, `useEffect`, `isExporting`, `lastExportResult`" in user_prompt
     assert "Do not reference planning runtime or discovery modules for frontend wiring work" in user_prompt
     assert "compatibility constraint or test target" in user_prompt
-    assert "do not add observability, logging, telemetry, rollout controls, or platform notes" in str(
-        messages[0]["content"]
-    )
-    assert "do not prescribe hook APIs, state variable names, or concrete local-state shapes" in str(
-        messages[0]["content"]
-    )
+    assert "do not add observability, logging, telemetry, rollout controls, or platform notes" in user_prompt
+    assert "do not prescribe hook APIs, state variable names, or explicit local-state object shapes" in user_prompt
 
 
 @pytest.mark.asyncio

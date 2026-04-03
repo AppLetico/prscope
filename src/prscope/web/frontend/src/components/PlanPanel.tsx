@@ -6,7 +6,7 @@ import { clsx } from "clsx";
 import mermaid from "mermaid";
 import { Tooltip } from "./ui/Tooltip";
 import { IssuePanel } from "./IssuePanel";
-import { getPressuredDecisions, getTopPressureSummary } from "../lib/impactView";
+import { getPressuredDecisions, getRelatedDecisionSummaries, getTopPressureSummary } from "../lib/impactView";
 import { preprocessPlanMarkdown } from "../lib/markdown";
 import { planMarkdownComponents } from "../lib/markdownComponents";
 import { augmentPlanMarkdownWithDecisionGraph } from "../lib/decisionGraphRender";
@@ -128,22 +128,54 @@ export function PlanPanel({
       ? `${(planCharacterCount / 1000).toFixed(planCharacterCount >= 10000 ? 0 : 1)}k chars`
       : `${planCharacterCount} chars`;
   const appendIssuePrompt = (issue: IssueGraphNode) => {
+    const decisions = getRelatedDecisionSummaries(issue, impactView, decisionGraph);
+    const decisionLines = decisions
+      .map((d) => {
+        const text = (d.label || d.decisionId).trim();
+        return text ? `- ${text}` : "";
+      })
+      .filter(Boolean);
+    const decisionBlock =
+      decisionLines.length > 0
+        ? `\n\nRelated architectural decisions (context only—continue in chat to resolve or update the plan):\n${decisionLines.join("\n")}`
+        : "";
     const prompt = [
       `Please update the plan to address ${issue.description}.`,
+      `Tracked issue id: \`${issue.id}\` — include this id in resolved_issues when validation confirms the fix.`,
       "Adjust the approach, tasks, dependencies, and success checks if needed.",
+      decisionBlock,
     ].join("\n");
     onAppendIssuePrompt?.(prompt);
   };
   const appendAllIssuesPrompt = () => {
     if (!openIssues.length) return;
+    const decisionLabels = new Set<string>();
+    for (const issue of openIssues) {
+      for (const d of getRelatedDecisionSummaries(issue, impactView, decisionGraph)) {
+        decisionLabels.add(d.label);
+      }
+    }
+    const decisionLines = [...decisionLabels].map((l) => l.trim()).filter(Boolean).map((l) => `- ${l}`);
+    const decisionFoot =
+      decisionLines.length > 0
+        ? `\n\nArchitectural decision context (reply in chat when you need to commit or change direction):\n${decisionLines.join("\n")}`
+        : "";
     const issueLines = openIssues.map((issue, idx) => `${idx + 1}. ${issue.description}`);
+    const idLine =
+      openIssues.length > 0
+        ? `Tracked issue ids: ${openIssues.map((i) => `\`${i.id}\``).join(", ")} — include fixed ids in resolved_issues.`
+        : "";
     const prompt = [
       "Please update the plan to address these review notes:",
       "",
       ...issueLines,
       "",
+      idLine,
       "Adjust the approach, tasks, dependencies, and success checks where needed.",
-    ].join("\n");
+      decisionFoot,
+    ]
+      .filter((line) => line !== "")
+      .join("\n");
     onAppendIssuePrompt?.(prompt);
   };
 

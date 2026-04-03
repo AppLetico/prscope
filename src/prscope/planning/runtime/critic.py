@@ -216,6 +216,7 @@ Gatekeeper standards:
 - Vague plans → blocking_issues (not buried in minor concerns).
 - Missing or non-actionable test strategy → blocking; use blocking_categories "testability" when applicable.
 - Architectural or behavioral claims without evidence (backtick file paths, constraints, manifesto, decision graph) → blocking; use "evidence".
+- Bare filenames alone (for example a lone `api.py`) are weak evidence unless tied to a verified repo-relative path from exploration or the decision graph; prefer concrete paths seen in tool history.
 - Prefer false positives over silent misses.
 - Never downgrade a serious gap to "architectural_concern" to avoid conflict.
 
@@ -970,6 +971,7 @@ class CriticAgent:
         session_id: str = "",
         round_number: int = 0,
         mode: Literal["initial", "validation", "stabilization", "implementability"] = "initial",
+        open_tracked_issues_block: str | None = None,
     ) -> ReviewResult | ImplementabilityResult:
         try:
             import litellm  # noqa: F401
@@ -977,6 +979,9 @@ class CriticAgent:
             raise RuntimeError("litellm is required for critic reviews but is not installed")
 
         prior_critique_blob = prior_critique.strip() if prior_critique else "None"
+        open_issues_section = ""
+        if open_tracked_issues_block and str(open_tracked_issues_block).strip():
+            open_issues_section = f"{str(open_tracked_issues_block).strip()}\n\n"
         constraints_block = (
             "\n".join(f"- {item.id} ({item.severity}): {item.text}" for item in constraints)
             if constraints
@@ -994,6 +999,7 @@ class CriticAgent:
             f"## Module Structure\n{modules}\n\n"
             f"## Patterns\n{patterns}\n\n"
             f"## Prior Review\n{prior_critique_blob}\n\n"
+            f"{open_issues_section}"
             f"## Current Plan\n{plan_content}\n\n"
             "Evaluate constraints explicitly in your JSON output.\n"
         )

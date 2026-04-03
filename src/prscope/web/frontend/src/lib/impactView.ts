@@ -51,7 +51,7 @@ export function getRelatedDecisionSummaries(
   impactView?: ArchitectureImpactView | null,
   decisionGraph?: DecisionGraph | null,
 ): RelatedDecisionSummary[] {
-  const relatedIds = issue.related_decision_ids ?? [];
+  const relatedIds = (issue.related_decision_ids ?? []).filter((id) => String(id ?? "").trim());
   if (!relatedIds.length) return [];
   const byDecisionId = new Map((impactView?.decisions ?? []).map((entry) => [entry.decision_id, entry]));
   return relatedIds

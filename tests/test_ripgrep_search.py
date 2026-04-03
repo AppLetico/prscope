@@ -110,6 +110,14 @@ def test_tool_executor_glob_files(tmp_path: Path) -> None:
     assert "src/two.py" in paths
 
 
+def test_tool_executor_glob_files_brace_pattern_includes_note(tmp_path: Path) -> None:
+    (tmp_path / "a.py").write_text("1", encoding="utf-8")
+    ex = ToolExecutor(tmp_path)
+    out = ex.glob_files("**/*.{py,ts}", path=".")
+    assert "note" in out
+    assert "brace" in out["note"].lower()
+
+
 def test_tool_executor_grep_matches_python_fallback(tmp_path: Path) -> None:
     (tmp_path / "t.py").write_text("unique_marker_xyz = 1\n", encoding="utf-8")
     ex = ToolExecutor(tmp_path, tools_config=PlanningToolsConfig(grep_backend="python"))

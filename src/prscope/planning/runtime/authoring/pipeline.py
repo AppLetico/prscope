@@ -7,7 +7,11 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from ..tools import extract_file_references
-from .discovery import is_localized_frontend_request
+from .discovery import (
+    exploration_budget_for_requirements,
+    is_localized_frontend_request,
+    requirements_imply_web_stack_exploration,
+)
 from .models import (
     AttemptContext,
     AuthorResult,
@@ -36,6 +40,7 @@ class AuthorPlannerPipeline:
         validate_draft: Callable[..., Any],
         self_review_draft: Callable[..., Awaitable[list[str]]] | None = None,
         event_emitter: Callable[[dict[str, Any]], Awaitable[None]] | None = None,
+        synthetic_exploration_tool_updates: bool = True,
     ) -> None:
         self._tool_executor = tool_executor
         self._scan_repo_candidates = scan_repo_candidates
@@ -45,6 +50,7 @@ class AuthorPlannerPipeline:
         self._validate_draft = validate_draft
         self._self_review_draft = self_review_draft
         self._emit = event_emitter
+        self._synthetic_exploration_tool_updates = synthetic_exploration_tool_updates
 
     @staticmethod
     def _extract_symbol_names(content: str) -> list[str]:
@@ -126,16 +132,27 @@ class AuthorPlannerPipeline:
             return content
         lowered_path = normalized_path.lower()
         lowered_requirements = str(requirements or "").lower()
+        stack_explore = requirements_imply_web_stack_exploration(lowered_requirements)
         should_read_header = lowered_path.endswith(("planningview.tsx", "actionbar.tsx", "planpanel.tsx"))
-        should_read_api = lowered_path.endswith("/lib/api.ts") and any(
-            token in lowered_requirements for token in ("export", "download", "snapshot", "diagnostic")
+        should_read_api = lowered_path.endswith("/lib/api.ts") and (
+            any(token in lowered_requirements for token in ("export", "download", "snapshot", "diagnostic"))
+            or stack_explore
         )
-        if not should_read_header and not should_read_api:
-            return content
+        should_read_sse = "usesessionevents.ts" in lowered_path and stack_explore
+        should_read_doc = "production_readiness.md" in lowered_path and stack_explore
+        should_read_agents = lowered_path.endswith("agents.md") and stack_explore
+        if not should_read_header and not should_read_api and not should_read_sse and not should_read_doc:
+            if not should_read_agents:
+                return content
+        max_lines = 120
+        if should_read_api or should_read_sse:
+            max_lines = 220
+        if should_read_doc or should_read_agents:
+            max_lines = 160
         try:
             payload = self._tool_executor.read_file(
                 normalized_path,
-                max_lines=320 if should_read_api else 120,
+                max_lines=max_lines,
             )
         except Exception:  # noqa: BLE001
             return content
@@ -225,6 +242,14 @@ class AuthorPlannerPipeline:
             note = str(risk).strip()
             if note:
                 evidence_notes.append(note)
+        if requirements_imply_web_stack_exploration(lower_requirements) and any(
+            "usesessionevents" in str(p).lower() or "/events" in str(p).lower() for p in relevant_files
+        ):
+            evidence_notes.append(
+                "SSE/EventSource in the browser often cannot attach custom Authorization headers; plans should "
+                "address how authenticated HTTP and live event streams stay consistent (cookies, query token, or "
+                "fetch-based streaming)."
+            )
         return EvidenceBundle(
             relevant_files=tuple(relevant_files[:12]),
             existing_components=tuple(existing_components[:12]),
@@ -594,6 +619,37 @@ class AuthorPlannerPipeline:
         payload.update(extra)
         await self._emit(payload)
 
+    async def _emit_synthetic_exploration_tool_updates(self, repo_understanding: RepoUnderstanding) -> None:
+        """Bounded SSE parity for deterministic explore_repo (no real agent tool loop)."""
+        emit = self._emit
+        if emit is None:
+            return
+        await emit(
+            {
+                "type": "tool_update",
+                "tool": {
+                    "name": "grep_code",
+                    "status": "done",
+                    "session_stage": "planner_explore",
+                    "query": "requirement-driven discovery",
+                    "synthetic": True,
+                },
+            }
+        )
+        for path in list(repo_understanding.file_contents.keys())[:4]:
+            await emit(
+                {
+                    "type": "tool_update",
+                    "tool": {
+                        "name": "read_file",
+                        "status": "done",
+                        "session_stage": "planner_explore",
+                        "path": path,
+                        "synthetic": True,
+                    },
+                }
+            )
+
     async def run(
         self,
         *,
@@ -604,6 +660,7 @@ class AuthorPlannerPipeline:
         rejection_counts: dict[str, int],
         rejection_reasons: list[dict[str, str]],
         timeout_seconds_override: int | Callable[[], int] | None,
+        initial_draft_context: str | None = None,
     ) -> AuthorResult:
         pipeline_start = time.perf_counter()
         mental_model = ""
@@ -623,12 +680,17 @@ class AuthorPlannerPipeline:
         candidates = self._scan_repo_candidates(mental_model=mental_model, seed_paths=seeded_paths or None)
         t1 = time.perf_counter()
         await self._emit_progress(stage="planner_explore", step="Draft: reading the most relevant files...")
+        max_reads, grep_max = exploration_budget_for_requirements(requirements)
         repo_understanding = self._explore_repo(
             requirements=requirements,
             candidates=candidates,
             mental_model=mental_model,
+            max_file_reads=max_reads,
+            grep_max_results=grep_max,
         )
         t2 = time.perf_counter()
+        if self._synthetic_exploration_tool_updates and self._emit:
+            await self._emit_synthetic_exploration_tool_updates(repo_understanding)
         await self._emit_progress(stage="planner_classify", step="Draft: sizing implementation complexity...")
         complexity = self._classify_complexity(
             requirements=requirements,
@@ -687,6 +749,7 @@ class AuthorPlannerPipeline:
                     model_override=model_override,
                     revision_hints=list(revision_hints),
                     timeout_seconds_override=timeout_seconds_override,
+                    initial_draft_context=initial_draft_context,
                 )
             except Exception as exc:  # noqa: BLE001
                 if best_plan_content:

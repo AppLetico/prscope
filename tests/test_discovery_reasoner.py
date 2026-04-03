@@ -25,6 +25,23 @@ def test_build_framework_signals_infers_fastapi() -> None:
     assert signals.candidates["fastapi"] > 0
 
 
+def test_build_framework_signals_tiebreak_prefers_fastapi_over_gin() -> None:
+    """Many TS .GET( lines vs fewer FastAPI lines — strong FastAPI identifiers must win."""
+    index = build_signal_index(
+        [
+            {"path": "src/client/api.ts", "line": 1, "text": "x.GET('/a');"},
+            {"path": "src/client/api.ts", "line": 2, "text": "x.GET('/b');"},
+            {"path": "src/client/api.ts", "line": 3, "text": "x.GET('/c');"},
+            {"path": "src/client/api.ts", "line": 4, "text": "x.POST('/d');"},
+            {"path": "src/client/api.ts", "line": 5, "text": "x.GET('/e');"},
+            {"path": "src/app/api.py", "line": 1, "text": "from fastapi import FastAPI"},
+            {"path": "src/app/api.py", "line": 2, "text": "@app.get('/health')"},
+        ]
+    )
+    signals = build_framework_signals(index)
+    assert signals.inferred_framework == "fastapi"
+
+
 def test_build_existing_feature_signals_marks_strong_runtime_evidence() -> None:
     signals = build_existing_feature_signals(
         {

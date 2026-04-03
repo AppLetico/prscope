@@ -6,6 +6,71 @@ from typing import Any
 from ....model_catalog import model_provider
 from ..pipeline import PlanningRoundContext
 
+_ASSISTANT_CONTEXT_MAX_CHARS = 8000
+
+
+def _is_short_followup_message(user_input: str) -> bool:
+    """
+    Short affirmations ("Yes do it") need the prior assistant turn in-context; the critic review
+    blob alone does not carry what "it" refers to.
+    """
+    t = (user_input or "").strip()
+    if not t or len(t) > 220:
+        return False
+    tl = t.lower()
+    if len(t) <= 12 and len(t.split()) <= 4:
+        return True
+    affirm = (
+        "yes do it",
+        "do it",
+        "do that",
+        "go ahead",
+        "please do",
+        "sounds good",
+        "make it so",
+        "proceed",
+        "continue",
+        "apply",
+        "go for it",
+    )
+    if any(phrase in tl for phrase in affirm):
+        return True
+    if tl in {"yes", "yes.", "yep", "yeah", "ok", "okay", "sure", "please"}:
+        return True
+    return False
+
+
+def _last_assistant_turn_content(core: Any, *, max_chars: int = _ASSISTANT_CONTEXT_MAX_CHARS) -> str | None:
+    """
+    Text the user is likely replying to. Prefer the most recent author turn (plan / assistant prose);
+    if none, use the most recent critic turn. Pending user message is not in the conversation yet.
+    """
+    conv = core.get_conversation()
+
+    def _take(turn: Any) -> str | None:
+        content = str(getattr(turn, "content", "") or "").strip()
+        return content or None
+
+    chosen: str | None = None
+    for turn in reversed(conv):
+        if str(getattr(turn, "role", "")).strip().lower() != "author":
+            continue
+        chosen = _take(turn)
+        if chosen:
+            break
+    if not chosen:
+        for turn in reversed(conv):
+            if str(getattr(turn, "role", "")).strip().lower() != "critic":
+                continue
+            chosen = _take(turn)
+            if chosen:
+                break
+    if not chosen:
+        return None
+    if len(chosen) > max_chars:
+        return chosen[: max_chars - 120] + "\n...[truncated for planning context budget]"
+    return chosen
+
 
 class RuntimeRoundEntry:
     def __init__(self, runtime: Any):
@@ -15,7 +80,18 @@ class RuntimeRoundEntry:
     def _effective_requirements(core: Any, session: Any, user_input: str | None) -> str:
         base = str(session.requirements or "")
         if user_input:
-            return base + f"\n\nUser input:\n{user_input}"
+            tail = ""
+            if _is_short_followup_message(user_input):
+                probe = _last_assistant_turn_content(core)
+                if probe:
+                    tail = (
+                        "\n\nReply context — the user's message is a short follow-up to this assistant message. "
+                        "Interpret User input as agreeing to or requesting what the assistant offered below."
+                        "\n\n---\n"
+                        f"{probe}"
+                        "\n---\n"
+                    )
+            return base + tail + f"\n\nUser input:\n{user_input}"
 
         recent_guidance: deque[str] = deque(maxlen=3)
         seen: set[str] = set()

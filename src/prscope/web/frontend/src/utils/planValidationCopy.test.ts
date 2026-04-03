@@ -24,4 +24,19 @@ describe("humanizePlanValidationError", () => {
     expect(h.title).toMatch(/didn’t pass|draft/i);
     expect(h.summary.length).toBeGreaterThan(20);
   });
+
+  it("maps missing test target before compound required-section noise", () => {
+    const raw =
+      "required section is empty: Test Strategy; missing test target reference; reference one of: tests/test_a.py, tests/test_b.py";
+    const h = humanizePlanValidationError(raw);
+    expect(h.title).toBe("Name a regression test target");
+    expect(h.whatToDo).toContain("test_a.py");
+    expect(h.summary).not.toContain("tests/test_a.py section is empty");
+  });
+
+  it("parses required section name only up to semicolon", () => {
+    const h = humanizePlanValidationError("required section is empty: Rollback Plan");
+    expect(h.summary).toContain("Rollback Plan");
+    expect(h.summary).not.toContain(";");
+  });
 });

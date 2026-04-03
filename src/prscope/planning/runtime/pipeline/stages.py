@@ -160,6 +160,62 @@ class PlanningStages:
         return block
 
     @staticmethod
+    def _open_tracked_issues_block_for_validation(issue_tracker: Any) -> str | None:
+        """Bullet list of open issue ids for validation-mode resolved_issues JSON."""
+        open_fn = getattr(issue_tracker, "open_issues", None)
+        if not callable(open_fn):
+            return None
+        open_list = open_fn()
+        if not open_list:
+            return None
+        lines: list[str] = []
+        for issue in open_list:
+            iid = str(getattr(issue, "id", "")).strip()
+            desc = str(getattr(issue, "description", "")).strip()
+            if iid:
+                lines.append(f"- `{iid}`: {desc}")
+        if not lines:
+            return None
+        return (
+            "## Open tracked issues (use these exact ids in resolved_issues)\n"
+            "For each open issue whose fix is verified in the current plan text, include its **exact** `id` "
+            "string in the JSON field `resolved_issues`. Use `[]` only if none are fixed.\n\n" + "\n".join(lines)
+        )
+
+    @staticmethod
+    def _merge_explicit_issue_ids_into_validation_resolved(
+        ctx: PlanningRoundContext,
+        review: ReviewResult,
+    ) -> None:
+        """
+        Requirements include `User input:` with text from Review Notes. If that text names
+        `issue_N` but the validation JSON omits `resolved_issues`, the issue graph never
+        closes. When the reviewer is not still surfacing the same issue text as blocking or
+        architectural, merge those ids into `resolved_issues` so `resolve_issue` runs.
+        """
+        req = ctx.requirements or ""
+        asked_raw = re.findall(r"\b(issue_\d+)\b", req, flags=re.IGNORECASE)
+        if not asked_raw:
+            return
+        canon_fn = getattr(ctx.issue_tracker, "canonical_issue_id", None)
+        asked = {canon_fn(r) if callable(canon_fn) else r for r in asked_raw}
+        open_by_id = {issue.id: issue for issue in ctx.issue_tracker.open_issues()}
+        blocking_blob = "\n".join([*review.blocking_issues, *review.architectural_concerns]).lower()
+        existing = {str(x).strip() for x in review.resolved_issues if str(x).strip()}
+        for iid in sorted(asked):
+            if iid not in open_by_id:
+                continue
+            if iid in existing:
+                continue
+            desc = (open_by_id[iid].description or "").strip().lower()
+            if desc:
+                head = desc[:120]
+                if head and head in blocking_blob:
+                    continue
+            review.resolved_issues.append(iid)
+            existing.add(iid)
+
+    @staticmethod
     def _load_graph_payload(raw: str | None) -> dict[str, Any] | None:
         if not raw:
             return None
@@ -1046,6 +1102,19 @@ class PlanningStages:
             )
         return f"- Add focused regression coverage for {requested_behavior} in the closest existing test target."
 
+    @staticmethod
+    def _parse_missing_test_target_candidate_paths(failure_message: str) -> list[str]:
+        """Parse paths from validate_refinement_result missing_test_target_failures message."""
+        m = re.search(
+            r"missing test target reference;\s*reference one of:\s*(.+)\s*$",
+            failure_message.strip(),
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        if not m:
+            return []
+        rest = m.group(1).strip()
+        return [p.strip() for p in rest.split(",") if p.strip()]
+
     @classmethod
     def _generic_refinement_rollback(cls, *, plan: PlanDocument, requirements: str) -> str:
         changed_paths = [path for path, _ in cls._parse_files_changed_entries(str(plan.files_changed or ""))]
@@ -1251,6 +1320,24 @@ class PlanningStages:
             updates["non_goals"] = (
                 str(plan.non_goals or "").strip() or "- Do not expand the change beyond the verified scope."
             )
+        # Deterministic fix: validation lists candidate paths from repo_understanding.relevant_tests.
+        for failure in failures:
+            text = str(failure or "").strip()
+            if not text.startswith("missing test target reference; reference one of:"):
+                continue
+            candidates = PlanningStages._parse_missing_test_target_candidate_paths(text)
+            if not candidates:
+                continue
+            temp_plan = apply_section_updates(plan, updates) if updates else plan
+            refs = extract_file_references(render_markdown(temp_plan))
+            chosen = next((p for p in candidates if p not in refs), candidates[0])
+            if chosen in refs:
+                continue
+            current_ts = str(updates.get("test_strategy", str(plan.test_strategy or "")) or "")
+            if f"`{chosen}`" in current_ts or chosen in current_ts:
+                continue
+            bullet = f"- Add or extend regression coverage in `{chosen}` aligned with the planned changes."
+            updates["test_strategy"] = (current_ts + "\n" + bullet).strip() if current_ts.strip() else bullet
         files_changed = str(plan.files_changed or "")
         for path in self._mentioned_validation_targets(
             failures,
@@ -1954,13 +2041,28 @@ class PlanningStages:
                 if why:
                     resolution_bits.append(f"{sec}: {why}")
         resolution_block = "\n".join(resolution_bits) if resolution_bits else ""
+        reconciled_sections = sorted(set(changed_sections) - set(chat_changed_sections))
         turn_lines = [
             f"Updated sections: {', '.join(chat_changed_sections) if chat_changed_sections else '(none)'}",
-            f"Problem understanding: {revision_result.problem_understanding}",
-            f"Review prediction: {revision_result.review_prediction}",
         ]
+        if reconciled_sections:
+            turn_lines.append(
+                "Other plan changes this round (reconciliation or pipeline, not counted as author-edited sections): "
+                + ", ".join(reconciled_sections)
+            )
+        turn_lines.extend(
+            [
+                f"Problem understanding: {revision_result.problem_understanding}",
+                f"Review prediction: {revision_result.review_prediction}",
+            ]
+        )
         if resolution_block:
-            turn_lines.append(f"How we addressed it:\n{resolution_block}")
+            turn_lines.append(f"Proposed updates (draft):\n{resolution_block}")
+        if chat_changed_sections or resolution_block:
+            turn_lines.append(
+                "Review Notes: an issue shows as resolved only after the validation reviewer lists its id in "
+                "resolved_issues."
+            )
         ctx.core.add_turn(
             "author",
             "\n\n".join(turn_lines),
@@ -2010,10 +2112,12 @@ class PlanningStages:
             session_id=ctx.session_id,
             round_number=ctx.round_number,
             mode="validation",
+            open_tracked_issues_block=self._open_tracked_issues_block_for_validation(ctx.issue_tracker),
         )
         if not isinstance(validation_payload, ReviewResult):
             raise RuntimeError("Expected ReviewResult from validation phase")
         validation_review = validation_payload
+        self._merge_explicit_issue_ids_into_validation_resolved(ctx, validation_review)
         validation_review.constraint_violations = self._confirmed_constraint_violations(
             plan_content=updated_markdown,
             constraints=ctx.state.constraints,

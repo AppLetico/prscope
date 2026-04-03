@@ -13,6 +13,10 @@ from .models import (
     SignalIndex,
 )
 
+# Gin: group method registrations like r.GET(...) — only meaningful on Go source files.
+# Must not match TS/JS HTTP clients (e.g. client.GET(...)) which falsely scored as "gin".
+_GIN_GO_VERB_PATTERN = re.compile(r"\b\w+\.(GET|POST|PUT|PATCH|DELETE)\(", re.I)
+
 FRAMEWORKS = [
     Framework(
         name="fastapi",
@@ -72,7 +76,7 @@ FRAMEWORKS = [
         name="gin",
         route_patterns=[
             re.compile(r"gin\.(default|new)\(", re.I),
-            re.compile(r"\b\w+\.(GET|POST|PUT|PATCH|DELETE)\(", re.I),
+            _GIN_GO_VERB_PATTERN,
         ],
         file_patterns=["main.go", "routes.go", "handler.go", "server.go"],
     ),
@@ -86,6 +90,56 @@ FRAMEWORKS = [
         file_patterns=["Controller.cs", "Program.cs"],
     ),
 ]
+
+# High-confidence identifiers for tie-breaking when total scores are close (see build_framework_signals).
+FRAMEWORK_STRONG_PATTERNS: dict[str, list[re.Pattern]] = {
+    "fastapi": [
+        re.compile(r"fastapi\(", re.I),
+        re.compile(r"apirouter\(", re.I),
+        re.compile(r"@(app|router)\.(get|post|put|patch|delete)\(", re.I),
+    ],
+    "flask": [
+        re.compile(r"from\s+flask", re.I),
+        re.compile(r"flask\(", re.I),
+        re.compile(r"@app\.route\(", re.I),
+    ],
+    "express": [
+        re.compile(r"express\(", re.I),
+        re.compile(r"app\.(get|post|put|patch|delete)\(", re.I),
+        re.compile(r"router\.(get|post|put|patch|delete)\(", re.I),
+    ],
+    "django": [
+        re.compile(r"from\s+django", re.I),
+        re.compile(r"urlpatterns", re.I),
+        re.compile(r"\b(path|re_path)\(", re.I),
+    ],
+    "rails": [
+        re.compile(r"rails\.application", re.I),
+        re.compile(r"\bresources\s+:", re.I),
+    ],
+    "spring": [
+        re.compile(r"@restcontroller", re.I),
+        re.compile(r"@(get|post|put|patch|delete)mapping", re.I),
+        re.compile(r"@requestmapping", re.I),
+    ],
+    "gin": [
+        re.compile(r"gin\.(default|new)\(", re.I),
+        _GIN_GO_VERB_PATTERN,
+    ],
+    "aspnet": [
+        re.compile(r"\[apicontroller\]", re.I),
+        re.compile(r"\[(httpget|httppost|httpput|httppatch|httpdelete)\]", re.I),
+        re.compile(r"map(get|post|put|patch|delete)\(", re.I),
+    ],
+}
+
+FRAMEWORK_SCORE_TIE_DELTA = 4
+
+# OR'd into bootstrap grep so Python/FastAPI stacks surface without relying only on route-regex hits.
+BOOTSTRAP_SUPPLEMENTAL_WEB_PATTERN = r"\b(?:FastAPI|CORSMiddleware|APIRouter|create_app)\b"
+
+# Minimum aggregate score before we tell the user (or discovery) a framework was "inferred".
+MIN_FRAMEWORK_EMIT_SCORE = 5
 
 _bootstrap_patterns = [pattern.pattern for framework in FRAMEWORKS for pattern in framework.route_patterns]
 BOOTSTRAP_ROUTE_REGEX = re.compile("|".join(_bootstrap_patterns) if _bootstrap_patterns else r"$^", re.I)
@@ -540,20 +594,50 @@ def location_score(path: str, file_line_count: int | None = None) -> int:
     return score
 
 
+def _distinct_paths_for_framework_evidence(evidence: list[str], name: str) -> set[str]:
+    """Paths from evidence lines formatted as ``framework:path:line``."""
+    prefix = f"{name}:"
+    out: set[str] = set()
+    for line in evidence:
+        if not line.startswith(prefix):
+            continue
+        rest = line[len(prefix) :]
+        path, _sep, _line_no = rest.rpartition(":")
+        if path:
+            out.add(path)
+    return out
+
+
+def framework_inference_should_emit(signals: FrameworkSignals) -> bool:
+    """True when inferred framework is strong enough to show in bootstrap / suppress framework questions."""
+    name = signals.inferred_framework
+    if not name:
+        return False
+    score = int(signals.candidates.get(name, 0) or 0)
+    if score >= MIN_FRAMEWORK_EMIT_SCORE:
+        return True
+    return len(_distinct_paths_for_framework_evidence(signals.evidence, name)) >= 2
+
+
 def detect_framework(index: SignalIndex) -> str | None:
-    return build_framework_signals(index).inferred_framework
+    signals = build_framework_signals(index)
+    fw = signals.inferred_framework
+    if fw and framework_inference_should_emit(signals):
+        return fw
+    return None
 
 
 def build_framework_signals(index: SignalIndex) -> FrameworkSignals:
     candidates = index.get("framework", [])
     if not candidates:
         return FrameworkSignals(candidates={}, inferred_framework=None, evidence=[])
-    best_name: str | None = None
-    best_score = 0
     scores: dict[str, int] = {}
+    strong_scores: dict[str, int] = {}
     evidence: list[str] = []
     for framework in FRAMEWORKS:
         score = 0
+        strong = 0
+        strong_patterns = FRAMEWORK_STRONG_PATTERNS.get(framework.name, [])
         for match in candidates:
             path_score = location_score(match.path, file_line_count=match.line_number)
             if path_score < 0:
@@ -561,17 +645,24 @@ def build_framework_signals(index: SignalIndex) -> FrameworkSignals:
             filename = str(match.path or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
             file_bonus = 2 if filename in {name.lower() for name in framework.file_patterns} else 0
             match_weight = 1 + max(path_score, 0) + file_bonus
-            if any(pattern.search(match.line) for pattern in framework.route_patterns):
-                score += match_weight
-                if len(evidence) < 6:
-                    evidence.append(f"{framework.name}:{match.path}:{match.line_number}")
+            if not any(pattern.search(match.line) for pattern in framework.route_patterns):
+                continue
+            score += match_weight
+            if strong_patterns and any(p.search(match.line) for p in strong_patterns):
+                strong += match_weight
+            if len(evidence) < 6:
+                evidence.append(f"{framework.name}:{match.path}:{match.line_number}")
         scores[framework.name] = score
-        if score > best_score:
-            best_name = framework.name
-            best_score = score
+        strong_scores[framework.name] = strong
+    positive = [name for name, s in scores.items() if s > 0]
+    if not positive:
+        return FrameworkSignals(candidates={}, inferred_framework=None, evidence=[])
+    best_score = max(scores[n] for n in positive)
+    eligible = [n for n in positive if scores[n] >= best_score - FRAMEWORK_SCORE_TIE_DELTA]
+    best_name = max(eligible, key=lambda n: (scores[n], strong_scores.get(n, 0)))
     return FrameworkSignals(
         candidates={name: score for name, score in scores.items() if score > 0},
-        inferred_framework=best_name if best_score > 0 else None,
+        inferred_framework=best_name,
         evidence=evidence,
     )
 
@@ -654,9 +745,13 @@ def build_signal_index(matches: list[dict[str, Any]]) -> SignalIndex:
         if lines_per_path[path] > MAX_TRUSTWORTHY_LINES:
             continue
         indexed = IndexedMatch(path=path, line_number=line_number, line=line)
+        path_lower = path.replace("\\", "/").lower()
         for signal_name, pattern in all_patterns:
-            if pattern.search(line):
-                index[signal_name].append(indexed)
+            if not pattern.search(line):
+                continue
+            if pattern is _GIN_GO_VERB_PATTERN and not path_lower.endswith(".go"):
+                continue
+            index[signal_name].append(indexed)
     return index
 
 

@@ -203,6 +203,8 @@ class PlanningConfig:
     # SSE "thinking" pings during long discovery / design_review phases (0 disables)
     long_phase_ping_first_after_seconds: float = 45.0
     long_phase_ping_interval_seconds: float = 35.0
+    # Planner pipeline emits synthetic tool_update events after deterministic explore_repo (UI parity).
+    synthetic_initial_draft_tool_updates: bool = True
 
 
 @dataclass
@@ -584,6 +586,7 @@ class PrscopeConfig:
             ),
             long_phase_ping_first_after_seconds=float(planning_data.get("long_phase_ping_first_after_seconds", 45.0)),
             long_phase_ping_interval_seconds=float(planning_data.get("long_phase_ping_interval_seconds", 35.0)),
+            synthetic_initial_draft_tool_updates=bool(planning_data.get("synthetic_initial_draft_tool_updates", True)),
         )
 
         repos_data = data.get("repos", {})

@@ -38,6 +38,7 @@ import type {
 } from "../types";
 import { AlertCircle, Check, Loader2 } from "lucide-react";
 import {
+  COMPOSER_PENDING_ACTIVITY_ID,
   formatPhaseTimingLabel,
   formatToolActivityLabel,
   INITIAL_TIMELINE_STATE,
@@ -222,7 +223,10 @@ export function PlanningViewPage() {
   }, [id]);
 
   const appendLiveActivity = useCallback((activity: LiveActivityEntry) => {
-    setLiveActivities((prev) => upsertLiveActivity(prev, activity));
+    setLiveActivities((prev) => {
+      const base = prev.filter((a) => a.id !== COMPOSER_PENDING_ACTIVITY_ID);
+      return upsertLiveActivity(base, activity);
+    });
   }, []);
 
   const isSessionNotFoundError = useCallback((err: unknown) => {
@@ -271,10 +275,12 @@ export function PlanningViewPage() {
     () => getStoredModelSelection(session?.repo_name),
     [session?.repo_name],
   );
+  // Prefer local state, then localStorage (survives remount / back-forward), then session
+  // defaults — session.author_model can stay at create-time default until the next API call.
   const selectedAuthorModel =
-    authorModel || session?.author_model || storedModels.author_model || fallbackModel;
+    authorModel || storedModels.author_model || session?.author_model || fallbackModel;
   const selectedCriticModel =
-    criticModel || session?.critic_model || storedModels.critic_model || fallbackModel;
+    criticModel || storedModels.critic_model || session?.critic_model || fallbackModel;
   const refetchSession = sessionQuery.refetch;
   const questions = sessionState?.pending_questions ?? [];
   const phaseMessage = sessionState?.phase_message
@@ -608,7 +614,15 @@ export function PlanningViewPage() {
       setError(null);
       setErrorTone("error");
       setThinkingMessage("Thinking...");
-      setLiveActivities([]);
+      setLiveActivities(() =>
+        upsertLiveActivity([], {
+          id: COMPOSER_PENDING_ACTIVITY_ID,
+          kind: "update",
+          message: "Message sent — waiting for the server…",
+          status: "running",
+          created_at: new Date().toISOString(),
+        }),
+      );
       const status = effectiveStatus;
       const models = {
         author_model: selectedAuthorModel || undefined,
@@ -657,7 +671,15 @@ export function PlanningViewPage() {
       setError(null);
       setErrorTone("error");
       setThinkingMessage("Applying follow-up answer...");
-      setLiveActivities([]);
+      setLiveActivities(() =>
+        upsertLiveActivity([], {
+          id: COMPOSER_PENDING_ACTIVITY_ID,
+          kind: "update",
+          message: "Applying follow-up — waiting for the server…",
+          status: "running",
+          created_at: new Date().toISOString(),
+        }),
+      );
       await answerPlanFollowup(id, {
         plan_version_id: currentPlan.id,
         followup_id: followupId,
@@ -697,7 +719,15 @@ export function PlanningViewPage() {
       setError(null);
       setErrorTone("error");
       setShowCritiquePrompt(false);
-      setLiveActivities([]);
+      setLiveActivities(() =>
+        upsertLiveActivity([], {
+          id: COMPOSER_PENDING_ACTIVITY_ID,
+          kind: "update",
+          message: "Review round starting…",
+          status: "running",
+          created_at: new Date().toISOString(),
+        }),
+      );
       await runRound(id, undefined, {
         author_model: selectedAuthorModel || undefined,
         critic_model: selectedCriticModel || undefined,
@@ -1057,6 +1087,8 @@ export function PlanningViewPage() {
                   canApprove={!isProcessing && effectiveStatus === "converged"}
                   critiquePending={showCritiquePrompt}
                   contextPercent={contextPercent}
+                  maxPromptTokens={maxPromptTokens}
+                  contextWindowTokens={contextWindowTokens}
                   onCritique={() => void onCritique()}
                   onApprove={() => void onApprove()}
                   onStop={() => void onStop()}

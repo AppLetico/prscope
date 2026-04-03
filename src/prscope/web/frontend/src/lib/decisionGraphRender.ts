@@ -46,6 +46,11 @@ function renderOpenQuestions(nodes: DecisionNode[]): string {
   return nodes.map((node) => `- ${node.description}`).join("\n");
 }
 
+/**
+ * Injects decision state and open questions into plan markdown for the left panel.
+ * UX follow-up: consider folding long pressure blocks (e.g. collapsible details) or
+ * surfacing unresolved decisions primarily via chat follow-ups instead of plan body.
+ */
 export function augmentPlanMarkdownWithDecisionGraph(
   content: string,
   decisionGraph: DecisionGraph | null | undefined,

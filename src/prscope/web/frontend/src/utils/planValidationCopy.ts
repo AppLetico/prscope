@@ -17,6 +17,28 @@ function extractMentionPath(text: string): string | null {
 export function humanizePlanValidationError(raw: string): PlanValidationFriendly {
   const t = raw.trim();
 
+  // Prefer this before "required section is empty" — compound errors join with "; " and would
+  // otherwise mangle the section name into the summary.
+  if (t.includes("missing test target reference")) {
+    const candidates = t.match(/reference one of:\s*([^;]+)/i)?.[1]?.trim();
+    const paths = candidates
+      ? candidates
+          .split(",")
+          .map((s) => s.trim())
+          .filter(Boolean)
+          .slice(0, 3)
+      : [];
+    return {
+      title: "Name a regression test target",
+      summary:
+        "When your requirements mention tests or coverage, the plan should name at least one verified test file (from the repo) in the Test Strategy or Files Changed.",
+      whatToDo:
+        paths.length > 0
+          ? `Add a bullet under Test Strategy that cites one of: ${paths.map((p) => `\`${p}\``).join(", ")}.`
+          : "Add a bullet under Test Strategy that cites one of the suggested test paths from the technical detail (in backticks).",
+    };
+  }
+
   if (t.includes("localized backend payload/response change must reference the existing API path")) {
     const path = extractMentionPath(t) ?? "src/prscope/web/api.py";
     return {
@@ -67,13 +89,16 @@ export function humanizePlanValidationError(raw: string): PlanValidationFriendly
     };
   }
 
-  if (t.startsWith("required section is empty:")) {
-    const section = t.replace(/^required section is empty:\s*/i, "").trim();
-    return {
-      title: "Fill in a required section",
-      summary: `The ${section} section is empty. The planner won’t save the draft until every required heading has real content.`,
-      whatToDo: `Write content for ${section}, then try Review or send another revision message.`,
-    };
+  {
+    const m = t.match(/^required section is empty:\s*([^;]+)/i);
+    if (m) {
+      const section = m[1].trim();
+      return {
+        title: "Fill in a required section",
+        summary: `The ${section} section is empty. The planner won’t save the draft until every required heading has real content.`,
+        whatToDo: `Write content for ${section}, then try Review or send another revision message.`,
+      };
+    }
   }
 
   if (t.includes("under-scoped draft")) {

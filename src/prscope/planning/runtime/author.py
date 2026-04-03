@@ -16,6 +16,7 @@ from .authoring.discovery import (
     AuthorDesignService,
     AuthorDiscoveryService,
     extract_paths_from_mental_model,
+    initial_draft_complexity_score,
     is_entrypoint_like,
     is_non_trivial_source,
     is_test_or_config,
@@ -51,6 +52,54 @@ from .transport import AuthorLLMClient
 
 apply_section_updates = _apply_section_updates
 render_markdown = _render_markdown
+
+# draft_plan embeds repo_understanding as JSON; full file bodies can exceed model context windows.
+_MAX_DRAFT_FILE_CHARS_PER_PATH = 4000
+_MAX_DRAFT_FILE_CONTENTS_TOTAL_CHARS = 28000
+_MAX_INITIAL_DRAFT_CONTEXT_CHARS = 12000
+_MAX_ARCHITECTURE_SUMMARY_IN_DRAFT_CHARS = 8000
+
+
+def _truncate_file_contents_for_draft_prompt(file_contents: dict[str, str]) -> dict[str, str]:
+    if not file_contents:
+        return {}
+    out: dict[str, str] = {}
+    total = 0
+    for path in sorted(file_contents.keys(), key=str):
+        text = str(file_contents.get(path) or "")
+        if not text.strip():
+            continue
+        remaining = _MAX_DRAFT_FILE_CONTENTS_TOTAL_CHARS - total
+        if remaining <= 0:
+            out[path] = f"[omitted: {len(text)} chars; draft prompt budget exceeded]"
+            continue
+        cap = min(_MAX_DRAFT_FILE_CHARS_PER_PATH, remaining)
+        if len(text) <= cap:
+            out[path] = text
+            total += len(text)
+        else:
+            out[path] = text[:cap] + "\n... [truncated]"
+            total += cap
+    return out
+
+
+def _truncate_initial_draft_context_block(text: str) -> str:
+    t = str(text or "").strip()
+    if len(t) <= _MAX_INITIAL_DRAFT_CONTEXT_CHARS:
+        return t
+    return t[:_MAX_INITIAL_DRAFT_CONTEXT_CHARS] + "\n... [truncated: project instructions]"
+
+
+def _repo_understanding_for_draft_prompt(ru: RepoUnderstanding) -> dict[str, Any]:
+    payload = dict(ru.__dict__)
+    fc = payload.get("file_contents")
+    if isinstance(fc, dict):
+        payload["file_contents"] = _truncate_file_contents_for_draft_prompt({str(k): str(v) for k, v in fc.items()})
+    summary = payload.get("architecture_summary")
+    if isinstance(summary, str) and len(summary) > _MAX_ARCHITECTURE_SUMMARY_IN_DRAFT_CHARS:
+        payload["architecture_summary"] = summary[:_MAX_ARCHITECTURE_SUMMARY_IN_DRAFT_CHARS] + "\n... [truncated]"
+    return payload
+
 
 # Safe to run concurrently via asyncio.to_thread (see ToolExecutor._access_lock).
 _READ_ONLY_PARALLEL_TOOL_NAMES = frozenset({"list_files", "read_file", "grep_code", "glob_files"})
@@ -257,53 +306,60 @@ class StageRunner:
 
 PLANNER_SYSTEM_PROMPT = """You are an expert software architect creating the first grounded planning draft.
 
-Your job is to produce a concise, high-signal outline grounded in the real codebase.
+Your job is to produce a **Cursor-quality** outline: structured, phased, and anchored in the real codebase—whether the user is adding UI, data layer work, performance, tooling, security, or anything else—not a thin file list.
 This planner draft is an intermediate artifact, not the final implementation document.
 
 Non-negotiable rules:
 1. Verify assumptions against the repository evidence already provided.
 2. If an assumption cannot be verified, mark it as an explicit risk or open question.
-3. Reference only concrete file paths in backticks.
-4. Keep the draft concise and avoid speculative implementation detail.
-5. Do not include code fences, example snippets, or mermaid diagrams in this phase.
-6. If the repository evidence shows the requested route, feature, or integration point already exists, plan to modify the existing implementation instead of creating a parallel one.
-7. For endpoint or route changes, mention both the expected success response and minimal failure/error handling, but do not broaden the design into dependency checks, authentication, or platform work unless the requirements require that.
-8. For lightweight endpoint requests, keep observability, logging, and documentation notes proportional; do not turn them into explicit workstreams unless the user asked for them.
-9. For localized UI or API-wiring requests, prefer the owning page/component and existing client/helper files already shown in repository evidence. Do not pull in planning runtime, discovery, or unrelated backend modules unless the evidence directly links them to the requested behavior.
-10. When tests are requested for a localized UI change, prefer an existing adjacent page/container test over an unrelated component test. If no verified test file is clearly related, do not invent a new path; surface the missing test target as a risk or open question instead.
-11. For localized UI or API-wiring requests, do not add observability, logging, telemetry, rollout controls, or platform notes unless the requirements or verified repository evidence explicitly require them.
-12. For localized UI or API-wiring requests, do not invent new backend response fields, session-state plumbing, or API contract changes unless the requirements explicitly ask for a payload/response change.
-13. For localized UI or API-wiring requests, do not prescribe hook APIs, state variable names, or concrete local-state shapes (for example `useState`, `useEffect`, `isExporting`, `lastExportResult`, or typed state objects) unless verified repository evidence already uses those exact constructs and the request explicitly depends on them.
-14. For localized UI requests that only ask to show the latest result/status without specifying formatting, assume a simple success/failure presentation and do not add open questions asking what format/details to show unless repository evidence proves multiple incompatible existing patterns.
+3. Reference only concrete file paths in backticks (from Verified File Paths or Structured Evidence).
+4. Keep the draft information-dense; avoid filler. Do not include code fences, example snippets, or mermaid diagrams in this phase.
+5. If the repository evidence shows the requested route, feature, or integration point already exists, plan to modify the existing implementation instead of creating a parallel one.
+6. **Current baseline:** In "## Current baseline", summarize what the evidence shows **today** for the *relevant* parts of the system (components, APIs, DB, jobs, config—whatever appears in evidence). Only state facts supported by evidence; say what is unknown if needed. Do not force HTTP/SSE/auth details into a plan that is purely about, e.g., a React component or a migration script unless evidence surfaces them.
+7. **Goals:** In "## Goals", state user-visible outcomes and success criteria for *this* request (feature, refactor, perf, etc.).
+8. **Risks and constraints:** In "## Risks and constraints", call out what could go wrong or what bounds the work (compatibility, rollout, data migration, backwards compatibility, cost/latency). For **security, abuse, privacy, or network exposure**, include a short threat/asset framing here. For **purely local or single-feature** work, a brief line such as "Deployment: local dev; no multi-tenant concerns" or "None identified" is enough—do not invent enterprise security sections.
+9. **When the requirements concern authentication, API security, or credential handling:** Prefer the **simplest** mechanism that fits the evidence (e.g. optional shared secret / API key from environment before JWT, OAuth, or user directories). If you propose JWT or token-issuing routes, justify why a static shared secret is insufficient. Mention constant-time comparison and never logging secrets or bearer tokens.
+10. **When the requirements involve the HTTP API, browser client, or streaming:** If evidence includes the web client or SSE hooks, note that **browser EventSource often cannot send custom Authorization headers** when relevant, and capture the design fork (cookies, short-lived query token for streaming paths, fetch/ReadableStream, etc.).
+11. **When deployment is not strictly localhost:** Mention TLS at a reverse proxy, bind policy, and CORS with credentials only at the level the requirements imply; skip if the change is local-only.
+12. For localized UI or API-wiring requests, prefer the owning page/component and existing client/helper files in evidence; do not pull in planning runtime modules unless evidence links them.
+13. For localized UI or API-wiring requests, do not invent new backend response fields or session plumbing unless the requirements explicitly ask for payload/response changes.
+14. Do not claim that authentication or security layers already exist unless evidence shows them.
+15. When similar patterns exist in the repo, prefer extending them over parallel mechanisms.
 
 Required markdown sections and order:
 - # <Relevant plan title>
 - ## Summary
+- ## Current baseline
 - ## Goals
+- ## Risks and constraints
 - ## Non-Goals
 - ## Changes
+- ## Critical design forks
+- ## Phased approach
+- ## Implementation map
 - ## Files Changed
+- ## Critical Files for Implementation
 - ## Architecture
+- ## Suggested sequencing
 - ## Open Questions
 
-Additional format requirements:
+Section guidance:
+- "Critical design forks": the 1–3 decisions that could change the approach **for this request** (e.g. schema migration ordering vs API first; sync vs async; feature flag; SSE vs polling for **only** when streaming is in scope; **or** "None significant" if the work is straightforward).
+- "Phased approach": numbered phases (Phase 0, 1, …) with goals—not low-level implementation steps.
+- "Implementation map": a **markdown table** with columns **Area | Work** (e.g. Frontend, Backend, Data, Tests, Docs, Ops—use only areas that apply). Use verified paths in cells where applicable.
+- "Suggested sequencing": ordered list of what to decide or build first (examples: lock data model before API; agree on UX before tests; **or** resolve SSE strategy before auth middleware—only when relevant).
 - "Files Changed" must list only verified concrete file paths and a short rationale per file.
-- "Architecture" should explain the minimal design direction, key interfaces, and observability/runtime concerns when relevant.
-- "Open Questions" should only include unresolved decisions that cannot be answered from the codebase.
+- "Critical Files for Implementation" must list 3–5 paths drawn only from Verified File Paths.
 
 Strict exclusions for this phase:
-- Do NOT include "Implementation Steps".
-- Do NOT include "Test Strategy".
-- Do NOT include "Rollback Plan".
-- Do NOT include "Example Code Snippets".
-- Do NOT include detailed numbered execution steps.
+- Do NOT include "Implementation Steps", "Test Strategy", "Rollback Plan", "Example Code Snippets", or detailed numbered execution steps.
 """
 
 
 REFINER_SYSTEM_PROMPT = """You are an expert software architect creating implementation plans.
 
 Your job is to produce a deeply practical, strategically aware plan grounded in the real codebase.
-The output must look like a Cursor-quality implementation plan, not a lightweight outline.
+The output must look like a **Cursor-quality** implementation plan: appropriate depth for any feature area (UI, backend, data, perf, tooling, security, etc.). Add explicit threat/deployment/SSE/CORS detail **only when** the requirements or verified evidence make it relevant—do not pad security or platform sections into unrelated work.
 
 Non-negotiable rules:
 1. Verify assumptions against the repository using tools before finalizing.
@@ -317,6 +373,7 @@ Non-negotiable rules:
 9. For localized UI or API-wiring requests, keep observability, logging, telemetry, rollout controls, and platform hardening proportional. Do not add them as workstreams or architecture notes unless the requirements explicitly ask for them.
 10. For localized UI or API-wiring requests, do not prescribe hook APIs, state variable names, typed state objects, timeout/unmount guards, or code-level React patterns (for example `useState`, `useEffect`, `useRef`, `useCallback`, `Promise.race`, `setTimeout`, or `type ExportStatus = ...`) unless verified repository evidence already uses those exact constructs and the request explicitly depends on them.
 11. For localized UI requests that only ask to show the latest result/status without specifying formatting, assume a simple success/failure presentation and do not add open questions or architecture churn about display format/details unless repository evidence proves the choice is genuinely ambiguous.
+12. For **API security, authentication, or exposure** work: include baseline, risks/assets, critical forks (including SSE vs header-only auth when streaming is involved), implementation map, TLS/proxy/CORS when not strictly localhost, and tests/docs follow-ups—unless the user explicitly narrowed scope. For **other** work, keep the same rigor but **omit** security/platform sections that do not apply.
 
 Required markdown sections and order:
 - # <Relevant plan title>
@@ -376,6 +433,7 @@ class AuthorAgent:
             validate_draft=self.validate_draft_result,
             self_review_draft=self.self_review_draft,
             event_emitter=self._emit,
+            synthetic_exploration_tool_updates=bool(getattr(self.config, "synthetic_initial_draft_tool_updates", True)),
         )
 
     @staticmethod
@@ -406,10 +464,7 @@ class AuthorAgent:
     @staticmethod
     def _initial_draft_policy(requirements: str) -> tuple[int, int, float, int]:
         """Tune startup discovery budget from requirement complexity."""
-        tokens = [token for token in re.split(r"[^a-z0-9]+", requirements.lower()) if token]
-        uniq_tokens = {token for token in tokens if len(token) >= 4}
-        path_mentions = re.findall(r"[A-Za-z0-9_./-]+\.[A-Za-z0-9]+", requirements)
-        complexity_score = len(uniq_tokens) + (3 * len(path_mentions))
+        complexity_score = initial_draft_complexity_score(requirements)
         if complexity_score >= 45:
             return 3, 4, 0.55, 1800
         if complexity_score >= 25:
@@ -477,6 +532,13 @@ class AuthorAgent:
             recall_allocated, used_recall = budget.allocate(recall_allocated, remaining)
             remaining = max(0, remaining - used_recall)
             context_index_block, _ = budget.allocate(context_index_block, remaining)
+        planner_context = (
+            f"{manifesto_block}"
+            f"Full manifesto available at: {manifesto_path}\n\n"
+            f"{skills_allocated}"
+            f"{recall_allocated}"
+            f"{context_index_block}"
+        ).strip()
         messages = [
             {
                 "role": "user",
@@ -504,6 +566,7 @@ class AuthorAgent:
             model_override=model_override,
             timeout_seconds_override=timeout_seconds_override,
             requirements_text_override=requirements,
+            initial_draft_context=planner_context,
             reset_tool_history=False,
         )
 
@@ -551,12 +614,14 @@ class AuthorAgent:
         candidates: RepoCandidates,
         mental_model: str | None = None,
         max_file_reads: int = 5,
+        grep_max_results: int = 40,
     ) -> RepoUnderstanding:
         return self._discovery_service.explore_repo(
             requirements=requirements,
             candidates=candidates,
             mental_model=mental_model,
             max_file_reads=max_file_reads,
+            grep_max_results=grep_max_results,
         )
 
     def classify_complexity(
@@ -601,6 +666,7 @@ class AuthorAgent:
         model_override: str | None = None,
         revision_hints: list[str] | None = None,
         timeout_seconds_override: int | Callable[[], int] | None = None,
+        initial_draft_context: str | None = None,
     ) -> str:
         system_prompt = PLANNER_SYSTEM_PROMPT if draft_phase == "planner" else REFINER_SYSTEM_PROMPT
         prioritized_verified_paths: list[str] = []
@@ -634,16 +700,24 @@ class AuthorAgent:
             "revision_hints": list(attempt_context.revision_hints if attempt_context else tuple(revision_hints or [])),
             "elapsed_ms": attempt_context.elapsed_ms if attempt_context else 0,
         }
+        context_prefix = ""
+        if initial_draft_context and str(initial_draft_context).strip():
+            context_prefix = (
+                "## Project instructions (excerpt)\n"
+                f"{_truncate_initial_draft_context_block(str(initial_draft_context))}\n\n"
+            )
         messages = [
             {"role": "system", "content": system_prompt},
             {
                 "role": "user",
                 "content": (
+                    f"{context_prefix}"
                     f"## Requirements\n{requirements}\n\n"
                     f"## Verified File Paths\n{verified_paths_block}\n\n"
                     f"## Structured Evidence\n{json.dumps(evidence_payload, indent=2)}\n\n"
                     f"## Attempt Context\n{json.dumps(attempt_payload, indent=2)}\n\n"
-                    f"## Repository Understanding\n{json.dumps(repo_understanding.__dict__, indent=2)}\n\n"
+                    f"## Repository Understanding\n"
+                    f"{json.dumps(_repo_understanding_for_draft_prompt(repo_understanding), indent=2)}\n\n"
                     f"## Architecture Design\n{json.dumps(architecture.__dict__, indent=2) if architecture else '(none)'}\n\n"
                     f"## Revision Hints\n{json.dumps(revision_hints or [], indent=2)}\n\n"
                     "## Grounding Rules\n"
@@ -962,6 +1036,7 @@ class AuthorAgent:
         rejection_counts: dict[str, int],
         rejection_reasons: list[dict[str, str]],
         timeout_seconds_override: int | Callable[[], int] | None,
+        initial_draft_context: str | None = None,
     ) -> AuthorResult:
         return await self._planner_pipeline.run(
             requirements=requirements,
@@ -971,6 +1046,7 @@ class AuthorAgent:
             rejection_counts=rejection_counts,
             rejection_reasons=rejection_reasons,
             timeout_seconds_override=timeout_seconds_override,
+            initial_draft_context=initial_draft_context,
         )
 
     async def author_loop(
@@ -987,6 +1063,7 @@ class AuthorAgent:
         model_override: str | None = None,
         timeout_seconds_override: int | Callable[[], int] | None = None,
         requirements_text_override: str | None = None,
+        initial_draft_context: str | None = None,
         reset_tool_history: bool = True,
     ) -> AuthorResult:
         if reset_tool_history:
@@ -1012,6 +1089,7 @@ class AuthorAgent:
             rejection_counts=rejection_counts,
             rejection_reasons=rejection_reasons,
             timeout_seconds_override=timeout_seconds_override,
+            initial_draft_context=initial_draft_context,
         )
         pipeline_elapsed = asyncio.get_running_loop().time() - pipeline_started
         await self._emit({"type": "thinking", "message": f"Plan drafted via pipeline ({pipeline_elapsed:.1f}s)."})

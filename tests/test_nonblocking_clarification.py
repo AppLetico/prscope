@@ -1490,6 +1490,38 @@ def test_supplement_refinement_plan_uses_generic_backend_fallbacks_for_cache_wor
     assert "`src/prscope/web/api.py`" in supplemented.rollback_plan
 
 
+def test_parse_missing_test_target_candidate_paths() -> None:
+    assert PlanningStages._parse_missing_test_target_candidate_paths(
+        "missing test target reference; reference one of: tests/test_a.py, tests/test_b.py"
+    ) == ["tests/test_a.py", "tests/test_b.py"]
+
+
+def test_supplement_refinement_plan_appends_missing_test_target_candidate() -> None:
+    stages = PlanningStages.__new__(PlanningStages)
+    plan = PlanDocument(
+        title="Plan",
+        summary="S",
+        goals="- g",
+        non_goals="- n",
+        files_changed="- `src/foo.py`: change",
+        architecture="arch",
+        implementation_steps="1. Do x",
+        test_strategy="- Smoke test the behavior.",
+        rollback_plan="- r",
+        open_questions="- None.",
+    )
+    failure = (
+        "missing test target reference; reference one of: "
+        "tests/test_author_pipeline.py, tests/test_authoring_models_render.py"
+    )
+    supplemented = stages._supplement_refinement_plan(
+        plan=plan,
+        failures=[failure],
+        requirements="Add tests for the feature.",
+    )
+    assert "tests/test_author_pipeline.py" in (supplemented.test_strategy or "")
+
+
 def test_stabilize_refinement_plan_prefers_existing_verified_owner_paths() -> None:
     current_plan = PlanDocument(
         title="Plan",

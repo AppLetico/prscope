@@ -153,6 +153,9 @@ CODEBASE_TOOLS = [
             "name": "glob_files",
             "description": (
                 "Find files by glob pattern under a directory (recursive patterns like **/*.py). "
+                "Uses Python glob semantics: brace expansion is NOT supported (patterns like "
+                "'**/*.{py,ts}' match literally and usually return zero files). Use **/*.py, "
+                "**/*.ts, or separate glob_files calls per extension. "
                 "Complements list_files (single-directory listing) for wide file discovery."
             ),
             "parameters": {
@@ -394,13 +397,22 @@ class ToolExecutor:
             with self._access_lock:
                 self.accessed_paths.add(rel)
             out.append(rel)
-        return {
+        brace_note: str | None = None
+        if "{" in pattern and "," in pattern:
+            brace_note = (
+                "Python glob does not expand brace groups (e.g. *.{py,go}). "
+                "Use **/*.py, **/*.go, or separate glob_files calls."
+            )
+        payload: dict[str, Any] = {
             "pattern": pattern,
             "path": str(base.relative_to(self.repo_root)),
             "results": out,
             "count": len(out),
             "truncated": truncated,
         }
+        if brace_note:
+            payload["note"] = brace_note
+        return payload
 
     def grep_code(
         self,
@@ -672,7 +684,10 @@ class ToolExecutor:
             "stored_at": stored_at,
             "truncated": True,
             **summary,
-            "note": "Tool result stored as artifact. Read it with read_file before referencing files.",
+            "note": (
+                f"Tool result stored as artifact at repo-relative path `{stored_at}`. "
+                "Call read_file with that exact path to load the full JSON before citing file contents."
+            ),
         }
 
 

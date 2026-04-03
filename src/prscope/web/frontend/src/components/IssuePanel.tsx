@@ -350,6 +350,10 @@ function IssueCard({
 
       {relatedDecisions.length > 0 ? (
         <div className="mb-3 space-y-2">
+          <p className="text-[10px] text-zinc-500 leading-snug">
+            Related decisions are context from the plan. Use <span className="text-zinc-400">Add to chat</span> to
+            continue in the thread.
+          </p>
           <div className="flex flex-wrap items-center gap-2">
             <span className="text-[10px] uppercase tracking-wider text-zinc-500">Related decisions</span>
             {relatedDecisions.map((decision) => (

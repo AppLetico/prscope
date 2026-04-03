@@ -80,6 +80,7 @@ Use list_files, glob_files, read_file, and grep_code to understand the project b
 Read: README, key source files, package manifests, existing patterns relevant to the request.
 Do not skip this step. Hallucinating project structure is worse than asking.
 If the request mentions endpoints/routes/APIs, inspect backend route handlers (not only frontend files) before asking.
+Infer languages and stack from repository evidence (for example `pyproject.toml`, `package.json`, `go.mod`, root listings). Do not assume Go/Gin unless `.go` sources or Go manifests appear in the repo.
 
 **Step 2 — Ask only what code can't tell you:**
 After scanning, ask ONLY 2-3 questions that require a human decision:

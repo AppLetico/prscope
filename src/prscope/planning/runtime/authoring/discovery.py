@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any, Literal
 
 from .models import RepoCandidates, RepoUnderstanding
@@ -43,6 +44,27 @@ LOW_SIGNAL_GREP_KEYWORDS = {
     "change",
     "changes",
 }
+# Short domain tokens that should stay in grep keyword slots (not treated as low-signal).
+DOMAIN_GREP_PRIORITY: frozenset[str] = frozenset(
+    {
+        "api",
+        "auth",
+        "oauth",
+        "openid",
+        "cors",
+        "csrf",
+        "jwt",
+        "sse",
+        "tls",
+        "ssl",
+        "bearer",
+        "cookie",
+        "session",
+        "middleware",
+        "fastapi",
+        "authorization",
+    }
+)
 
 NON_TRIVIAL_EXTENSIONS = {
     ".py",
@@ -74,6 +96,20 @@ IGNORED_SCAN_DIRS = {
     "node_modules",
     "venv",
 }
+
+# Tokens like "create", "plan", "add" match everywhere; deprioritize for grep-driven discovery.
+GENERIC_PLANNING_VERBS = frozenset(
+    {
+        "create",
+        "plan",
+        "add",
+        "make",
+        "implement",
+        "build",
+        "write",
+        "update",
+    }
+)
 
 
 def requirements_keywords(text: str) -> set[str]:
@@ -151,18 +187,207 @@ def extract_paths_from_mental_model(mental_model: str) -> set[str]:
     return {path.strip() for path in candidates if path.strip()}
 
 
+def initial_draft_complexity_score(requirements: str) -> int:
+    """Single source of truth for initial-draft heuristics (policy + exploration budgets)."""
+    tokens = [token for token in re.split(r"[^a-z0-9]+", requirements.lower()) if token]
+    uniq_tokens = {token for token in tokens if len(token) >= 4}
+    path_mentions = re.findall(r"[A-Za-z0-9_./-]+\.[A-Za-z0-9]+", requirements)
+    return len(uniq_tokens) + (3 * len(path_mentions))
+
+
+def _keywords_for_grep_priority(req_kw: set[str]) -> list[str]:
+    """Order tokens for grep: longer, more specific terms first (any domain).
+
+    Generic planning verbs and low-signal tokens are already removed by the caller.
+    Domain tokens (api, auth, cors, …) are moved to the front so they survive the :N cap.
+    """
+    filtered = [
+        token
+        for token in sorted(req_kw, key=lambda item: (-len(item), item))
+        if token not in LOW_SIGNAL_GREP_KEYWORDS and token not in GENERIC_PLANNING_VERBS
+    ]
+
+    # Same length: prefer tokens that read as identifiers (digits/underscore) for DB/migrations/etc.
+    def _tiebreak(t: str) -> tuple[int, str]:
+        identish = 1 if (any(ch.isdigit() for ch in t) or "_" in t) else 0
+        return (-identish, t)
+
+    by_len: dict[int, list[str]] = {}
+    for token in filtered:
+        by_len.setdefault(len(token), []).append(token)
+    out: list[str] = []
+    for length in sorted(by_len.keys(), reverse=True):
+        tier = sorted(by_len[length], key=_tiebreak)
+        out.extend(tier)
+    domain = [t for t in out if t in DOMAIN_GREP_PRIORITY]
+    other = [t for t in out if t not in DOMAIN_GREP_PRIORITY]
+    return domain + other
+
+
 def requirement_search_patterns(text: str) -> list[str]:
     route_literals = re.findall(r"/[A-Za-z0-9_./:-]+", text)
     patterns: list[str] = [re.escape(route.strip()) for route in route_literals if route.strip()]
-    keywords = [
-        token
-        for token in sorted(requirements_keywords(text), key=lambda item: (-len(item), item))
-        if token not in LOW_SIGNAL_GREP_KEYWORDS
-    ]
-    for keyword in keywords[:4]:
+    req_kw = requirements_keywords(text)
+    merged = _keywords_for_grep_priority(req_kw)
+    lowered_full = text.lower()
+    # Enough slots for multi-topic prompts (e.g. migration + cache + tests) without a fixed domain list.
+    _MAX_KEYWORD_GREP_PATTERNS = 10
+    for keyword in merged[:_MAX_KEYWORD_GREP_PATTERNS]:
         patterns.append(rf"\b{re.escape(keyword)}\b")
-    # Preserve order while removing duplicates.
+    # Optional repo-shaped hints when the prompt clearly concerns HTTP/API surface (not security-only).
+    _WEB_SURFACE_HINTS = (
+        "security",
+        "authentication",
+        "authorization",
+        "auth",
+        "cors",
+        "token",
+        "bearer",
+        "sse",
+        "http",
+        "https",
+        "rest",
+        "endpoint",
+        "fastapi",
+        "server",
+        "middleware",
+        "cookie",
+        "session",
+        "oauth",
+        "jwt",
+        "csrf",
+        "openid",
+    )
+    if any(x in lowered_full for x in _WEB_SURFACE_HINTS):
+        extras = [
+            r"\bCORSMiddleware\b",
+            r"\bAuthorization\b",
+            r"\bFastAPI\b",
+            r"\bcreate_app\b",
+        ]
+        if any(x in lowered_full for x in ("oauth", "jwt", "openid", "csrf")):
+            extras.extend((r"\bOAuth2\b", r"\bjwt\b", r"\bJWT\b", r"\bCSRF\b"))
+        for extra in extras:
+            patterns.append(extra)
     return list(dict.fromkeys(patterns))
+
+
+def exploration_budget_for_requirements(requirements: str) -> tuple[int, int]:
+    """Return (max_file_reads, grep_max_results) for initial-draft exploration."""
+    complexity_score = initial_draft_complexity_score(requirements)
+    lowered = requirements.lower()
+    security_boost = any(
+        k in lowered
+        for k in (
+            "security",
+            "authentication",
+            "authorization",
+            "oauth",
+            "cors",
+            "csrf",
+            "tls",
+            "ssl",
+            "sse",
+            "token",
+            "bearer",
+        )
+    )
+    if complexity_score >= 45:
+        reads, grep_max = 9, 60
+    elif complexity_score >= 25:
+        reads, grep_max = 7, 50
+    else:
+        reads, grep_max = 5, 40
+    if security_boost:
+        reads = min(reads + 2, 12)
+        grep_max = min(grep_max + 15, 80)
+    elif requirements_imply_web_stack_exploration(lowered):
+        reads = min(reads + 1, 12)
+        grep_max = min(grep_max + 10, 80)
+    return reads, grep_max
+
+
+def requirements_imply_web_stack_exploration(requirements_lower: str) -> bool:
+    """True when the prompt likely needs HTTP/API/SSE/client/docs context—not only for security plans."""
+    return any(
+        k in requirements_lower
+        for k in (
+            "security",
+            "authentication",
+            "authorization",
+            "api",
+            "cors",
+            "sse",
+            "fastapi",
+            "server",
+            "bearer",
+            "bind",
+            "jwt",
+            "oauth",
+            "network",
+            "expose",
+            "tls",
+            "ssl",
+            "token",
+            "cookie",
+            "session",
+        )
+    )
+
+
+def _planner_stack_priority_paths(requirements_lower: str, candidates: RepoCandidates) -> list[str]:
+    """Prefer backend entrypoints, client API/SSE hooks, and top-level security docs when relevant."""
+    if not requirements_imply_web_stack_exploration(requirements_lower):
+        return []
+    out: list[str] = []
+    for path in candidates.all_paths:
+        lp = path.lower()
+        if lp.endswith("/web/api.py") or lp.endswith("/web/server.py"):
+            out.append(path)
+        if "usesessionevents.ts" in lp.replace("\\", "/"):
+            out.append(path)
+        if lp.endswith("/lib/api.ts"):
+            out.append(path)
+        if "production_readiness.md" in lp:
+            out.append(path)
+        if lp.endswith("/agents.md") or lp == "agents.md":
+            out.append(path)
+    return out
+
+
+def _grep_search_roots_for_repo(candidates: RepoCandidates, repo_root: Path) -> list[str | None]:
+    """Derive bounded grep roots (top-level dirs) under ``repo_root``.
+
+    Bare filenames from the mental model (e.g. ``api.py``) must not become search roots:
+    ripgrep treats the path argument as a directory to search and fails with
+    "No such file or directory" when that path is missing or is a non-file.
+
+    Paths like ``planning/core.py`` without a repo-root prefix must also be dropped when
+    ``planning/`` is not a real top-level directory.
+    """
+    top_level_roots: list[str] = []
+    for path in [*candidates.source_modules, *candidates.tests_and_config]:
+        normalized = str(path).replace("\\", "/")
+        if "/" not in normalized:
+            continue
+        root = normalized.split("/", 1)[0]
+        if root and root not in top_level_roots:
+            top_level_roots.append(root)
+    filtered: list[str] = []
+    for root in top_level_roots:
+        try:
+            if (repo_root / root).is_dir():
+                filtered.append(root)
+        except OSError:
+            continue
+    search_roots: list[str | None] = []
+    for preferred in ("src", "tests", "test"):
+        if preferred in filtered:
+            search_roots.append(preferred)
+    search_roots.extend(root for root in filtered if root not in {"src", "tests", "test"})
+    if not search_roots:
+        search_roots = [None]
+    return search_roots
 
 
 def grep_match_priority(line: str) -> int:
@@ -255,6 +480,7 @@ class AuthorDiscoveryService:
         candidates: RepoCandidates,
         mental_model: str | None = None,
         max_file_reads: int = 5,
+        grep_max_results: int = 40,
     ) -> RepoUnderstanding:
         seeded_paths = extract_paths_from_mental_model(mental_model or "")
         req_keywords = requirements_keywords(requirements)
@@ -266,23 +492,12 @@ class AuthorDiscoveryService:
             max_file_reads = 6
         if needs_backend_contract_test and max_file_reads < 7:
             max_file_reads = 7
-        search_roots: list[str | None] = []
-        top_level_roots = []
-        for path in [*candidates.source_modules, *candidates.tests_and_config]:
-            root = str(path).split("/", 1)[0]
-            if root and root not in top_level_roots:
-                top_level_roots.append(root)
-        for preferred in ("src", "tests", "test"):
-            if preferred in top_level_roots:
-                search_roots.append(preferred)
-        search_roots.extend(root for root in top_level_roots if root not in {"src", "tests", "test"})
-        if not search_roots:
-            search_roots = [None]
+        search_roots = _grep_search_roots_for_repo(candidates, self.tool_executor.repo_root)
         grep_hits_by_path: dict[str, list[tuple[int, str]]] = {}
         for pattern in requirement_search_patterns(requirements):
             for root in search_roots:
                 try:
-                    payload = self.tool_executor.grep_code(pattern=pattern, path=root, max_results=40)
+                    payload = self.tool_executor.grep_code(pattern=pattern, path=root, max_results=grep_max_results)
                 except Exception:  # noqa: BLE001
                     continue
                 for match in payload.get("results", []):
@@ -370,6 +585,34 @@ class AuthorDiscoveryService:
                     score -= 8
                 if "/planning/runtime/" in lower_path or "/authoring/" in lower_path:
                     score -= 15
+            if not localized_frontend:
+                lr = (requirements or "").lower()
+                if any(
+                    k in lr
+                    for k in (
+                        "api",
+                        "security",
+                        "auth",
+                        "cors",
+                        "sse",
+                        "server",
+                        "fastapi",
+                        "bearer",
+                    )
+                ):
+                    if lower_path.endswith("/web/api.py"):
+                        score += 8
+                    if lower_path.endswith("/web/server.py"):
+                        score += 6
+                if requirements_imply_web_stack_exploration(lr):
+                    if "usesessionevents.ts" in lower_path:
+                        score += 7
+                    if lower_path.endswith("/lib/api.ts"):
+                        score += 5
+                    if "production_readiness.md" in lower_path:
+                        score += 6
+                    if lower_path.endswith("agents.md"):
+                        score += 4
             score_by_path[path] = score
             scored_paths.append((score, path))
         scored_paths.sort(key=lambda item: (-item[0], item[1]))
@@ -423,6 +666,11 @@ class AuthorDiscoveryService:
                 selected.append(path)
             if len(selected) >= max(1, max_file_reads):
                 break
+
+        stack = _planner_stack_priority_paths((requirements or "").lower(), candidates)
+        if stack:
+            merged_sel = list(dict.fromkeys([*stack, *selected]))
+            selected = merged_sel[: max(1, max_file_reads)]
 
         file_contents: dict[str, str] = {}
         for path in selected:

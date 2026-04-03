@@ -3,11 +3,88 @@ import {
   buildRefinementRoundSummaries,
   collapseTimelineForDisplay,
   compactTimelineToRecentRounds,
+  contextGaugeLabels,
+  getLiveStatusMessage,
   hasRunningToolCalls,
+  normalizeChatMessageForDedup,
   shouldHideCompletedToolGroup,
   shouldShowActiveToolStream,
 } from "./chatPanelUtils";
 import type { PlanningTurn, ToolCallEntry, ToolCallGroup } from "../types";
+
+describe("normalizeChatMessageForDedup", () => {
+  it("matches optimistic and persisted user text across whitespace differences", () => {
+    const a = "Hello\n\nworld";
+    const b = "  Hello  \n\n  world  ";
+    expect(normalizeChatMessageForDedup(a)).toBe(normalizeChatMessageForDedup(b));
+  });
+});
+
+describe("contextGaugeLabels", () => {
+  it("shows peak and window when both are available", () => {
+    const { tooltip, ariaLabel } = contextGaugeLabels(25, 2048, 8192);
+    expect(tooltip).toContain("2,048");
+    expect(tooltip).toContain("8,192");
+    expect(tooltip).toContain("(25%)");
+    expect(ariaLabel).toContain("2,048");
+    expect(ariaLabel).toContain("25");
+  });
+
+  it("falls back to percent-only when window is unknown", () => {
+    const { tooltip } = contextGaugeLabels(40, undefined, null);
+    expect(tooltip).toContain("40%");
+    expect(tooltip).not.toContain("/");
+  });
+
+  it("derives peak from percent when max prompt is missing but window is set", () => {
+    const { tooltip } = contextGaugeLabels(50, undefined, 10000);
+    expect(tooltip).toContain("5,000");
+    expect(tooltip).toContain("10,000");
+  });
+});
+
+describe("getLiveStatusMessage", () => {
+  const base = {
+    questionsLength: 0,
+    pendingClarification: false,
+    isProcessing: true,
+    activeToolCalls: [] as ToolCallEntry[],
+    animatedThinkingMessage: "Thinking",
+  };
+
+  it("prefers server phase over generic thinking when processing", () => {
+    expect(
+      getLiveStatusMessage({
+        ...base,
+        phaseMessage: "Revising design",
+        animatedThinkingMessage: "Preparing the next step",
+      }),
+    ).toBe("Revising design");
+  });
+
+  it("falls back to animated thinking when no phase", () => {
+    expect(
+      getLiveStatusMessage({
+        ...base,
+        phaseMessage: null,
+        animatedThinkingMessage: "Thinking",
+      }),
+    ).toBe("Thinking");
+  });
+
+  it("prefers running plan-phase tools over phase message", () => {
+    expect(
+      getLiveStatusMessage({
+        ...base,
+        phaseMessage: "Revising design",
+        animatedThinkingMessage: "Thinking",
+        activeToolCalls: [
+          { id: "1", name: "design_review", status: "running" },
+        ],
+      }),
+    ).toBe("Design review...");
+  });
+});
 
 describe("hasRunningToolCalls", () => {
   it("returns false for completed-only tool calls", () => {

@@ -62,6 +62,7 @@ function normalizeEvent(rawType: string, rawPayload: Record<string, unknown>): U
         status: String(tool.status ?? "running") as "running" | "done",
         durationMs: tool.durationMs !== undefined ? Number(tool.durationMs) : (tool.duration_ms !== undefined ? Number(tool.duration_ms) : undefined),
         created_at: tool.created_at ? String(tool.created_at) : new Date().toISOString(),
+        synthetic: tool.synthetic === true ? true : undefined,
       },
     };
   }

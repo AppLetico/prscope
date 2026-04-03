@@ -5,7 +5,11 @@ from typing import Any
 
 from .existing_feature import format_evidence_line
 from .models import Evidence, FeatureIntent
-from .signals import BOOTSTRAP_ROUTE_REGEX, is_trustworthy_existing_feature_path
+from .signals import (
+    BOOTSTRAP_ROUTE_REGEX,
+    BOOTSTRAP_SUPPLEMENTAL_WEB_PATTERN,
+    is_trustworthy_existing_feature_path,
+)
 
 
 class DiscoveryBootstrapService:
@@ -274,7 +278,7 @@ class DiscoveryBootstrapService:
                 if sample:
                     context_lines.append(f"- `{candidate}` sample: {', '.join(sample)}")
 
-        bootstrap_patterns = [BOOTSTRAP_ROUTE_REGEX.pattern]
+        bootstrap_patterns = [BOOTSTRAP_ROUTE_REGEX.pattern, BOOTSTRAP_SUPPLEMENTAL_WEB_PATTERN]
         if feature is not None:
             bootstrap_patterns.extend(feature.patterns)
         endpoint_matches = await self._manager._run_bootstrap_tool(

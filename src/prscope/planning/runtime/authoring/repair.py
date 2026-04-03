@@ -10,11 +10,22 @@ from ....model_catalog import (
     model_prefers_compact_json,
     model_provider,
 )
+from ....pricing import context_window_for_model
 from .discovery import is_localized_frontend_request
 from .models import PlanDocument, RepairPlan, RevisionResult
 from .validation import localized_request_explicit_payload_change
 
 LlmCaller = Callable[..., Awaitable[tuple[Any, str]]]
+
+# Revise-plan user blob includes full Plan JSON + evidence; cap before LLM to avoid ContextWindowExceeded.
+_REVIEW_USER_CHAR_BUDGET_RATIO = 0.34
+_REVIEW_USER_CHARS_PER_TOKEN_EST = 3.0
+
+
+def _max_revise_user_chars_for_window(context_window: int) -> int:
+    """Heuristic max chars for the author revise user message (~34% of window as tokens * 3 chars/token)."""
+    cw = max(8_000, int(context_window))
+    return max(48_000, min(200_000, int(cw * _REVIEW_USER_CHAR_BUDGET_RATIO * _REVIEW_USER_CHARS_PER_TOKEN_EST)))
 
 
 def extract_first_json_object(raw: str) -> tuple[str, str]:
@@ -102,6 +113,20 @@ class AuthorRepairService:
         maybe = self._event_callback(event)
         if maybe is not None:
             await maybe
+
+    @staticmethod
+    def _cap_revise_plan_user_content(content: str, model_override: str | None) -> tuple[str, bool]:
+        model = (model_override or "gpt-4o").strip()
+        cw = context_window_for_model(model)
+        max_chars = _max_revise_user_chars_for_window(cw)
+        if len(content) <= max_chars:
+            return content, False
+        marker = (
+            "\n\n[Truncated by Prscope: revise prompt exceeded safe context budget for this model. "
+            "The full plan remains in the plan panel; prefer smaller edits or a new session if this persists.]\n"
+        )
+        head = max(0, max_chars - len(marker))
+        return content[:head] + marker, True
 
     @staticmethod
     def _compact_json_retry_instruction(model_override: str | None) -> str:
@@ -600,6 +625,19 @@ class AuthorRepairService:
                 f"{compact_tail}"
             ),
         }
+        raw_user = str(user_message.get("content") or "")
+        capped, truncated = self._cap_revise_plan_user_content(raw_user, model_override)
+        if truncated:
+            await self._emit(
+                {
+                    "type": "warning",
+                    "message": (
+                        "Author revise prompt was truncated to fit the model context window. "
+                        "The plan file in the UI is unchanged; only the LLM prompt was shortened."
+                    ),
+                }
+            )
+        user_message = {"role": "user", "content": capped}
         payload = await self._call_json_object(
             system_prompt=system_prompt,
             user_message=user_message,

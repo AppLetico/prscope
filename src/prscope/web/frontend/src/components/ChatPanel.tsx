@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ClarificationPrompt, DiscoveryQuestion, LiveActivityEntry, PlanFollowups, PlanningTurn, ToolCallEntry } from "../types";
 import { OptionButtons, formatOptionDisplayText } from "./OptionButtons";
-import { PLAN_PHASE_NAMES, ToolCallStream } from "./ToolCallStream";
+import { ToolCallStream } from "./ToolCallStream";
 import { ModelSelector } from "./ModelSelector";
 import {
   Send,
@@ -27,9 +27,12 @@ import remarkGfm from "remark-gfm";
 import { Tooltip } from "./ui/Tooltip";
 import { chatMarkdownComponents } from "../lib/markdownComponents";
 import {
+  contextGaugeLabels,
   buildRefinementRoundSummaries,
   collapseTimelineForDisplay,
   extractFirstJsonObject,
+  getLiveStatusMessage,
+  normalizeChatMessageForDedup,
 } from "./chatPanelUtils";
 import type { TimelineItem } from "./chatPanelUtils";
 
@@ -86,6 +89,9 @@ interface ChatPanelProps {
   canApprove?: boolean;
   critiquePending?: boolean;
   contextPercent?: number | null;
+  /** Peak prompt token count (session / token_usage); pairs with contextWindowTokens for the gauge tooltip. */
+  maxPromptTokens?: number;
+  contextWindowTokens?: number | null;
   onCritique?: () => void;
   onApprove?: () => void;
   onStop?: () => void;
@@ -125,6 +131,8 @@ export function ChatPanel({
   canApprove = false,
   critiquePending = false,
   contextPercent = null,
+  maxPromptTokens,
+  contextWindowTokens = null,
   onCritique,
   onApprove,
   onStop,
@@ -193,13 +201,16 @@ export function ChatPanel({
 
   useEffect(() => {
     if (!optimisticUserMessage) return;
-    const normalizedOptimistic = optimisticUserMessage.trim();
+    const normalizedOptimistic = normalizeChatMessageForDedup(optimisticUserMessage);
     if (!normalizedOptimistic) {
       setOptimisticUserMessage(null);
       return;
     }
     const confirmed = timeline.some(
-      (item) => item.kind === "turn" && item.turn.role === "user" && item.turn.content.trim() === normalizedOptimistic,
+      (item) =>
+        item.kind === "turn"
+        && item.turn.role === "user"
+        && normalizeChatMessageForDedup(item.turn.content) === normalizedOptimistic,
     );
     if (confirmed) {
       setOptimisticUserMessage(null);
@@ -438,27 +449,49 @@ export function ChatPanel({
     }
     if (turn.role === "author" && raw.startsWith("Updated sections:")) {
       const lines = raw.split("\n");
+      const otherPlanIdx = lines.findIndex((l) =>
+        l.startsWith("Other plan changes this round (reconciliation or pipeline"),
+      );
+      const otherPlanLine = otherPlanIdx >= 0 ? lines[otherPlanIdx] : null;
       const updatedSections = lines[0];
+      const updatedSectionsDisplay =
+        otherPlanLine
+          ? `${updatedSections}\n\n${otherPlanLine}`
+          : updatedSections.includes("(none)")
+            ? `${updatedSections}\n\nNo author-labeled sections changed this round. If the plan still changed, check the left panel — updates may be reconciliation-only (graph merge, open questions, or validation).`
+            : updatedSections;
       const problemUnderstanding = lines.find((l) => l.startsWith("Problem understanding:"))?.replace(/^Problem understanding:\s*/i, "").trim();
       const reviewPrediction = lines.find((l) => l.startsWith("Review prediction:"))?.replace(/^Review prediction:\s*/i, "").trim();
-      const howWeAddressedIdx = lines.findIndex((l) => l.startsWith("How we addressed it:"));
-      const howWeAddressed =
-        howWeAddressedIdx >= 0
+      const addressedIdx = lines.findIndex(
+        (l) =>
+          l.startsWith("Proposed updates (draft):") ||
+          l.startsWith("How we addressed it:"),
+      );
+      const reviewNotesIdx = lines.findIndex((l) => l.startsWith("Review Notes:"));
+      const addressedEnd = reviewNotesIdx >= 0 ? reviewNotesIdx : lines.length;
+      const addressedBody =
+        addressedIdx >= 0
           ? lines
-              .slice(howWeAddressedIdx + 1)
+              .slice(addressedIdx + 1, addressedEnd)
               .filter((l) => l.trim())
               .join("\n")
               .trim()
           : null;
-      const parts: string[] = [updatedSections];
-      if (howWeAddressed) {
-        parts.push(`How we addressed it:\n${howWeAddressed}`);
+      const reviewNotesLine =
+        reviewNotesIdx >= 0 ? lines.slice(reviewNotesIdx).join("\n").trim() : null;
+      const parts: string[] = [updatedSectionsDisplay];
+      if (addressedBody && addressedIdx >= 0) {
+        const header = lines[addressedIdx].startsWith("Proposed updates (draft):") ? "Proposed updates (draft):" : "How we addressed it:";
+        parts.push(`${header}\n${addressedBody}`);
       } else if (reviewPrediction) {
         parts.push(`How we addressed it: ${reviewPrediction}`);
       } else {
         const primaryIssue = refinementRoundSummaries[turn.round]?.primaryIssue;
         if (primaryIssue) parts.push(`Addressed review feedback: ${primaryIssue}`);
         else if (problemUnderstanding) parts.push(`Problem understanding: ${problemUnderstanding}`);
+      }
+      if (reviewNotesLine) {
+        parts.push(reviewNotesLine);
       }
       parts.push("Review the latest draft in the plan panel.");
       return parts.join("\n\n");
@@ -530,26 +563,25 @@ export function ChatPanel({
     }
     return null;
   }, [displayedTimeline]);
-  const liveStatusMessage = useMemo(() => {
-    if (questions.length > 0 || pendingClarification) return null;
-    const runningCalls = activeToolCalls.filter((c) => c.status === "running");
-    const hasRunning = runningCalls.length > 0;
-    const runningPlanPhase = runningCalls.find((c) => c.name in PLAN_PHASE_NAMES);
-    if (animatedThinkingMessage) return animatedThinkingMessage;
-    if (phaseMessage && isProcessing && !hasRunning) return phaseMessage;
-    if (hasRunning) {
-      if (runningPlanPhase) {
-        const label = PLAN_PHASE_NAMES[runningPlanPhase.name]?.label ?? "Working";
-        return `${label}...`;
-      }
-      return "Running tools...";
-    }
-    if (isProcessing) return "Working...";
-    return null;
-  }, [questions.length, pendingClarification, phaseMessage, animatedThinkingMessage, activeToolCalls, isProcessing]);
+  const liveStatusMessage = useMemo(
+    () =>
+      getLiveStatusMessage({
+        questionsLength: questions.length,
+        pendingClarification: Boolean(pendingClarification),
+        phaseMessage,
+        isProcessing,
+        activeToolCalls,
+        animatedThinkingMessage,
+      }),
+    [questions.length, pendingClarification, phaseMessage, animatedThinkingMessage, activeToolCalls, isProcessing],
+  );
   const visibleLiveActivities = useMemo(
     () => liveActivities.slice(-6).reverse(),
     [liveActivities],
+  );
+  const contextGauge = useMemo(
+    () => contextGaugeLabels(contextPercent, maxPromptTokens, contextWindowTokens),
+    [contextPercent, maxPromptTokens, contextWindowTokens],
   );
   const hasAgentActivity = visibleLiveActivities.length > 0 || liveStatusMessage;
   useEffect(() => {
@@ -1239,21 +1271,11 @@ export function ChatPanel({
 
             {/* Center: context gauge — prompt vs model window (token_usage SSE + session hydrate) */}
             <div className="flex items-center justify-end shrink-0 order-1 sm:order-2 mr-auto sm:mr-0 sm:flex-1 pr-1">
-              <Tooltip
-                content={
-                  contextPercent == null
-                    ? "Context fill updates after model calls or when the session loads usage data."
-                    : "Prompt size vs model context window (updates after each LLM call)."
-                }
-              >
+              <Tooltip content={contextGauge.tooltip}>
                 <div
                   className="relative w-6 h-6 flex items-center justify-center shrink-0"
                   role="img"
-                  aria-label={
-                    contextPercent == null
-                      ? "Context usage unknown"
-                      : `Context usage about ${Math.round(contextPercent)} percent`
-                  }
+                  aria-label={contextGauge.ariaLabel}
                 >
                   <svg className="w-full h-full -rotate-90" viewBox="0 0 36 36" aria-hidden>
                     <circle

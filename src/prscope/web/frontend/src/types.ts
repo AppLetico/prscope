@@ -182,6 +182,8 @@ export interface ToolCallEntry {
   status: "running" | "done";
   durationMs?: number;
   created_at?: string;
+  /** True when emitted for deterministic planner exploration (not a live LLM tool call). */
+  synthetic?: boolean;
 }
 
 export interface ToolCallGroup {

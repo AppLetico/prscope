@@ -154,6 +154,19 @@ def test_detect_framework_prefers_runtime_code_over_test_fixtures():
     assert manager._detect_framework(index) == "fastapi"
 
 
+def test_detect_framework_prefers_fastapi_over_gin_when_ts_client_uses_uppercase_verbs():
+    """Gin-style .GET( matches must not fire on non-Go files (e.g. generated TS clients)."""
+    manager = DiscoveryManager.__new__(DiscoveryManager)
+    matches = [
+        {"path": "client/api.ts", "line": 1, "text": "return client.GET('/x', opts);"},
+        {"path": "client/api.ts", "line": 2, "text": "api.POST('/y');"},
+        {"path": "src/web/api.py", "line": 1, "text": "from fastapi import FastAPI"},
+        {"path": "src/web/api.py", "line": 22, "text": "@app.get('/health')"},
+    ]
+    index = manager._build_signal_index(matches)
+    assert manager._detect_framework(index) == "fastapi"
+
+
 def test_detect_architecture_from_signal_scores():
     manager = DiscoveryManager.__new__(DiscoveryManager)
     assert manager._detect_architecture({"route": 6, "middleware": 2}) == "api_service"

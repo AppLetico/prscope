@@ -81,6 +81,16 @@ describe("impactView helpers", () => {
     });
   });
 
+  it("drops empty related_decision_ids entries", () => {
+    const issue: Pick<IssueGraphNode, "id" | "related_decision_ids"> = {
+      id: "issue_2",
+      related_decision_ids: ["", "  ", "architecture.database"],
+    };
+    const summaries = getRelatedDecisionSummaries(issue, impactView, decisionGraph);
+    expect(summaries).toHaveLength(1);
+    expect(summaries[0]?.decisionId).toBe("architecture.database");
+  });
+
   it("maps issue related decisions to labeled summaries ordered by pressure", () => {
     const issue: Pick<IssueGraphNode, "id" | "related_decision_ids"> = {
       id: "issue_2",

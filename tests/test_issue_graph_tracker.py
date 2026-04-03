@@ -45,6 +45,23 @@ def _review(*, prose: str) -> ReviewResult:
     )
 
 
+def test_resolve_issue_unknown_id_leaves_issues_open():
+    tracker = _tracker()
+    tracker.add_issue("Still open", 1, preferred_id="issue_1")
+    tracker.resolve_issue("issue_999", 2)
+    assert [i.id for i in tracker.open_issues()] == ["issue_1"]
+
+
+def test_apply_resolved_issues_list_closes_only_listed_ids():
+    """Mimics validation_review applying validation_review.resolved_issues."""
+    tracker = _tracker()
+    tracker.add_issue("first", 1, preferred_id="issue_1")
+    tracker.add_issue("second", 1, preferred_id="issue_2")
+    for issue_id in ["issue_1"]:
+        tracker.resolve_issue(issue_id, 2)
+    assert {i.id for i in tracker.open_issues()} == {"issue_2"}
+
+
 def test_canonicalization_applies_to_add_edge_and_resolve():
     tracker = _tracker()
     root = tracker.add_issue("Architecture layering violation", 1, preferred_id="issue_1")

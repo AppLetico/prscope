@@ -1,3 +1,4 @@
+import { PLAN_PHASE_NAMES } from "./ToolCallStream";
 import type { LiveActivityEntry, PlanningTurn, ToolCallEntry, ToolCallGroup } from "../types";
 
 export type TimelineItem =
@@ -154,6 +155,49 @@ export function formatToolActivityLabel(tool: ToolCallEntry): string {
   return `${toolLabel} running`;
 }
 
+/** Placeholder row in Agent Activity until first SSE; stripped when real activity arrives. */
+export const COMPOSER_PENDING_ACTIVITY_ID = "composer:pending";
+
+export type LiveStatusParams = {
+  questionsLength: number;
+  pendingClarification: boolean;
+  phaseMessage: string | null | undefined;
+  isProcessing: boolean;
+  activeToolCalls: ToolCallEntry[];
+  animatedThinkingMessage: string | null;
+};
+
+/**
+ * Status line for Agent Activity header. Server phase_message wins over generic
+ * animated "Thinking" so users see e.g. "Revising design" during long LLM phases.
+ */
+export function getLiveStatusMessage(params: LiveStatusParams): string | null {
+  const {
+    questionsLength,
+    pendingClarification,
+    phaseMessage,
+    isProcessing,
+    activeToolCalls,
+    animatedThinkingMessage,
+  } = params;
+  if (questionsLength > 0 || pendingClarification) return null;
+  const runningCalls = activeToolCalls.filter((c) => c.status === "running");
+  const hasRunning = runningCalls.length > 0;
+  const runningPlanPhase = runningCalls.find((c) => c.name in PLAN_PHASE_NAMES);
+  if (hasRunning) {
+    if (runningPlanPhase) {
+      const label = PLAN_PHASE_NAMES[runningPlanPhase.name]?.label ?? "Working";
+      return `${label}...`;
+    }
+    return "Running tools...";
+  }
+  const phaseTrimmed = typeof phaseMessage === "string" ? phaseMessage.trim() : "";
+  if (phaseTrimmed && isProcessing) return phaseTrimmed;
+  if (animatedThinkingMessage) return animatedThinkingMessage;
+  if (isProcessing) return "Working...";
+  return null;
+}
+
 export function upsertLiveActivity(
   activities: LiveActivityEntry[],
   activity: LiveActivityEntry,
@@ -305,4 +349,49 @@ export function extractFirstJsonObject(
     }
   }
   return null;
+}
+
+/** Tooltip and aria text for the composer context ring (peak prompt vs model window). */
+export function contextGaugeLabels(
+  contextPercent: number | null,
+  maxPromptTokens?: number,
+  contextWindowTokens?: number | null,
+): { tooltip: string; ariaLabel: string } {
+  if (contextPercent == null) {
+    return {
+      tooltip: "Context fill updates after model calls or when the session loads usage data.",
+      ariaLabel: "Context usage unknown",
+    };
+  }
+  const pct = Math.min(100, Math.max(0, Math.round(contextPercent)));
+  const window =
+    typeof contextWindowTokens === "number" && contextWindowTokens > 0 ? contextWindowTokens : null;
+  let peak: number | null =
+    typeof maxPromptTokens === "number" && maxPromptTokens >= 0 ? maxPromptTokens : null;
+  if (peak == null && window != null) {
+    peak = Math.round((pct / 100) * window);
+  }
+  if (window != null && peak != null) {
+    const peakStr = peak.toLocaleString();
+    const windowStr = window.toLocaleString();
+    return {
+      tooltip: `${peakStr} / ${windowStr} tokens (${pct}%). Updates after each LLM call.`,
+      ariaLabel: `Peak prompt ${peakStr} of ${windowStr} tokens, ${pct} percent of context window`,
+    };
+  }
+  return {
+    tooltip: `${pct}% of model context window. Updates after each LLM call.`,
+    ariaLabel: `About ${pct} percent of model context window used`,
+  };
+}
+
+/** Collapse whitespace/newlines so optimistic user bubble matches persisted server turn. */
+export function normalizeChatMessageForDedup(raw: string): string {
+  return raw
+    .trim()
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .map((line) => line.replace(/[ \t]+/g, " ").trim())
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n");
 }
