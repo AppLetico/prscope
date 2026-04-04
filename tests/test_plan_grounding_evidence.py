@@ -9,6 +9,7 @@ from prscope.planning.runtime.authoring.discovery import (
 )
 from prscope.planning.runtime.authoring.models import EvidenceBundle
 from prscope.planning.runtime.authoring.pipeline import AuthorPlannerPipeline
+from prscope.planning.runtime.authoring.planner_paths import planner_verified_file_paths
 from prscope.planning.runtime.authoring.validation import AuthorValidationService
 
 
@@ -95,6 +96,45 @@ def test_build_files_changed_evidence_allowlist_includes_http_hints() -> None:
     )
     assert allow is not None
     assert "src/prscope/benchmark.py" in allow
+
+
+def test_planner_verified_file_paths_dedupes_and_limits() -> None:
+    from types import SimpleNamespace
+
+    ru = SimpleNamespace(
+        relevant_modules=[f"m{i}.py" for i in range(45)],
+        relevant_tests=(),
+        file_contents={},
+        entrypoints=(),
+        core_modules=(),
+    )
+    assert len(planner_verified_file_paths(ru, limit=40)) == 40
+
+
+def test_planner_files_changed_allowlist_union_includes_verified_paths() -> None:
+    """Paths in Verified File Paths (file_contents) must pass Files Changed subset check when merged."""
+    from types import SimpleNamespace
+
+    ru = SimpleNamespace(
+        relevant_modules=("src/a.py",),
+        relevant_tests=(),
+        file_contents={"src/prscope/config.py": "x"},
+        entrypoints=(),
+        core_modules=(),
+    )
+    base = AuthorValidationService.build_files_changed_evidence_allowlist(
+        relevant_files=("src/a.py",),
+        test_targets=("tests/t.py",),
+        related_modules=(),
+        http_client_hints=(),
+        grounding_paths=set(),
+    )
+    assert base is not None
+    assert "src/prscope/config.py" not in base
+    merged = base | set(planner_verified_file_paths(ru, limit=40))
+    assert "src/prscope/config.py" in merged
+    md = "## Files Changed\n- `src/prscope/config.py`\n"
+    assert not AuthorValidationService.files_changed_subset_failures(md, merged)
 
 
 def test_localized_frontend_owner_paths_empty_for_api_key_prompt() -> None:

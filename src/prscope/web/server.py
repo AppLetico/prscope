@@ -98,6 +98,7 @@ def setup_logging() -> None:
 
     # Intercept standard logging
     logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
+    logging.getLogger("LiteLLM").setLevel(logging.WARNING)
 
     # Intercept uvicorn loggers
     for logger_name in ("uvicorn", "uvicorn.access", "uvicorn.error", "fastapi"):

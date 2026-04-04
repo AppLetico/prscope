@@ -87,6 +87,7 @@ INTELLIGENCE = {
     "planning.runtime.authoring.validation",
     "planning.runtime.authoring.repair",
     "planning.runtime.authoring.pipeline",
+    "planning.runtime.authoring.planner_paths",
     "planning.runtime.critic",
     "planning.runtime.tools",
     "planning.runtime.llm_retry",

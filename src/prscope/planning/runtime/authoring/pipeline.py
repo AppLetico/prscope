@@ -22,6 +22,7 @@ from .models import (
     RepoUnderstanding,
     ValidationResult,
 )
+from .planner_paths import planner_verified_file_paths
 from .validation import AuthorValidationService, localized_request_explicit_payload_change
 
 logger = logging.getLogger(__name__)
@@ -305,6 +306,11 @@ class AuthorPlannerPipeline:
                 hints.append(text.replace("must reference", "should explicitly reference"))
             elif text.startswith("replace unverified path "):
                 hints.append(text)
+            elif text.startswith("Files Changed paths outside evidence allowlist"):
+                hints.append(
+                    "Under ## Files Changed, list only task-relevant paths that appear in Verified File Paths "
+                    "or Structured Evidence for this attempt, or that the user explicitly named in requirements."
+                )
         return tuple(dict.fromkeys(hints))
 
     @staticmethod
@@ -719,6 +725,8 @@ class AuthorPlannerPipeline:
             grounding_paths=set(grounding_paths or set()),
             requirements_text=requirements,
         )
+        if files_changed_allowlist is not None:
+            files_changed_allowlist |= set(planner_verified_file_paths(repo_understanding, limit=40))
 
         await self._emit_progress(
             stage="planner_draft",

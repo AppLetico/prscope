@@ -43,6 +43,7 @@ from .authoring.models import (
     render_markdown as _render_markdown,
 )
 from .authoring.pipeline import AuthorPlannerPipeline
+from .authoring.planner_paths import planner_verified_file_paths
 from .authoring.repair import AuthorRepairService, extract_first_json_object, parse_plan_document
 from .authoring.validation import AuthorValidationService
 from .context import TokenBudgetManager, estimate_tokens
@@ -673,21 +674,8 @@ class AuthorAgent:
         planner_complexity: str | None = None,
     ) -> str:
         system_prompt = PLANNER_SYSTEM_PROMPT if draft_phase == "planner" else REFINER_SYSTEM_PROMPT
-        prioritized_verified_paths: list[str] = []
-        for group in (
-            repo_understanding.relevant_modules,
-            repo_understanding.relevant_tests,
-            list(repo_understanding.file_contents.keys()),
-            repo_understanding.entrypoints,
-            repo_understanding.core_modules,
-        ):
-            for path in group:
-                normalized = str(path).strip()
-                if normalized and normalized not in prioritized_verified_paths:
-                    prioritized_verified_paths.append(normalized)
-        verified_paths_block = (
-            "\n".join(f"- `{path}`" for path in prioritized_verified_paths[:40]) or "- (none captured)"
-        )
+        prioritized_verified_paths = planner_verified_file_paths(repo_understanding, limit=40)
+        verified_paths_block = "\n".join(f"- `{path}`" for path in prioritized_verified_paths) or "- (none captured)"
         evidence_payload = {
             "relevant_files": list((evidence_bundle.relevant_files if evidence_bundle else ())[:12]),
             "existing_components": list((evidence_bundle.existing_components if evidence_bundle else ())[:12]),

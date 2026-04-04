@@ -17,6 +17,7 @@ In `prscope`, the harness is the operational envelope around planning agents and
 - **Persistence**: SQLite session row as canonical UI state, turns as audit log
 - **Tool/runtime telemetry**: tool call/result events and token/cost metrics
 - **Benchmark harness**: repeatable startup + quality checks against the same API surface
+- **UI projection**: the web app may augment persisted plan markdown for display (decision graph); exported files use persisted content—see [docs/FRONTEND.md](./FRONTEND.md#persisted-plan-vs-live-ui).
 
 ## Architecture and Ownership
 
@@ -68,7 +69,8 @@ Core components:
   - Decision graph extraction, merge, and follow-up generation
   - Persisted plan artifacts include `decision_graph_json` and `followups_json`
 - `src/prscope/planning/runtime/authoring/*`
-  - Author subsystem: `models`, `discovery`, `validation`, `repair`, `pipeline`
+  - Author subsystem: `models`, `discovery`, `validation`, `repair`, `pipeline`, `planner_paths`
+  - Planner **Verified File Paths** and the **Files Changed** subset check share the same path ordering via `planner_verified_file_paths()`; the pipeline unions evidence-derived allowlist entries with that set so paths shown to the model are valid under Files Changed validation.
 - `src/prscope/store.py`
   - Session schema fields for canonical UI state (`status`, `phase_message`, `pending_questions_json`, etc.)
   - Runtime guard preventing direct writes to protected state fields

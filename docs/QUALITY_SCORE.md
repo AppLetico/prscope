@@ -27,7 +27,7 @@ Grading: **A** = solid, well-tested, documented | **B** = functional, minor gaps
 ### High Priority
 
 - [x] Component unit tests for `ActionBar` and `PlanPanel` (`src/prscope/web/frontend/src/components/*.test.ts`).
-- [ ] `ToolCallStream` — no dedicated unit tests; behavior covered indirectly via `PlanningView` / integration only.
+- [x] `ToolCallStream` — Vitest + Testing Library (`src/prscope/web/frontend/src/components/ToolCallStream.test.tsx`); jsdom test env in `vite.config.ts`.
 - [x] Tier 1 Playwright smoke in CI (`src/prscope/web/frontend/e2e/`).
 - [ ] **Full-stack integration** (create session → draft → refinement round) with real API keys — optional / manual; main blind spot for UI ↔ API ↔ provider regressions.
 - [ ] `orchestration.py` is still the largest runtime module (~1.2k+ lines). Continue incremental splits into `orchestration_support/*` as seams clear. **Same for** `web/api.py` (thin route modules per area when touching files).

@@ -133,6 +133,12 @@ The frontend handles `409` responses gracefully — they indicate the session is
 - `decisionGraphRender.ts` injects graph-backed architecture decisions and unresolved questions that may not yet be reflected in prose.
 - When the graph has edges (or at least two nodes) and the Architecture section does not already contain a ` ```mermaid ` fence, a **Decision map (auto)** subsection is appended with deterministic Mermaid from `decision_graph` (no LLM).
 
+### Persisted plan vs live UI
+
+- **Live `PlanPanel`** runs `augmentPlanMarkdownWithDecisionGraph()` on the persisted plan body so reviewers see **Decision State**, optional **Decision map (auto)** Mermaid, and appended **Open Questions** that are derived from structured `decision_graph` data.
+- **Exported artifacts** (for example `render_prd()` in `src/prscope/planning/render.py` and the `plan.md.j2` template) use **stored** `plan_content` (and related JSON) from the database. They do **not** automatically include those client-side augmentations unless the export path is extended to mirror them server-side.
+- Treat **persisted markdown + artifacts** as the canonical text for commits and benchmarks; treat **UI-only injections** as a read-time projection for clarity.
+
 ### Mermaid diagrams in plans
 
 - Plan markdown uses **Mermaid** (lazy-loaded in [`mermaidRender.ts`](src/prscope/web/frontend/src/lib/mermaidRender.ts)) with `securityLevel: "loose"` because plan text is session-local/trusted in normal use; do not treat as safe for untrusted multi-tenant HTML.

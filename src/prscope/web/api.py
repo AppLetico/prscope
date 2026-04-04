@@ -1293,8 +1293,9 @@ def create_app() -> FastAPI:
                     }
                 )
             logger.info(
-                "command conflict session_id={} command={} reason=invalid_status detail={}",
+                "command conflict session_id={} command_id={} command={} reason=invalid_status detail={}",
                 session_id,
+                command_id,
                 command,
                 str(exc),
             )
@@ -1311,8 +1312,9 @@ def create_app() -> FastAPI:
                     }
                 )
             logger.info(
-                "command conflict session_id={} command={} reason={} status={} phase_message={}",
+                "command conflict session_id={} command_id={} command={} reason={} status={} phase_message={}",
                 session_id,
+                command_id,
                 command,
                 exc.reason,
                 detail.get("status", ""),
@@ -1329,7 +1331,11 @@ def create_app() -> FastAPI:
                     _, _, runtime = _runtime_for(repo_name=session.repo_name)
                     runtime.persist_state_snapshot(session_id)
                 except Exception:  # noqa: BLE001
-                    logger.debug("failed to persist snapshot for command failure session_id={}", session_id)
+                    logger.debug(
+                        "failed to persist snapshot for command failure session_id={} command_id={}",
+                        session_id,
+                        command_id,
+                    )
             detail: dict[str, Any] = {"reason": "command_failed", "detail": message}
             if session is not None:
                 detail.update(
@@ -1340,8 +1346,9 @@ def create_app() -> FastAPI:
                     }
                 )
             logger.info(
-                "command conflict session_id={} command={} reason=command_failed detail={}",
+                "command conflict session_id={} command_id={} command={} reason=command_failed detail={}",
                 session_id,
+                command_id,
                 command,
                 message,
             )
@@ -1456,8 +1463,9 @@ def create_app() -> FastAPI:
                             rebuild_memory=payload.rebuild_memory,
                         )
                         logger.info(
-                            "api.sessions draft complete session_id={} elapsed_s={:.3f}",
+                            "api.sessions draft complete session_id={} command_id={} elapsed_s={:.3f}",
                             session.id,
+                            f"initial-draft:{session.id}",
                             time.perf_counter() - draft_started,
                         )
                         timing = registry._ensure_session_timing(session.id, store=store)
@@ -1469,8 +1477,9 @@ def create_app() -> FastAPI:
                         registry._persist_session_timing(session.id, timing, store=store)
                     except Exception as exc:  # noqa: BLE001
                         logger.error(
-                            "api.sessions draft failed session_id={} elapsed_s={:.3f} error={}",
+                            "api.sessions draft failed session_id={} command_id={} elapsed_s={:.3f} error={}",
                             session.id,
+                            f"initial-draft:{session.id}",
                             time.perf_counter() - draft_started,
                             exc,
                         )
