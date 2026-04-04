@@ -28,7 +28,7 @@ from .author import (
     RevisionResult,
 )
 from .context import ClarificationGate, ContextAssembler, CritiqueCompressor
-from .critic import CriticAgent, CriticResult, ImplementabilityResult, ReviewResult
+from .critic import CriticAgent, CriticResult, ImplementabilityResult, ReviewResult, hydrate_review_result
 from .discovery import DiscoveryManager, DiscoveryTurnResult
 from .discovery_support import RefinementEvidenceRefresh, RefinementEvidenceRefreshResult
 from .events import ToolEventStateManager
@@ -316,6 +316,9 @@ class PlanningRuntime:
                 fp = snapshot.get("last_critic_turn_plan_fingerprint")
                 if isinstance(fp, str) and fp.strip():
                     state.last_critic_turn_plan_fingerprint = fp.strip()
+                hydrated_review = hydrate_review_result(snapshot.get("review"))
+                if hydrated_review is not None:
+                    state.review = hydrated_review
             self._states[session_id] = state
             if len(self._states) > MAX_STATE_CACHE:
                 oldest_session_id = next(iter(self._states))
@@ -1070,6 +1073,7 @@ class PlanningRuntime:
             ctx=ctx,
             current_plan_content=current_plan_content,
             emit_tool=emit_tool,
+            same_round_repeat=ctx.same_round_repeat,
         )
 
     async def _stage_repair_plan(
@@ -1140,11 +1144,42 @@ class PlanningRuntime:
         author_model_override: str | None = None,
         critic_model_override: str | None = None,
         event_callback: Any | None = None,
+        *,
+        skip_validation_review: bool = False,
     ) -> tuple[CriticResult, AuthorResult, ConvergenceResult]:
         return await self._round_entry.run_adversarial_round(
             session_id=session_id,
             user_input=user_input,
             refinement_evidence=refinement_evidence,
+            author_model_override=author_model_override,
+            critic_model_override=critic_model_override,
+            event_callback=event_callback,
+            skip_validation_review=skip_validation_review,
+        )
+
+    async def run_critique(
+        self,
+        session_id: str,
+        author_model_override: str | None = None,
+        critic_model_override: str | None = None,
+        event_callback: Any | None = None,
+    ) -> Any:
+        return await self._round_entry.run_critique_only(
+            session_id=session_id,
+            author_model_override=author_model_override,
+            critic_model_override=critic_model_override,
+            event_callback=event_callback,
+        )
+
+    async def apply_critique(
+        self,
+        session_id: str,
+        author_model_override: str | None = None,
+        critic_model_override: str | None = None,
+        event_callback: Any | None = None,
+    ) -> tuple[CriticResult, AuthorResult, ConvergenceResult]:
+        return await self._round_entry.run_apply_critique(
+            session_id=session_id,
             author_model_override=author_model_override,
             critic_model_override=critic_model_override,
             event_callback=event_callback,

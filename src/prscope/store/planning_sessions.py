@@ -297,6 +297,7 @@ class StorePlanningSessionsMixin:
         active_tool_calls_json: str | None | object = _UNSET,
         completed_tool_call_groups_json: str | None | object = _UNSET,
         current_command_id: str | None | object = _UNSET,
+        critique_pending_apply: int | None = None,
     ) -> PlanningSession:
         """Update mutable fields on a planning session."""
         if not _bypass_protection:
@@ -382,6 +383,9 @@ class StorePlanningSessionsMixin:
         if current_command_id is not _UNSET:
             updates.append("current_command_id = ?")
             params.append(current_command_id)
+        if critique_pending_apply is not None:
+            updates.append("critique_pending_apply = ?")
+            params.append(int(bool(critique_pending_apply)))
 
         updates.append("updated_at = ?")
         params.append(self._now())

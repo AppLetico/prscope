@@ -949,8 +949,25 @@ def create_app() -> FastAPI:
 
     COMMAND_MATRIX: dict[str, set[str]] = {
         "draft": {"message", "reset", "export"},
-        "refining": {"run_round", "reset", "message", "followup_answer", "export"},
-        "converged": {"run_round", "approve", "reset", "message", "followup_answer", "export"},
+        "refining": {
+            "run_round",
+            "run_critique",
+            "apply_critique",
+            "reset",
+            "message",
+            "followup_answer",
+            "export",
+        },
+        "converged": {
+            "run_round",
+            "run_critique",
+            "apply_critique",
+            "approve",
+            "reset",
+            "message",
+            "followup_answer",
+            "export",
+        },
         "approved": {"export", "reset"},
         "error": {"reset"},
     }
@@ -1059,6 +1076,58 @@ def create_app() -> FastAPI:
             await runtime.run_adversarial_round(
                 session_id=ctx.session_id,
                 user_input=payload.get("user_input"),
+                author_model_override=author_model,
+                critic_model_override=critic_model,
+                event_callback=callback,
+            )
+            return HandlerResult()
+
+        async def _run_critique(ctx: CommandContext) -> HandlerResult:
+            session = ctx.store.get_planning_session(ctx.session_id)
+            if session is None:
+                raise ValueError("session not found")
+            author_model = _validated_model_or_400(
+                payload.get("author_model") or session.author_model,
+                "author",
+            )
+            critic_model = _validated_model_or_400(
+                payload.get("critic_model") or session.critic_model,
+                "critic",
+            )
+
+            async def callback(event: dict[str, Any]) -> None:
+                enriched = dict(event)
+                enriched.setdefault("command_id", command_id)
+                await _emit_session_event(ctx.session_id, enriched)
+
+            await runtime.run_critique(
+                session_id=ctx.session_id,
+                author_model_override=author_model,
+                critic_model_override=critic_model,
+                event_callback=callback,
+            )
+            return HandlerResult()
+
+        async def _apply_critique(ctx: CommandContext) -> HandlerResult:
+            session = ctx.store.get_planning_session(ctx.session_id)
+            if session is None:
+                raise ValueError("session not found")
+            author_model = _validated_model_or_400(
+                payload.get("author_model") or session.author_model,
+                "author",
+            )
+            critic_model = _validated_model_or_400(
+                payload.get("critic_model") or session.critic_model,
+                "critic",
+            )
+
+            async def callback(event: dict[str, Any]) -> None:
+                enriched = dict(event)
+                enriched.setdefault("command_id", command_id)
+                await _emit_session_event(ctx.session_id, enriched)
+
+            await runtime.apply_critique(
+                session_id=ctx.session_id,
                 author_model_override=author_model,
                 critic_model_override=critic_model,
                 event_callback=callback,
@@ -1236,6 +1305,7 @@ def create_app() -> FastAPI:
                 converged_early=0,
                 last_commands_json=json.dumps({}),
                 current_command_id=None,
+                critique_pending_apply=0,
             )
             registry._session_timing.pop(ctx.session_id, None)
             return HandlerResult(metadata={"reset": True})
@@ -1257,6 +1327,8 @@ def create_app() -> FastAPI:
 
         handlers: dict[str, Any] = {
             "run_round": _run_round,
+            "run_critique": _run_critique,
+            "apply_critique": _apply_critique,
             "message": _message,
             "followup_answer": _followup_answer,
             "approve": _approve,

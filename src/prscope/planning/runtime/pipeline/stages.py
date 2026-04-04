@@ -9,6 +9,7 @@ import logging
 import re
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any, Literal
 
 from ....config import PlanningConfig
@@ -18,7 +19,14 @@ from ..acceptance_contract import (
     compute_harness_convergence_gates,
     verify_convergence_postcondition,
 )
-from ..author import PlanDocument, RepairPlan, RepoUnderstanding, RevisionResult, apply_section_updates, render_markdown
+from ..author import (
+    PlanDocument,
+    RepairPlan,
+    RepoUnderstanding,
+    RevisionResult,
+    apply_section_updates,
+    render_markdown,
+)
 from ..authoring.discovery import (
     PRSCOPE_HTTP_CLIENT_HINTS,
     is_localized_frontend_request,
@@ -124,6 +132,23 @@ class PlanningStages:
             http_client_hints=hints,
             requirements_text=requirements,
         )
+
+    @staticmethod
+    def _merge_refinement_allowlist_with_verified_paths(
+        base: set[str] | None,
+        verified_paths: set[str],
+    ) -> set[str] | None:
+        """Union repo-derived allowlist with session-verified paths (tool reads + prior plan refs).
+
+        Without this, ``validate_refinement_result`` can reject Files Changed entries that the
+        session already anchored on but the narrow module/test allowlist omitted—blocking Apply
+        with 'outside evidence allowlist' despite recoverable grounding.
+        """
+        if base is None:
+            return None
+        merged = set(base)
+        merged |= {str(p).strip() for p in verified_paths if str(p).strip()}
+        return merged
 
     def _convergence_signals(
         self,
@@ -488,6 +513,29 @@ class PlanningStages:
         )
 
     @staticmethod
+    def _merge_revision_repo_understanding_with_session(
+        session_ru: RepoUnderstanding | None,
+        revision_ru: RepoUnderstanding,
+        *,
+        max_relevant_tests: int = 20,
+    ) -> RepoUnderstanding:
+        """
+        Revision-time RepoUnderstanding is derived only from verified paths + the prior plan, so
+        `relevant_tests` can be a narrow subset. Merge in discovery/session `relevant_tests` so
+        missing-test-target validation, deterministic supplements, and incremental grounding agree
+        with the gate that lists candidate paths from the full session understanding.
+        """
+        if session_ru is None:
+            return revision_ru
+        base_tests = [str(p).strip() for p in (getattr(session_ru, "relevant_tests", None) or []) if str(p).strip()]
+        if not base_tests:
+            return revision_ru
+        merged = sorted(set(revision_ru.relevant_tests) | set(base_tests))
+        if merged == list(revision_ru.relevant_tests):
+            return revision_ru
+        return replace(revision_ru, relevant_tests=merged[:max_relevant_tests])
+
+    @staticmethod
     def _refinement_evidence_confidence(
         *,
         verified_paths: set[str],
@@ -742,6 +790,7 @@ class PlanningStages:
         requirements: str,
         verified_paths: set[str],
         supplemental_evidence: dict[str, Any] | None,
+        repo_understanding: RepoUnderstanding | None = None,
     ) -> tuple[str, ...]:
         current_refs = [
             str(path).strip()
@@ -766,6 +815,15 @@ class PlanningStages:
         )
         ordered = list(dict.fromkeys([*current_refs, *evidence_refs, *verified_test_paths]))
         lowered_requirements = str(requirements or "").lower()
+        wants_test_gate = any(tok in lowered_requirements for tok in ("test", "tests", "coverage", "regression"))
+        repo_rt: list[str] = []
+        if repo_understanding is not None and wants_test_gate:
+            repo_rt = sorted(
+                str(p).strip() for p in (getattr(repo_understanding, "relevant_tests", None) or []) if str(p).strip()
+            )
+        if repo_rt:
+            # Match AuthorValidationService.missing_test_target_failures: cite at least one relevant_tests path.
+            ordered = list(dict.fromkeys([*repo_rt[:3], *ordered]))
         if (
             not ordered
             and "cache" in lowered_requirements
@@ -986,6 +1044,7 @@ class PlanningStages:
         localized_detail_preserver: Any,
         verified_paths: set[str] | None = None,
         supplemental_evidence: dict[str, Any] | None = None,
+        repo_understanding: RepoUnderstanding | None = None,
     ) -> PlanDocument:
         stabilized = cls._restore_required_refinement_sections(plan=plan, current_plan=current_plan)
         preferred_owner_paths = cls._preferred_owner_paths(
@@ -999,6 +1058,7 @@ class PlanningStages:
             requirements=requirements,
             verified_paths=set(verified_paths or set()),
             supplemental_evidence=supplemental_evidence,
+            repo_understanding=repo_understanding,
         )
         stabilized = cls._preserve_verified_owner_paths(
             plan=stabilized,
@@ -1423,6 +1483,21 @@ class PlanningStages:
             review_prediction=revision_result.review_prediction,
         )
 
+    def _refinement_failures_with_grounding(
+        self,
+        *,
+        plan_markdown: str,
+        refinement_failure_messages: list[str],
+        previous_plan_content: str,
+        verified_paths: set[str],
+    ) -> list[str]:
+        grounding = self._author.incremental_grounding_failures(
+            previous_plan_content=previous_plan_content,
+            updated_plan_content=plan_markdown,
+            verified_paths=verified_paths,
+        )
+        return [*grounding, *refinement_failure_messages]
+
     def _autofix_refinement_plan_to_valid(
         self,
         *,
@@ -1432,12 +1507,13 @@ class PlanningStages:
         ctx: PlanningRoundContext,
         revision_repo_understanding: RepoUnderstanding,
         verified_paths: set[str],
+        previous_plan_content: str,
         supplemental_evidence: dict[str, Any] | None,
-        max_rounds: int = 6,
+        max_rounds: int = 12,
     ) -> tuple[PlanDocument, str, RevisionResult]:
         """
-        Stabilize + patch + validate; on retryable failures, run supplement (same as in-loop repair)
-        until the draft passes or we exhaust rounds. Avoids surfacing command_failed for fixable gates.
+        Stabilize + patch + validate; on failures, always run deterministic supplement (do not bail
+        on retryable=False) until the draft passes or rounds exhaust, then one consolidated pass.
         """
         plan = updated_plan
         rr = revision_result
@@ -1450,6 +1526,7 @@ class PlanningStages:
                 localized_detail_preserver=self._preserve_localized_refinement_detail,
                 verified_paths=verified_paths,
                 supplemental_evidence=supplemental_evidence,
+                repo_understanding=revision_repo_understanding,
             )
             plan = patch_plan_document_localized_backend_grounding(plan, revision_repo_understanding, ctx.requirements)
             # Patch only mutates Files Changed; re-sync Implementation Steps so validation cannot
@@ -1461,22 +1538,100 @@ class PlanningStages:
                 repo_understanding=revision_repo_understanding,
                 verified_paths_extra=verified_paths,
                 requirements_text=ctx.requirements,
-                files_changed_allowlist=self._refinement_files_changed_allowlist(
-                    ctx.requirements, revision_repo_understanding
+                files_changed_allowlist=self._merge_refinement_allowlist_with_verified_paths(
+                    self._refinement_files_changed_allowlist(ctx.requirements, revision_repo_understanding),
+                    verified_paths,
                 ),
             )
-            if not val.failure_messages:
+            merged_failures = self._refinement_failures_with_grounding(
+                plan_markdown=md,
+                refinement_failure_messages=list(val.failure_messages),
+                previous_plan_content=previous_plan_content,
+                verified_paths=verified_paths,
+            )
+            if not merged_failures:
                 rr = self._merge_revision_result_with_plan(rr, current_plan_doc, plan)
                 return plan, md, rr
-            last_detail = "; ".join(val.failure_messages)
-            if not val.retryable:
-                raise ValueError(last_detail)
+            last_detail = "; ".join(merged_failures)
+            if not val.retryable and val.failure_messages:
+                _LOG.debug(
+                    "Refinement validation marked non-retryable; continuing with supplement anyway: %s",
+                    last_detail[:500],
+                )
             plan = self._supplement_refinement_plan(
                 plan=plan,
-                failures=list(val.failure_messages),
+                failures=merged_failures,
                 requirements=ctx.requirements,
             )
-        raise ValueError("Plan draft could not be auto-repaired to pass validation checks. " + last_detail)
+        # Consolidated pass after exhausting rounds.
+        plan = self._stabilize_refinement_plan(
+            plan=plan,
+            current_plan=current_plan_doc,
+            requirements=ctx.requirements,
+            localized_detail_preserver=self._preserve_localized_refinement_detail,
+            verified_paths=verified_paths,
+            supplemental_evidence=supplemental_evidence,
+            repo_understanding=revision_repo_understanding,
+        )
+        plan = patch_plan_document_localized_backend_grounding(plan, revision_repo_understanding, ctx.requirements)
+        plan = self._restore_missing_implementation_refs(plan=plan, current_plan=current_plan_doc)
+        md = render_markdown(plan)
+        val = self._author.validate_refinement_result(
+            plan_content=md,
+            repo_understanding=revision_repo_understanding,
+            verified_paths_extra=verified_paths,
+            requirements_text=ctx.requirements,
+            files_changed_allowlist=self._merge_refinement_allowlist_with_verified_paths(
+                self._refinement_files_changed_allowlist(ctx.requirements, revision_repo_understanding),
+                verified_paths,
+            ),
+        )
+        merged_failures = self._refinement_failures_with_grounding(
+            plan_markdown=md,
+            refinement_failure_messages=list(val.failure_messages),
+            previous_plan_content=previous_plan_content,
+            verified_paths=verified_paths,
+        )
+        if merged_failures:
+            plan = self._supplement_refinement_plan(
+                plan=plan,
+                failures=merged_failures,
+                requirements=ctx.requirements,
+            )
+            plan = self._stabilize_refinement_plan(
+                plan=plan,
+                current_plan=current_plan_doc,
+                requirements=ctx.requirements,
+                localized_detail_preserver=self._preserve_localized_refinement_detail,
+                verified_paths=verified_paths,
+                supplemental_evidence=supplemental_evidence,
+                repo_understanding=revision_repo_understanding,
+            )
+            plan = patch_plan_document_localized_backend_grounding(plan, revision_repo_understanding, ctx.requirements)
+            plan = self._restore_missing_implementation_refs(plan=plan, current_plan=current_plan_doc)
+            md = render_markdown(plan)
+            val = self._author.validate_refinement_result(
+                plan_content=md,
+                repo_understanding=revision_repo_understanding,
+                verified_paths_extra=verified_paths,
+                requirements_text=ctx.requirements,
+                files_changed_allowlist=self._merge_refinement_allowlist_with_verified_paths(
+                    self._refinement_files_changed_allowlist(ctx.requirements, revision_repo_understanding),
+                    verified_paths,
+                ),
+            )
+            merged_failures = self._refinement_failures_with_grounding(
+                plan_markdown=md,
+                refinement_failure_messages=list(val.failure_messages),
+                previous_plan_content=previous_plan_content,
+                verified_paths=verified_paths,
+            )
+        if not merged_failures:
+            rr = self._merge_revision_result_with_plan(rr, current_plan_doc, plan)
+            return plan, md, rr
+        last_detail = "; ".join(merged_failures)
+        _LOG.warning("Refinement draft could not be auto-repaired after max rounds: %s", last_detail[:800])
+        raise ValueError(last_detail)
 
     def _confirmed_constraint_violations(
         self,
@@ -1500,12 +1655,20 @@ class PlanningStages:
         ctx: PlanningRoundContext,
         current_plan_content: str,
         emit_tool: Callable[..., Any],
+        same_round_repeat: bool = False,
     ) -> ReviewResult:
-        snapshot = ctx.core.transition_and_snapshot(
-            "refining",
-            phase_message="Running design review",
-            current_round=ctx.round_number,
-        )
+        if same_round_repeat:
+            snapshot = ctx.core.transition_and_snapshot(
+                "refining",
+                phase_message="Running design review",
+                allow_round_stability=True,
+            )
+        else:
+            snapshot = ctx.core.transition_and_snapshot(
+                "refining",
+                phase_message="Running design review",
+                current_round=ctx.round_number,
+            )
         await self._emit_event(ctx.event_callback, snapshot, ctx.session_id)
         review_mode: Literal["initial", "validation", "stabilization", "implementability"] = "initial"
         architecture_change_count = int(ctx.state.architecture_change_count)
@@ -1693,14 +1856,7 @@ class PlanningStages:
                 )
                 ctx.state.design_record = self._design_record_from_payload(updated_record)
             except Exception as exc:  # noqa: BLE001
-                await self._emit_event(
-                    ctx.event_callback,
-                    {
-                        "type": "warning",
-                        "message": f"Design record update failed; continuing with existing record: {exc}",
-                    },
-                    ctx.session_id,
-                )
+                _LOG.warning("Design record update failed; continuing with existing record: %s", exc)
         repair_plan = await self._author.plan_repair(
             review=review_result,
             plan=current_plan_doc,
@@ -1736,21 +1892,18 @@ class PlanningStages:
             accepted = {item.strip() for item in repair_plan.accepted_issues}
             rejected = {item.strip() for item in repair_plan.rejected_issues}
             unresolved_must_fix = [item for item in must_fix_issues if item not in accepted and item not in rejected]
-            for unresolved in unresolved_must_fix:
-                ctx.issue_tracker.add_issue(
-                    f"Must-fix unresolved without rationale: {unresolved}",
-                    ctx.round_number,
-                    severity=review_issue_severity("must_fix"),  # type: ignore[arg-type]
-                )
-                await self._emit_event(
-                    ctx.event_callback,
-                    {
-                        "type": "warning",
-                        "message": (
-                            f"Must-fix issue remained unresolved without explicit rejection rationale: {unresolved}"
-                        ),
-                    },
-                    ctx.session_id,
+            if unresolved_must_fix:
+                # Record explicit pipeline-side rejections so the repair plan can proceed without
+                # another LLM round; avoids noisy SSE warnings and duplicate chat surfaces.
+                repair_plan = replace(
+                    repair_plan,
+                    rejected_issues=[*repair_plan.rejected_issues, *unresolved_must_fix],
+                    repair_strategy=(
+                        repair_plan.repair_strategy
+                        + "\n\n"
+                        + "[Pipeline] Must-fix items explicitly deferred to the following revision pass "
+                        "(auto-recorded rejection so the pipeline can proceed)."
+                    ),
                 )
         await emit_tool(
             "repair_planning",
@@ -1803,6 +1956,11 @@ class PlanningStages:
             verified_paths=verified_paths,
             previous_plan_content=previous_plan_content,
         )
+        revision_repo_understanding = self._merge_revision_repo_understanding_with_session(
+            ctx.state.repo_understanding,
+            revision_repo_understanding,
+        )
+        verified_paths |= set(revision_repo_understanding.relevant_tests)
         refinement_fc_allowlist = self._refinement_files_changed_allowlist(
             ctx.requirements, revision_repo_understanding
         )
@@ -1811,7 +1969,9 @@ class PlanningStages:
             repo_understanding=revision_repo_understanding,
             verified_paths_extra=verified_paths,
             requirements_text=ctx.requirements,
-            files_changed_allowlist=refinement_fc_allowlist,
+            files_changed_allowlist=self._merge_refinement_allowlist_with_verified_paths(
+                refinement_fc_allowlist, verified_paths
+            ),
         )
         missing_section_failures = [
             failure
@@ -1874,6 +2034,11 @@ class PlanningStages:
                         verified_paths=verified_paths,
                         previous_plan_content=previous_plan_content,
                     )
+                    revision_repo_understanding = self._merge_revision_repo_understanding_with_session(
+                        ctx.state.repo_understanding,
+                        revision_repo_understanding,
+                    )
+                    verified_paths |= set(revision_repo_understanding.relevant_tests)
                     refinement_fc_allowlist = self._refinement_files_changed_allowlist(
                         ctx.requirements, revision_repo_understanding
                     )
@@ -1883,14 +2048,7 @@ class PlanningStages:
                 except Exception as exc:  # noqa: BLE001
                     supplemental_evidence = None
                     query_summary = f"failed: {exc}"[:180]
-                    await self._emit_event(
-                        ctx.event_callback,
-                        {
-                            "type": "warning",
-                            "message": f"Refinement evidence refresh failed; continuing without it: {exc}",
-                        },
-                        ctx.session_id,
-                    )
+                    _LOG.warning("Refinement evidence refresh failed; continuing without it: %s", exc)
                 await emit_tool(
                     "refinement_evidence_refresh",
                     "done",
@@ -1902,7 +2060,7 @@ class PlanningStages:
         revision_budget = max(base_budget, min(5, len(missing_section_failures) or 1))
         if missing_section_failures:
             revision_hints = [*base_revision_hints, *missing_section_failures]
-        for attempt in range(2):
+        for _ in range(1):
             revision_result = await self._author.revise_plan(
                 repair_plan=repair_plan,
                 current_plan=current_plan_doc,
@@ -1925,6 +2083,7 @@ class PlanningStages:
                 localized_detail_preserver=self._preserve_localized_refinement_detail,
                 verified_paths=verified_paths,
                 supplemental_evidence=supplemental_evidence,
+                repo_understanding=revision_repo_understanding,
             )
             updated_plan = patch_plan_document_localized_backend_grounding(
                 updated_plan, revision_repo_understanding, ctx.requirements
@@ -1941,7 +2100,9 @@ class PlanningStages:
                 repo_understanding=revision_repo_understanding,
                 verified_paths_extra=verified_paths,
                 requirements_text=ctx.requirements,
-                files_changed_allowlist=refinement_fc_allowlist,
+                files_changed_allowlist=self._merge_refinement_allowlist_with_verified_paths(
+                    refinement_fc_allowlist, verified_paths
+                ),
             )
             retryable_failures = [*grounding_failures, *list(revision_validation.failure_messages)]
             if retryable_failures:
@@ -1957,7 +2118,9 @@ class PlanningStages:
                     repo_understanding=revision_repo_understanding,
                     verified_paths_extra=verified_paths,
                     requirements_text=ctx.requirements,
-                    files_changed_allowlist=refinement_fc_allowlist,
+                    files_changed_allowlist=self._merge_refinement_allowlist_with_verified_paths(
+                        refinement_fc_allowlist, verified_paths
+                    ),
                 )
                 if supplemented_validation.failure_messages:
                     supplemented_plan = self._supplement_refinement_plan(
@@ -1971,7 +2134,9 @@ class PlanningStages:
                         repo_understanding=revision_repo_understanding,
                         verified_paths_extra=verified_paths,
                         requirements_text=ctx.requirements,
-                        files_changed_allowlist=refinement_fc_allowlist,
+                        files_changed_allowlist=self._merge_refinement_allowlist_with_verified_paths(
+                            refinement_fc_allowlist, verified_paths
+                        ),
                     )
                 if not supplemented_validation.failure_messages:
                     revision_result = RevisionResult(
@@ -1998,9 +2163,18 @@ class PlanningStages:
                     retryable_failures = []
             if not retryable_failures:
                 break
-            if attempt == 1:
-                raise ValueError("; ".join(retryable_failures))
-            revision_hints = [*base_revision_hints, *retryable_failures]
+            # Run deterministic autofix as soon as supplements fail (do not require a second LLM revise).
+            updated_plan, preliminary_markdown, revision_result = self._autofix_refinement_plan_to_valid(
+                updated_plan=updated_plan,
+                current_plan_doc=current_plan_doc,
+                revision_result=revision_result,
+                ctx=ctx,
+                revision_repo_understanding=revision_repo_understanding,
+                verified_paths=verified_paths,
+                previous_plan_content=previous_plan_content,
+                supplemental_evidence=supplemental_evidence,
+            )
+            break
         previous_version = ctx.core.get_current_plan()
         updated_plan = apply_section_updates(current_plan_doc, revision_result.updates)
         updated_plan, preliminary_markdown, revision_result = self._autofix_refinement_plan_to_valid(
@@ -2010,6 +2184,7 @@ class PlanningStages:
             ctx=ctx,
             revision_repo_understanding=revision_repo_understanding,
             verified_paths=verified_paths,
+            previous_plan_content=previous_plan_content,
             supplemental_evidence=supplemental_evidence,
         )
         previous_graph = decision_graph_from_json(getattr(previous_version, "decision_graph_json", None))
@@ -2099,10 +2274,16 @@ class PlanningStages:
         if resolution_block:
             turn_lines.append(f"Proposed updates (draft):\n{resolution_block}")
         if chat_changed_sections or resolution_block:
-            turn_lines.append(
-                "Review Notes: an issue shows as resolved only after the validation reviewer lists its id in "
-                "resolved_issues."
-            )
+            if getattr(ctx.state, "defer_validation_after_apply", False):
+                turn_lines.append(
+                    "Review Notes: critic validation was skipped for this apply. Run Review when you want a "
+                    "fresh critic pass; open/resolved issue state is not refreshed until then."
+                )
+            else:
+                turn_lines.append(
+                    "Review Notes: an issue shows as resolved only after the validation reviewer lists its id in "
+                    "resolved_issues."
+                )
         ctx.core.add_turn(
             "author",
             "\n\n".join(turn_lines),
@@ -2126,13 +2307,9 @@ class PlanningStages:
             constraints=ctx.state.constraints,
         )
         if manifesto_result.violations:
-            await self._emit_event(
-                ctx.event_callback,
-                {
-                    "type": "warning",
-                    "message": ("Manifesto check violations: " + "; ".join(manifesto_result.violations[:4])),
-                },
-                ctx.session_id,
+            _LOG.warning(
+                "Manifesto check violations (continuing to design review): %s",
+                "; ".join(manifesto_result.violations[:4]),
             )
         await emit_tool("review_validation", "running", stage="reviewer")
         validation_started = time.perf_counter()

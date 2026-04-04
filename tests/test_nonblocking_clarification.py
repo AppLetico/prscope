@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 from prscope.config import PlanningConfig, PrscopeConfig, RepoProfile
-from prscope.planning.runtime.author import RepairPlan, RevisionResult
+from prscope.planning.runtime.author import RepairPlan, RepoUnderstanding, RevisionResult
 from prscope.planning.runtime.authoring.models import PlanDocument, ValidationResult, render_markdown
 from prscope.planning.runtime.critic import CriticResult, ReviewResult
 from prscope.planning.runtime.discovery import DiscoveryQuestion, DiscoveryTurnResult, QuestionOption
@@ -1453,6 +1453,31 @@ def test_stabilize_refinement_plan_reuses_current_steps_for_missing_file_refs() 
     assert "`tests/test_web_api_models.py`" in stabilized.implementation_steps
 
 
+def test_preferred_test_targets_prepends_repo_relevant_tests_when_requirements_mention_tests() -> None:
+    """Aligns stabilize/anchor with missing_test_target_failures (same relevant_tests list)."""
+    plan = PlanDocument(
+        title="Plan",
+        summary="s",
+        goals="g",
+        non_goals="",
+        files_changed="- `src/prscope/web/api.py`: x",
+        architecture="",
+        implementation_steps="",
+        test_strategy="",
+        rollback_plan="",
+        open_questions="",
+    )
+    repo = SimpleNamespace(relevant_tests=["tests/test_z.py", "tests/test_a.py"])
+    targets = PlanningStages._preferred_test_targets(
+        current_plan=plan,
+        requirements="Add tests and coverage for the API.",
+        verified_paths=set(),
+        supplemental_evidence=None,
+        repo_understanding=repo,
+    )
+    assert targets[0] == "tests/test_a.py"
+
+
 def test_supplement_refinement_plan_uses_generic_backend_fallbacks_for_cache_work() -> None:
     stages = PlanningStages.__new__(PlanningStages)
     plan = PlanDocument(
@@ -1494,6 +1519,31 @@ def test_parse_missing_test_target_candidate_paths() -> None:
     assert PlanningStages._parse_missing_test_target_candidate_paths(
         "missing test target reference; reference one of: tests/test_a.py, tests/test_b.py"
     ) == ["tests/test_a.py", "tests/test_b.py"]
+
+
+def test_merge_revision_repo_understanding_with_session_merges_discovery_tests() -> None:
+    session_ru = RepoUnderstanding(
+        entrypoints=["src/a.py"],
+        core_modules=[],
+        relevant_modules=[],
+        relevant_tests=["tests/test_discovery_reasoner.py", "tests/test_nonblocking_clarification.py"],
+        architecture_summary="",
+        risks=[],
+        file_contents={},
+    )
+    revision_ru = RepoUnderstanding(
+        entrypoints=["src/a.py"],
+        core_modules=[],
+        relevant_modules=[],
+        relevant_tests=["tests/test_a.py"],
+        architecture_summary="",
+        risks=[],
+        file_contents={},
+    )
+    merged = PlanningStages._merge_revision_repo_understanding_with_session(session_ru, revision_ru)
+    assert "tests/test_a.py" in merged.relevant_tests
+    assert "tests/test_discovery_reasoner.py" in merged.relevant_tests
+    assert "tests/test_nonblocking_clarification.py" in merged.relevant_tests
 
 
 def test_supplement_refinement_plan_appends_missing_test_target_candidate() -> None:

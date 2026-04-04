@@ -1,14 +1,20 @@
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
 
+from prscope.config import IssueDedupeConfig
 from prscope.planning.runtime.orchestration_support.chat_flow import RuntimeChatFlow
+from prscope.planning.runtime.pipeline.adversarial_loop import AdversarialPlanningLoop
+from prscope.planning.runtime.pipeline.round_context import PlanningRoundContext
 from prscope.planning.runtime.reasoning import (
     IssueReferenceSignals,
     OpenQuestionResolutionSignals,
     ReasoningContext,
     RefinementReasoner,
 )
+from prscope.planning.runtime.review import IssueGraphTracker, IssueSimilarityService
 
 
 def test_extract_refinement_message_signals_marks_ambiguous_security_request() -> None:
@@ -17,6 +23,22 @@ def test_extract_refinement_message_signals_marks_ambiguous_security_request() -
     assert signals.intent == "refine"
     assert signals.small_refinement is False
     assert signals.heuristic_route == "full_refine"
+
+
+def test_plan_panel_issue_followup_is_small_despite_length_and_security_keywords() -> None:
+    """Add-all-to-chat prompts exceed 280 chars and often mention security — must not force full_refine."""
+    msg = (
+        "Please update the plan to address these review notes:\n\n"
+        "1. Implement Bearer token authentication for all API routes.\n"
+        "2. Add structured logging for authentication failures.\n\n"
+        "Tracked issue ids: `issue_12`, `issue_13` — include fixed ids in resolved_issues.\n"
+        "Adjust the approach, tasks, dependencies, and success checks where needed.\n" + ("padding " * 80)
+    )
+    assert RefinementReasoner.looks_like_plan_panel_issue_followup(msg)
+    assert RefinementReasoner.is_small_request(msg)
+    signals = RuntimeChatFlow._extract_refinement_message_signals(msg)
+    assert signals.small_refinement is True
+    assert signals.heuristic_route == "lightweight_refine"
 
 
 @pytest.mark.asyncio
@@ -146,3 +168,60 @@ def test_refinement_reasoner_resolves_single_targeted_issue_reference() -> None:
 
     assert decision.issue_resolution == ["issue_auth_missing"]
     assert decision.confidence >= 0.75
+
+
+def test_refinement_reasoner_resolves_batch_tracked_issue_ids() -> None:
+    reasoner = RefinementReasoner()
+
+    decision = reasoner.resolve_issue_references(
+        ReasoningContext(
+            signals=IssueReferenceSignals(
+                user_message=(
+                    "Please update the plan to address these review notes:\n\n"
+                    "1. First note.\n"
+                    "2. Second note.\n\n"
+                    "Tracked issue ids: `issue_19`, `issue_20`, `issue_21`, `issue_22` — "
+                    "include fixed ids in resolved_issues.\n"
+                ),
+                issues=[
+                    {"id": "issue_19", "description": "A"},
+                    {"id": "issue_20", "description": "B"},
+                    {"id": "issue_21", "description": "C"},
+                    {"id": "issue_22", "description": "D"},
+                ],
+            ),
+            session_metadata={"scenario": "issue_resolution"},
+        )
+    )
+
+    assert decision.issue_resolution == ["issue_19", "issue_20", "issue_21", "issue_22"]
+    assert decision.confidence >= 0.8
+
+
+def test_resolve_plan_panel_tracked_issue_ids_when_validation_skipped_closes_named_issues() -> None:
+    similarity = IssueSimilarityService(
+        IssueDedupeConfig(
+            embeddings_enabled="false",
+            embedding_model="unused",
+            similarity_threshold=0.95,
+            fallback_mode="none",
+        )
+    )
+    tracker = IssueGraphTracker(similarity=similarity, max_nodes=50, max_edges=100)
+    tracker.add_issue("a", 1, preferred_id="issue_19")
+    tracker.add_issue("b", 1, preferred_id="issue_20")
+
+    ctx = PlanningRoundContext(
+        core=MagicMock(),
+        session_id="s",
+        round_number=3,
+        requirements=(
+            "Please update the plan to address these review notes:\n\n"
+            "Tracked issue ids: `issue_19`, `issue_20` — include fixed ids in resolved_issues.\n"
+        ),
+        state=MagicMock(),
+        issue_tracker=tracker,
+    )
+    AdversarialPlanningLoop._resolve_plan_panel_tracked_issue_ids_when_validation_skipped(ctx)
+
+    assert [i.id for i in tracker.open_issues()] == []

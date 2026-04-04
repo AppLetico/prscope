@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import time
 from collections.abc import Awaitable
@@ -24,6 +25,8 @@ from ...model_catalog import (
 )
 from ...pricing import MODEL_CONTEXT_WINDOWS
 from .telemetry import completion_telemetry
+
+_LOG = logging.getLogger(__name__)
 
 PERSPECTIVE_TIMEOUT_SECONDS = 20.0
 PERSPECTIVE_SYNTHESIS_BUDGET_SECONDS = 45.0
@@ -174,6 +177,115 @@ class ReviewResult:
         if not self.plan_rubric:
             return 0.0
         return float(min(self.plan_rubric.values()))
+
+
+def synthetic_review_for_chat_refinement(
+    issue_tracker: Any,
+    *,
+    user_input: str,
+) -> ReviewResult:
+    """When chat drives a refine round but no stored critique exists, avoid running design_review.
+
+    Repair/revise still need a ReviewResult; we derive blocking issues from the issue graph and/or
+    the user's message. A full scored critique only runs via run_critique (Review button).
+    """
+    issues: list[str] = []
+    try:
+        for node in issue_tracker.open_issues()[:32]:
+            desc = str(getattr(node, "description", "") or "").strip()
+            if desc:
+                issues.append(desc)
+    except Exception:  # noqa: BLE001 — best-effort; empty issues still ok
+        issues = []
+    ui = user_input.strip()
+    if not issues and ui:
+        issues = [ui[:8000]]
+    primary = issues[0] if issues else None
+    prose = (
+        "Chat refinement context (no automatic critic design review). "
+        "Use Review when you want a fresh scored critique of the plan."
+    )
+    return ReviewResult(
+        strengths=[],
+        architectural_concerns=[],
+        risks=[],
+        simplification_opportunities=[],
+        blocking_issues=issues,
+        reviewer_questions=[],
+        recommended_changes=[],
+        design_quality_score=5.0,
+        confidence="medium",
+        review_complete=False,
+        simplest_possible_design=None,
+        primary_issue=primary,
+        resolved_issues=[],
+        constraint_violations=[],
+        issue_priority=issues[:8],
+        prose=prose,
+        parse_error=None,
+    )
+
+
+def skipped_validation_review_placeholder() -> ReviewResult:
+    """Synthetic review result when validation is deferred (e.g. after apply_critique).
+
+    Used for convergence/metrics only — no critic call. Keeps convergence conservative
+    (design_quality_score 0, review_complete False) so we do not auto-converge.
+    """
+    return ReviewResult(
+        strengths=[],
+        architectural_concerns=[],
+        risks=[],
+        simplification_opportunities=[],
+        blocking_issues=[],
+        reviewer_questions=[],
+        recommended_changes=[],
+        design_quality_score=0.0,
+        confidence="n/a",
+        review_complete=False,
+        simplest_possible_design=None,
+        primary_issue=None,
+        resolved_issues=[],
+        constraint_violations=[],
+        issue_priority=[],
+        prose="Validation deferred — run Review for a fresh critic pass on the updated plan.",
+        parse_error=None,
+    )
+
+
+def hydrate_review_result(raw: Any) -> ReviewResult | None:
+    """Restore ReviewResult from a persisted state snapshot dict (best-effort)."""
+    if not isinstance(raw, dict):
+        return None
+    try:
+        pr = raw.get("plan_rubric")
+        plan_rubric: dict[str, float] = dict(pr) if isinstance(pr, dict) else _default_plan_rubric()
+        return ReviewResult(
+            strengths=list(raw.get("strengths") or []),
+            architectural_concerns=list(raw.get("architectural_concerns") or []),
+            risks=list(raw.get("risks") or []),
+            simplification_opportunities=list(raw.get("simplification_opportunities") or []),
+            blocking_issues=list(raw.get("blocking_issues") or []),
+            reviewer_questions=list(raw.get("reviewer_questions") or []),
+            recommended_changes=list(raw.get("recommended_changes") or []),
+            design_quality_score=float(raw.get("design_quality_score") or 0.0),
+            confidence=str(raw.get("confidence") or "medium"),
+            review_complete=bool(raw.get("review_complete", True)),
+            simplest_possible_design=raw.get("simplest_possible_design"),
+            primary_issue=raw.get("primary_issue"),
+            resolved_issues=list(raw.get("resolved_issues") or []),
+            constraint_violations=list(raw.get("constraint_violations") or []),
+            issue_priority=list(raw.get("issue_priority") or []),
+            prose=str(raw.get("prose") or ""),
+            parse_error=raw.get("parse_error"),
+            plan_rubric=plan_rubric,
+            rubric_incomplete=bool(raw.get("rubric_incomplete", False)),
+            blocking_categories=list(raw.get("blocking_categories") or []),
+            blocking_categories_invalid=bool(raw.get("blocking_categories_invalid", False)),
+            acceptance_criteria=list(raw.get("acceptance_criteria") or []),
+        )
+    except (TypeError, ValueError):
+        return None
 
 
 @dataclass
@@ -375,18 +487,8 @@ class CriticAgent:
         telemetry = completion_telemetry(response, model=model)
         context_window = MODEL_CONTEXT_WINDOWS.get(model)
         if model not in MODEL_CONTEXT_WINDOWS:
-            await self._emit(
-                {
-                    "type": "warning",
-                    "message": f"Unknown model '{model}' - context window tracking disabled",
-                }
-            )
-            await self._emit(
-                {
-                    "type": "warning",
-                    "message": f"Unknown model '{model}' - cost tracking disabled for this call",
-                }
-            )
+            _LOG.warning("Unknown model '%s' - context window tracking disabled", model)
+            _LOG.warning("Unknown model '%s' - cost tracking disabled for this call", model)
         await self._emit(
             {
                 "type": "token_usage",
@@ -399,14 +501,11 @@ class CriticAgent:
             }
         )
         if context_window and telemetry.usage.prompt_tokens > int(context_window * 0.75):
-            await self._emit(
-                {
-                    "type": "warning",
-                    "message": (
-                        f"Prompt tokens {telemetry.usage.prompt_tokens} exceed "
-                        f"75% of context window ({context_window}) for {model}"
-                    ),
-                }
+            _LOG.warning(
+                "Prompt tokens %s exceed 75%% of context window (%s) for %s",
+                telemetry.usage.prompt_tokens,
+                context_window,
+                model,
             )
         return raw, model
 
@@ -1086,14 +1185,9 @@ class CriticAgent:
                     },
                 ]
             except Exception as exc:  # noqa: BLE001
-                await self._emit(
-                    {
-                        "type": "warning",
-                        "message": (
-                            "Multi-perspective review fell back to single-pass "
-                            f"due to timeout/failure guardrails: {exc}"
-                        ),
-                    }
+                _LOG.warning(
+                    "Multi-perspective review fell back to single-pass due to timeout/failure guardrails: %s",
+                    exc,
                 )
 
         temp = 0.0 if temperature is None else temperature
@@ -1123,24 +1217,15 @@ class CriticAgent:
                         return self._parse_implementability_response(raw)
                     parsed = self._parse_review_response(raw)
                     if parsed.rubric_incomplete:
-                        await self._emit(
-                            {
-                                "type": "warning",
-                                "message": (
-                                    "Reviewer omitted or partially omitted plan_rubric axes; "
-                                    f"defaulted missing scores to {MISSING_RUBRIC_SCORE} (rubric_incomplete)."
-                                ),
-                            }
+                        _LOG.warning(
+                            "Reviewer omitted or partially omitted plan_rubric axes; "
+                            "defaulted missing scores to %s (rubric_incomplete).",
+                            MISSING_RUBRIC_SCORE,
                         )
                     if parsed.blocking_categories_invalid:
-                        await self._emit(
-                            {
-                                "type": "warning",
-                                "message": (
-                                    "blocking_categories contained unknown tokens or was omitted; "
-                                    "convergence will fail closed until fixed."
-                                ),
-                            }
+                        _LOG.warning(
+                            "blocking_categories contained unknown tokens or was omitted; "
+                            "convergence will fail closed until fixed."
                         )
                     return self._apply_scope_discipline(requirements, parsed)
                 except CriticParseError as exc:
@@ -1179,14 +1264,10 @@ class CriticAgent:
                                 "failure_category": "json_contract",
                             }
                         )
-                        await self._emit(
-                            {
-                                "type": "warning",
-                                "message": (
-                                    f"Reviewer JSON contract failed on {active_model}; "
-                                    f"retrying stage with fallback model {models_to_try[model_index + 1]}."
-                                ),
-                            }
+                        _LOG.warning(
+                            "Reviewer JSON contract failed on %s; retrying stage with fallback model %s.",
+                            active_model,
+                            models_to_try[model_index + 1],
                         )
                         break
                     raise CriticContractError(f"Reviewer parse failed after {max_retries + 1} attempts: {exc}") from exc

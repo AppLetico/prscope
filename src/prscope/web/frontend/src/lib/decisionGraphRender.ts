@@ -65,30 +65,9 @@ export function decisionGraphToMermaid(graph: DecisionGraph): string | null {
   return lines.join("\n");
 }
 
-/** True when Architecture already contains a mermaid fence (skip auto map to avoid noise). */
+/** True when Architecture already contains a mermaid fence. */
 export function hasMermaidInArchitectureSection(md: string): boolean {
   return /^##\s+Architecture\b[\s\S]*?```mermaid/mi.test(md);
-}
-
-function shouldShowAutoDecisionMap(graph: DecisionGraph): boolean {
-  const nodes = Object.values(graph.nodes ?? {});
-  if (nodes.length === 0) return false;
-  const edges = graph.edges ?? [];
-  if (edges.length > 0) return true;
-  return nodes.length >= 2;
-}
-
-/** Injects ### Decision map (auto) with fenced mermaid under Architecture when useful. */
-function maybeInsertDecisionMapMermaid(content: string, graph: DecisionGraph): string {
-  if (!shouldShowAutoDecisionMap(graph)) return content;
-  if (hasMermaidInArchitectureSection(content)) return content;
-  const diagram = decisionGraphToMermaid(graph);
-  if (!diagram) return content;
-  const addition = `### Decision map (auto)\n\n\`\`\`mermaid\n${diagram}\n\`\`\``;
-  if (hasSection(content, "Architecture")) {
-    return insertIntoSection(content, "Architecture", addition);
-  }
-  return appendSection(content, "Architecture", addition);
 }
 
 function hasSection(content: string, heading: string): boolean {
@@ -159,8 +138,6 @@ export function augmentPlanMarkdownWithDecisionGraph(
       ? insertIntoSection(next, "Architecture", addition)
       : appendSection(next, "Architecture", addition);
   }
-
-  next = maybeInsertDecisionMapMermaid(next, decisionGraph);
 
   const unresolved = unresolvedNodes(decisionGraph);
   if (unresolved.length === 0) {

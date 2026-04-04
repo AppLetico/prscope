@@ -8,7 +8,8 @@ import {
   Bot,
   User,
   Sparkles,
-  Microscope,
+  ClipboardCheck,
+  Wrench,
   CheckCircle2,
   Copy,
   Check,
@@ -87,12 +88,22 @@ interface ChatPanelProps {
   onCriticModelChange?: (modelId: string) => void;
   canCritique?: boolean;
   canApprove?: boolean;
+  /** When set, controls Critic model dropdown visibility (e.g. show during processing while Review buttons are hidden). Defaults to canCritique || canApprove. */
+  showCriticModelSelector?: boolean;
   critiquePending?: boolean;
   contextPercent?: number | null;
   /** Peak prompt token count (session / token_usage); pairs with contextWindowTokens for the gauge tooltip. */
   maxPromptTokens?: number;
   contextWindowTokens?: number | null;
   onCritique?: () => void;
+  /** Apply stored critique to the plan (author repair/revise). */
+  onApplyCritique?: () => void;
+  /** True when a critique is scored but not yet applied to the plan. */
+  critiquePendingApply?: boolean;
+  applyCritiquePending?: boolean;
+  /** Incrementing nonce: focus the composer when the user picks "Discuss first". */
+  focusChatNonce?: number;
+  onDiscussFirst?: () => void;
   onApprove?: () => void;
   onStop?: () => void;
   onSubmit: (text: string) => Promise<void>;
@@ -129,11 +140,17 @@ export function ChatPanel({
   onCriticModelChange,
   canCritique = false,
   canApprove = false,
+  showCriticModelSelector: showCriticModelSelectorProp,
   critiquePending = false,
   contextPercent = null,
   maxPromptTokens,
   contextWindowTokens = null,
   onCritique,
+  onApplyCritique,
+  critiquePendingApply = false,
+  applyCritiquePending = false,
+  focusChatNonce = 0,
+  onDiscussFirst,
   onApprove,
   onStop,
   onSubmit,
@@ -142,6 +159,8 @@ export function ChatPanel({
   externalInputAppend = null,
   latestResponseMode = null,
 }: ChatPanelProps) {
+  const showCriticModelSelector =
+    showCriticModelSelectorProp ?? (canCritique || canApprove);
   const [input, setInput] = useState("");
   const [optimisticUserMessage, setOptimisticUserMessage] = useState<string | null>(null);
   const [clarificationInput, setClarificationInput] = useState("");
@@ -154,6 +173,8 @@ export function ChatPanel({
   const [submittingFollowupId, setSubmittingFollowupId] = useState<string | null>(null);
   const [submittingSuggestionId, setSubmittingSuggestionId] = useState<string | null>(null);
   const [focusPrompt, setFocusPrompt] = useState<FocusPrompt | null>(null);
+  /** True when the focus chip came from PlanPanel "Add to chat" (externalInputAppend). */
+  const [planSeededComposer, setPlanSeededComposer] = useState(false);
   const [autoScroll, setAutoScroll] = useState(true);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [thinkingStatusTick, setThinkingStatusTick] = useState(0);
@@ -224,12 +245,18 @@ export function ChatPanel({
     const nextText = externalInputAppend.text.trim();
     if (!nextText) return;
     setFocusPrompt(deriveFocusPrompt(nextText));
+    setPlanSeededComposer(true);
     if (inputRef.current) {
       inputRef.current.focus();
       inputRef.current.style.height = "auto";
       inputRef.current.style.height = `${Math.min(inputRef.current.scrollHeight, 256)}px`;
     }
   }, [externalInputAppend]);
+
+  useEffect(() => {
+    if (focusChatNonce <= 0) return;
+    inputRef.current?.focus();
+  }, [focusChatNonce]);
 
   useEffect(() => {
     const validIndexes = new Set(questions.map((q) => q.index));
@@ -317,6 +344,7 @@ export function ChatPanel({
     if (!combined) return;
     setInput("");
     setFocusPrompt(null);
+    setPlanSeededComposer(false);
     await submitMessage(combined);
   };
 
@@ -563,6 +591,16 @@ export function ChatPanel({
     }
     return null;
   }, [displayedTimeline]);
+  const latestCriticDesignReviewKey = useMemo(() => {
+    for (let idx = displayedTimeline.length - 1; idx >= 0; idx -= 1) {
+      const item = displayedTimeline[idx];
+      if (item.kind !== "turn" || item.turn.role !== "critic") continue;
+      if (item.turn.content.trim().toLowerCase().startsWith("design review:")) {
+        return item.key;
+      }
+    }
+    return null;
+  }, [displayedTimeline]);
   const liveStatusMessage = useMemo(
     () =>
       getLiveStatusMessage({
@@ -750,6 +788,50 @@ export function ChatPanel({
                         </div>
                       )}
                     </div>
+                    {turn.role === "critic"
+                      && turnKey === latestCriticDesignReviewKey
+                      && critiquePendingApply
+                      && !isProcessing && (
+                      <div className="mt-2 flex flex-wrap items-center gap-2">
+                        <p className="w-full text-[11px] leading-snug text-zinc-500">
+                          Critique is ready — apply it to the plan or discuss in chat first. Use Review below to run another pass.
+                        </p>
+                        {onApplyCritique && (
+                          <Tooltip content="Update the plan from the critique (repair + revise)">
+                            <button
+                              type="button"
+                              disabled={applyCritiquePending}
+                              onClick={onApplyCritique}
+                              className={clsx(
+                                "flex items-center gap-2 px-3 py-1.5 text-xs font-semibold rounded-lg border transition-all duration-200 active:scale-95",
+                                applyCritiquePending
+                                  ? "border-zinc-700 text-zinc-500 cursor-not-allowed"
+                                  : "border-indigo-500/40 bg-indigo-500/20 text-indigo-100 hover:bg-indigo-500/30 hover:border-indigo-400/50",
+                              )}
+                            >
+                              {applyCritiquePending ? (
+                                <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                              ) : (
+                                <Sparkles className="w-3.5 h-3.5" />
+                              )}
+                              Apply revision
+                            </button>
+                          </Tooltip>
+                        )}
+                        {onDiscussFirst && (
+                          <Tooltip content="Focus chat to add guidance before updating the plan">
+                            <button
+                              type="button"
+                              onClick={onDiscussFirst}
+                              className="flex items-center gap-2 px-2.5 py-1.5 text-xs font-medium rounded-lg border border-zinc-700 bg-zinc-800/50 text-zinc-300 hover:bg-zinc-800 hover:border-zinc-600 transition-all duration-200 active:scale-95"
+                            >
+                              <MessageSquare className="w-3.5 h-3.5" />
+                              Discuss first
+                            </button>
+                          </Tooltip>
+                        )}
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>
@@ -1073,7 +1155,7 @@ export function ChatPanel({
                             onClick={() => void onCritique()}
                             className="group flex items-center gap-2 rounded-lg border border-indigo-500/20 bg-indigo-500/5 px-3 py-2 text-xs font-medium text-indigo-300 transition-all hover:border-indigo-500/40 hover:bg-indigo-500/10 hover:text-indigo-200 hover:shadow-[0_0_12px_rgba(99,102,241,0.15)] active:scale-95"
                           >
-                            <Microscope className="h-3.5 w-3.5" />
+                            <ClipboardCheck className="h-3.5 w-3.5" />
                             Ask critic to review
                           </button>
                         )}
@@ -1089,7 +1171,7 @@ export function ChatPanel({
               {warningSummary.slice(-2).map((warning, idx) => (
                 <div
                   key={`warning-${idx}`}
-                  className="ml-12 max-w-[90%] rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200/90"
+                  className="ml-12 max-w-[90%] rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200/90 whitespace-pre-wrap"
                 >
                   {warning.message}
                   {warning.count > 1 ? ` (x${warning.count})` : ""}
@@ -1174,7 +1256,7 @@ export function ChatPanel({
                             ) : isThought ? (
                               <MessageSquare className="h-3 w-3 text-violet-300" />
                             ) : isTool ? (
-                              <Microscope className="h-3 w-3 text-sky-300" />
+                              <Wrench className="h-3 w-3 text-sky-300" />
                             ) : (
                               <ArrowRight className="h-3 w-3 text-amber-300" />
                             )}
@@ -1207,7 +1289,10 @@ export function ChatPanel({
               <div className="flex-1" />
               <button
                 type="button"
-                onClick={() => setFocusPrompt(null)}
+                onClick={() => {
+                  setFocusPrompt(null);
+                  setPlanSeededComposer(false);
+                }}
                 className="rounded-md p-1 text-zinc-500 transition-colors hover:bg-zinc-800 hover:text-zinc-300"
                 aria-label="Remove focus"
               >
@@ -1227,7 +1312,13 @@ export function ChatPanel({
                 void handleSubmit();
               }
             }}
-            placeholder={focusPrompt ? "Add any extra guidance..." : "Type a message..."}
+            placeholder={
+              planSeededComposer
+                ? "Optional: add a note — Send submits the staged review notes. ⌘↵ / Ctrl+↵ also sends."
+                : focusPrompt
+                  ? "Add any extra guidance..."
+                  : "Type a message..."
+            }
             rows={1}
             style={{ height: "auto" }}
             onInput={(e) => {
@@ -1252,7 +1343,7 @@ export function ChatPanel({
                       dropUp
                     />
                   )}
-                  {(canCritique || canApprove) && criticModel !== undefined && onCriticModelChange && authorModel !== undefined && (
+                  {showCriticModelSelector && criticModel !== undefined && onCriticModelChange && authorModel !== undefined && (
                     <>
                       <div className="w-px h-5 bg-zinc-700/50 mx-1 shrink-0" />
                       <ModelSelector
@@ -1260,7 +1351,7 @@ export function ChatPanel({
                         value={criticModel}
                         onChange={onCriticModelChange}
                         options={modelOptions}
-                        icon={<Microscope className="w-3.5 h-3.5" />}
+                        icon={<ClipboardCheck className="w-3.5 h-3.5" />}
                         className="hover:bg-zinc-800/80 rounded-lg px-2 py-1 flex-1 sm:flex-none justify-center sm:justify-start"
                         dropUp
                       />
@@ -1310,9 +1401,15 @@ export function ChatPanel({
             </div>
 
             {/* Right: action buttons */}
-            <div className="flex items-center justify-end gap-2 shrink-0 order-1 sm:order-3">
+            <div className="flex items-center justify-end gap-2 shrink-0 order-1 sm:order-3 flex-wrap sm:flex-nowrap">
               {!isProcessing && canCritique && onCritique && (
-                <Tooltip content="Run critique pass">
+                <Tooltip
+                  content={
+                    critiquePendingApply
+                      ? "Run a fresh design critique (replaces the pending one). Separate from automatic validation after Send."
+                      : "Run a full design critique on the current plan. Sending a chat message runs author work plus automatic validation — that is not this button."
+                  }
+                >
                   <button
                     type="button"
                     disabled={critiquePending}
@@ -1327,7 +1424,7 @@ export function ChatPanel({
                     {critiquePending ? (
                       <Loader2 className="w-4 h-4 animate-spin" />
                     ) : (
-                      <Microscope className="w-4 h-4" />
+                      <ClipboardCheck className="w-4 h-4" />
                     )}
                     Review
                   </button>
@@ -1357,7 +1454,9 @@ export function ChatPanel({
                   </button>
                 </Tooltip>
               ) : (
-                <Tooltip content="Send message">
+                <Tooltip
+                  content="Send message. After Send, the pipeline runs author refinement and automatic validation scoring — use Review only for a separate full design critique."
+                >
                   <button
                     type="button"
                     aria-label="Send message"

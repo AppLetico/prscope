@@ -1,11 +1,15 @@
 import type { DraftTimingDiagnostics, RoundMetric, SessionStatus } from "../types";
-import { ChevronDown, GitBranch, Trash2 } from "lucide-react";
+import { Check, ChevronDown, Copy, GitBranch, Trash2 } from "lucide-react";
 import { Link } from "react-router-dom";
 import { clsx } from "clsx";
 import { useRef, useEffect, useState, useMemo } from "react";
 import { Tooltip } from "./ui/Tooltip";
 
-import { formatDiagnosticsSource, formatInvestigationDensity } from "./actionBarDiagnostics";
+import {
+  formatDiagnosticsSource,
+  formatInvestigationDensity,
+  formatTraceDiagnosticsForCopy,
+} from "./actionBarDiagnostics";
 import { isConvergedOrApproved, scoreColor } from "./actionBarUi";
 import { ThemeToggle } from "./ThemeToggle";
 
@@ -14,7 +18,7 @@ interface ActionBarProps {
   title: string;
   round: number;
   status: SessionStatus;
-  /** When false, refining/draft status shows as idle (no pulse). Omittable for non-session bars. */
+  /** When false, refining/draft status dot does not pulse. Omittable for non-session bars. */
   isProcessing?: boolean;
   convergenceScore?: number;
   sessionCostUsd?: number;
@@ -65,6 +69,7 @@ export function ActionBar({
   const [moreOpen, setMoreOpen] = useState(false);
   const [convOpen, setConvOpen] = useState(false);
   const [routingOpen, setRoutingOpen] = useState(false);
+  const [traceDiagCopied, setTraceDiagCopied] = useState(false);
   const moreRef = useRef<HTMLDivElement>(null);
   const convRef = useRef<HTMLDivElement>(null);
   const routingRef = useRef<HTMLDivElement>(null);
@@ -124,6 +129,21 @@ export function ActionBar({
   const lastInvestigationReason = String(routingDiagnostics?.investigation_trigger_reason_last ?? "");
   const diagnosticsSource = formatDiagnosticsSource(routingDiagnosticsSource);
 
+  const copyTraceDiagnostics = async () => {
+    try {
+      const text = formatTraceDiagnosticsForCopy(
+        routingDiagnostics,
+        diagnosticsSource.label,
+        diagnosticsSource.detail,
+      );
+      await navigator.clipboard.writeText(text);
+      setTraceDiagCopied(true);
+      window.setTimeout(() => setTraceDiagCopied(false), 1500);
+    } catch {
+      // Clipboard may be unavailable in restricted contexts.
+    }
+  };
+
   const totalCost = useMemo(
     () => sortedMetrics.reduce((sum, m) => sum + (m.call_cost_usd ?? 0), 0),
     [sortedMetrics],
@@ -131,13 +151,11 @@ export function ActionBar({
   const isConverged = isConvergedOrApproved(status);
   const isRefining = status === "refining" || status === "draft";
   const refiningActive = isRefining && isProcessing;
-  const showIdleHint =
-    (status === "refining" || status === "draft") && !isProcessing;
   const statusTooltip =
     status === "refining" && !isProcessing
-      ? "Refining: idle. The last run finished; run Review again or keep editing."
+      ? "The last run finished. Run Review again or keep editing."
       : status === "draft" && !isProcessing
-        ? "Draft: idle. Continue the conversation or request changes."
+        ? "Continue the conversation or request changes."
         : {
             draft: "Collecting requirements and preparing the first plan draft.",
             refining: "Refining plan with critique rounds.",
@@ -193,40 +211,33 @@ export function ActionBar({
                   {isConverged ? (
                     <div className="w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.5)]"></div>
                   ) : isRefining ? (
-                    <div
-                      className={clsx(
-                        "w-1.5 h-1.5 rounded-full shadow-[0_0_8px_rgba(245,158,11,0.35)]",
-                        refiningActive
-                          ? "bg-amber-500 animate-pulse"
-                          : "bg-amber-500/55",
-                      )}
-                    ></div>
+                    refiningActive ? (
+                      <div
+                        className="relative flex h-2 w-2 shrink-0 items-center justify-center"
+                        aria-hidden
+                      >
+                        <span className="absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-50 animate-ping motion-reduce:animate-none" />
+                        <span className="relative h-1.5 w-1.5 rounded-full bg-amber-400 shadow-[0_0_12px_rgba(245,158,11,0.85)]" />
+                      </div>
+                    ) : (
+                      <div className="w-1.5 h-1.5 shrink-0 rounded-full bg-amber-500/55 shadow-[0_0_8px_rgba(245,158,11,0.35)]" />
+                    )
                   ) : (
                     <div className="w-1.5 h-1.5 rounded-full bg-zinc-500"></div>
                   )}
-                  <span className="hidden sm:inline-flex items-baseline gap-1">
-                    <span
-                      className={clsx(
-                        "text-[10px] font-bold uppercase tracking-widest",
-                        isConverged
-                          ? "text-emerald-400"
-                          : isRefining
-                            ? refiningActive
-                              ? "text-amber-400"
-                              : "text-amber-400/75"
-                            : "text-zinc-400",
-                      )}
-                    >
-                      {status}
-                    </span>
-                    {showIdleHint && (
-                      <span
-                        className="text-[9px] font-semibold uppercase tracking-wider text-zinc-500"
-                        aria-hidden
-                      >
-                        · idle
-                      </span>
+                  <span
+                    className={clsx(
+                      "hidden sm:inline text-[10px] font-bold uppercase tracking-widest",
+                      isConverged
+                        ? "text-emerald-400"
+                        : isRefining
+                          ? refiningActive
+                            ? "text-amber-400"
+                            : "text-amber-400/75"
+                          : "text-zinc-400",
                     )}
+                  >
+                    {status}
                   </span>
                 </div>
               </div>
@@ -442,26 +453,45 @@ export function ActionBar({
                 )}
                 aria-expanded={routingOpen}
                 aria-haspopup="true"
-                title="Internal routing diagnostics"
+                title="Internal trace diagnostics"
               >
                 <GitBranch className="w-3.5 h-3.5 shrink-0" />
-                <span>routing {routingDecisionCount}</span>
+                <span>Trace {routingDecisionCount}</span>
                 <ChevronDown className={clsx("w-3 h-3 shrink-0 transition-transform", routingOpen && "rotate-180")} />
               </button>
               {routingOpen && (
                 <div className="absolute right-0 top-full mt-2 w-[280px] rounded-xl border border-zinc-800 bg-zinc-900 shadow-2xl z-[100] overflow-hidden">
                   <div className="p-3 border-b border-zinc-800 bg-zinc-950/50">
                     <div className="flex items-center justify-between gap-2">
-                      <div className="flex items-center gap-2">
+                      <div className="flex items-center gap-2 min-w-0">
                         <GitBranch className="w-4 h-4 text-cyan-400 shrink-0" />
-                        <span className="text-xs font-semibold text-zinc-200">Routing Diagnostics</span>
+                        <span className="text-xs font-semibold text-zinc-200">Trace Diagnostics</span>
                       </div>
-                      <span className="inline-flex items-center rounded-full border border-zinc-700/60 bg-zinc-800/70 px-2 py-0.5 text-[10px] font-medium text-zinc-300">
-                        {diagnosticsSource.label}
-                      </span>
+                      <div className="flex items-center gap-1 shrink-0">
+                        <span className="inline-flex items-center rounded-full border border-zinc-700/60 bg-zinc-800/70 px-2 py-0.5 text-[10px] font-medium text-zinc-300">
+                          {diagnosticsSource.label}
+                        </span>
+                        <Tooltip content={traceDiagCopied ? "Copied" : "Copy trace diagnostics"}>
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              void copyTraceDiagnostics();
+                            }}
+                            className="p-1 rounded-md text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/80 transition-colors"
+                            aria-label="Copy trace diagnostics"
+                          >
+                            {traceDiagCopied ? (
+                              <Check className="w-3.5 h-3.5 text-emerald-400" />
+                            ) : (
+                              <Copy className="w-3.5 h-3.5" />
+                            )}
+                          </button>
+                        </Tooltip>
+                      </div>
                     </div>
                     <div className="mt-1 text-[10px] text-zinc-500">
-                      Internal counters for request routing and refinement heuristics.
+                      Internal counters for request tracing and refinement heuristics.
                     </div>
                     <div className="mt-2 text-[10px] text-zinc-600">
                       {diagnosticsSource.detail}
@@ -510,7 +540,7 @@ export function ActionBar({
                       )}
                     </section>
                     <div className="border-t border-zinc-800 pt-3 text-[10px] leading-relaxed text-zinc-500">
-                      These diagnostics describe internal routing behavior. They do not represent critique rounds or review-note counts.
+                      These diagnostics describe internal trace behavior. They do not represent critique rounds or review-note counts.
                     </div>
                   </div>
                 </div>

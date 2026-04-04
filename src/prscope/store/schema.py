@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 
-CURRENT_SCHEMA_VERSION = 19
+CURRENT_SCHEMA_VERSION = 20
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -521,5 +521,13 @@ class StoreSchemaMixin:
             if not self._column_exists(conn, "plan_versions", "followups_json"):
                 conn.execute("ALTER TABLE plan_versions ADD COLUMN followups_json TEXT")
             current = 19
+
+        # v19 -> v20: critique completed but author revision not yet applied (split review UX)
+        if current < 20:
+            if not self._column_exists(conn, "planning_sessions", "critique_pending_apply"):
+                conn.execute(
+                    "ALTER TABLE planning_sessions ADD COLUMN critique_pending_apply INTEGER NOT NULL DEFAULT 0"
+                )
+            current = 20
 
         self._set_schema_version(conn, current)

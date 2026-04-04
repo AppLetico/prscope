@@ -25,6 +25,8 @@ _RETRYABLE_REASON_CODES = frozenset(
         "localized_scope_drift",
         "missing_localized_backend_grounding",
         "files_changed_evidence",
+        # Unknown refinement gate strings: still attempt deterministic supplement in autofix.
+        "refinement_repairable",
     }
 )
 
@@ -877,11 +879,13 @@ class AuthorValidationService:
             return "missing_tests"
         if normalized.startswith("missing explicit helper reuse reference for "):
             return "missing_helper_reuse"
-        if "localized ui/api draft introduced" in normalized:
+        if normalized.startswith("localized ui/api draft "):
             return "localized_scope_drift"
+        if normalized.startswith("revision introduced unverified file references"):
+            return "unknown_file_reference"
         if normalized.startswith("localized backend payload/response change must reference "):
             return "missing_localized_backend_grounding"
-        return "validation_failure"
+        return "refinement_repairable"
 
     @classmethod
     def build_validation_result(cls, failures: list[str]) -> ValidationResult:
@@ -963,6 +967,16 @@ class AuthorValidationService:
         files_changed_allowlist: set[str] | None = None,
     ) -> ValidationResult:
         failures: list[str] = []
+        requirement_paths = AuthorValidationService.paths_mentioned_in_requirements(requirements_text)
+        verified_paths = (
+            set(getattr(repo_understanding, "file_contents", {}).keys())
+            | set(getattr(repo_understanding, "entrypoints", []))
+            | set(getattr(repo_understanding, "core_modules", []))
+            | set(getattr(repo_understanding, "relevant_modules", []))
+            | set(getattr(repo_understanding, "relevant_tests", []))
+            | set(verified_paths_extra or set())
+            | requirement_paths
+        )
         required_non_empty = [
             "Goals",
             "Non-Goals",
@@ -979,8 +993,16 @@ class AuthorValidationService:
         if not files_changed:
             failures.append("Files Changed section is empty")
         total_references = extract_file_references(plan_content)
-        if len(files_changed) == 1 and len(total_references) > 1:
-            failures.append("under-scoped draft: one file in Files Changed but multiple referenced files")
+        # One Files Changed entry is only "under-scoped" when the plan cites additional paths that
+        # are not already session-verified (repo snapshot + reads + prior plan + allowlist). Listing
+        # a single owner file while naming a verified regression test elsewhere should not block Apply.
+        if len(files_changed) == 1:
+            extra_refs = total_references - files_changed
+            if extra_refs:
+                scoped = verified_paths | set(files_changed_allowlist or [])
+                unverified_extra = extra_refs - scoped
+                if unverified_extra:
+                    failures.append("under-scoped draft: one file in Files Changed but multiple referenced files")
         implementation = extract_file_references(self.extract_section(plan_content, "Implementation Steps"))
         missing_impl_refs = sorted(files_changed - implementation)
         if missing_impl_refs:
@@ -991,16 +1013,6 @@ class AuthorValidationService:
         failures.extend(self.localized_backend_grounding_failures(plan_content, repo_understanding, requirements_text))
         failures.extend(self.files_changed_subset_failures(plan_content, files_changed_allowlist))
         if min_grounding_ratio is not None:
-            requirement_paths = AuthorValidationService.paths_mentioned_in_requirements(requirements_text)
-            verified_paths = (
-                set(getattr(repo_understanding, "file_contents", {}).keys())
-                | set(getattr(repo_understanding, "entrypoints", []))
-                | set(getattr(repo_understanding, "core_modules", []))
-                | set(getattr(repo_understanding, "relevant_modules", []))
-                | set(getattr(repo_understanding, "relevant_tests", []))
-                | set(verified_paths_extra or set())
-                | requirement_paths
-            )
             grounding, _, _ = self.grounding_failures(
                 plan_content=plan_content,
                 verified_paths=verified_paths,

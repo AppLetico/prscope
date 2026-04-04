@@ -25,3 +25,7 @@ class PlanningRoundContext:
     model_policy: ResolvedModelPolicy | None = None
     event_callback: Any | None = None
     refinement_evidence: dict[str, Any] | None = None
+    # True when re-running design review for the same session round (pending critique replaced).
+    same_round_repeat: bool = False
+    # When True, skip critic validation_review LLM after repair/revise (e.g. PlanPanel issue follow-up).
+    skip_validation_review: bool = False

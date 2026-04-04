@@ -51,6 +51,8 @@ class PlanningState:
     issue_tracker: Any | None = None
     architecture_change_count: int = 0
     architecture_change_rounds: list[bool] = field(default_factory=list)
+    # True only for the apply_critique round: skip critic validation_review; user runs Review when ready.
+    defer_validation_after_apply: bool = False
 
     # Clarification and summaries
     clarification_logs: list[dict[str, Any]] = field(default_factory=list)

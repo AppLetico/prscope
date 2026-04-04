@@ -11,6 +11,7 @@ from prscope.planning.runtime.authoring.models import EvidenceBundle
 from prscope.planning.runtime.authoring.pipeline import AuthorPlannerPipeline
 from prscope.planning.runtime.authoring.planner_paths import planner_verified_file_paths
 from prscope.planning.runtime.authoring.validation import AuthorValidationService
+from prscope.planning.runtime.pipeline.stages import PlanningStages
 
 
 def test_is_server_api_or_auth_true_for_boundary_not_fastapi_alone() -> None:
@@ -32,6 +33,18 @@ def test_files_changed_subset_failures() -> None:
     failures = AuthorValidationService.files_changed_subset_failures(md, allow)
     assert failures
     assert "outside evidence allowlist" in failures[0]
+
+
+def test_merge_refinement_allowlist_with_verified_paths_unions_session_anchors() -> None:
+    """Session-verified paths (prior plan / tool reads) must widen the repo allowlist."""
+    base = {"src/a.py", "src/b.py"}
+    verified = {"src/c.py", "src/a.py"}
+    merged = PlanningStages._merge_refinement_allowlist_with_verified_paths(base, verified)
+    assert merged == {"src/a.py", "src/b.py", "src/c.py"}
+
+
+def test_merge_refinement_allowlist_with_verified_paths_preserves_none() -> None:
+    assert PlanningStages._merge_refinement_allowlist_with_verified_paths(None, {"x.py"}) is None
 
 
 def test_requirement_named_paths_count_as_verified_for_unknown_refs() -> None:

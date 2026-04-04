@@ -74,11 +74,13 @@ Defined in `PlanningCore.ALLOWED_TRANSITIONS`:
 
 Executor command matrix (server-derived):
 
-- `draft`: `message`, `reset`
-- `refining`: `run_round`, `message`, `reset`
-- `converged`: `run_round`, `message`, `approve`, `reset`
+- `draft`: `message`, `reset`, `export`
+- `refining`: `run_round`, `run_critique`, `apply_critique`, `message`, `followup_answer`, `reset`, `export`
+- `converged`: `run_round`, `run_critique`, `apply_critique`, `message`, `followup_answer`, `approve`, `reset`, `export`
 - `approved`: `export`, `reset`
 - while processing with live lease: `cancel` only
+
+**Split review UX:** `run_critique` runs the critic design review only and sets `critique_pending_apply` on the session row until the user runs `apply_critique` (author repair/revise, then convergence), sends a refinement chat message that uses the stored critique, or resets the session. **`apply_critique` does not run the critic `validation_review` stage** (no automatic critic pass after apply); run `run_critique` again when you want refreshed Review Notes. **Chat-driven `run_round` does not run critic `design_review`** (including “Add all to chat” + Send); it reuses `state.review` when present, otherwise derives repair context from open issues + the chat message. Chat-driven rounds still run `validation_review` after repair/revise unless skipped elsewhere. `run_round` with no `user_input` is rejected while a critique is pending application; use `apply_critique` or chat instead.
 
 ## Core Transition Function
 

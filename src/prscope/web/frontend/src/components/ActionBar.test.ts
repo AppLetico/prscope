@@ -1,7 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import { isConvergedOrApproved, scoreColor } from "./actionBarUi";
-import { formatDiagnosticsSource, formatInvestigationDensity } from "./actionBarDiagnostics";
+import type { DraftTimingDiagnostics } from "../types";
+import {
+  formatDiagnosticsSource,
+  formatInvestigationDensity,
+  formatTraceDiagnosticsForCopy,
+} from "./actionBarDiagnostics";
 
 describe("formatDiagnosticsSource", () => {
   it("labels live runtime diagnostics", () => {
@@ -49,5 +54,41 @@ describe("formatInvestigationDensity", () => {
   it("falls back safely for empty values", () => {
     expect(formatInvestigationDensity(undefined)).toBe("0.00x");
     expect(formatInvestigationDensity(-1)).toBe("0.00x");
+  });
+});
+
+describe("formatTraceDiagnosticsForCopy", () => {
+  it("formats a full diagnostics snapshot for clipboard", () => {
+    const d: DraftTimingDiagnostics = {
+      routing_heuristic_decisions: 4,
+      routing_model_decisions: 0,
+      routing_fallback_decisions: 0,
+      route_author_chat_total: 0,
+      route_lightweight_refine_total: 3,
+      route_full_refine_total: 1,
+      route_existing_feature_total: 0,
+      refinement_turns_total: 4,
+      average_refinement_turn_tokens: 9368.2,
+      investigation_trigger_total: 2,
+      investigation_trigger_rate: 0.5,
+      investigation_trigger_reason_last: "architecture_tradeoff",
+    };
+    const text = formatTraceDiagnosticsForCopy(d, "Live", "Updated from the active runtime for this session.");
+    expect(text).toContain("Trace Diagnostics");
+    expect(text).toContain("Source: Live");
+    expect(text).toContain("Heuristic: 4");
+    expect(text).toContain("Lightweight refine: 3");
+    expect(text).toContain("Avg tokens/turn: 9368");
+    expect(text).toContain("Triggers / turn: 0.50x");
+    expect(text).toContain("Last trigger: architecture_tradeoff");
+    expect(text).toContain("critique rounds or review-note counts");
+  });
+
+  it("omits last trigger when empty", () => {
+    const d: DraftTimingDiagnostics = {
+      investigation_trigger_reason_last: "",
+    };
+    const text = formatTraceDiagnosticsForCopy(d, "Empty", "No trace diagnostics were recorded for this session.");
+    expect(text).not.toContain("Last trigger:");
   });
 });

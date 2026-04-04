@@ -137,6 +137,7 @@ class PlanningSession:
     clarifications_log_json: str | None = None
     diagnostics_json: str | None = None
     event_seq: int = 0
+    critique_pending_apply: int = 0
 
     @property
     def clarifications_log(self) -> list[dict[str, Any]]:

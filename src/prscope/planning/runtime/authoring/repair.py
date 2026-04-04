@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from collections.abc import Awaitable
 from typing import Any, Callable
@@ -14,6 +15,8 @@ from ....pricing import context_window_for_model
 from .discovery import is_localized_frontend_request
 from .models import PlanDocument, RepairPlan, RevisionResult
 from .validation import localized_request_explicit_payload_change
+
+_LOG = logging.getLogger(__name__)
 
 LlmCaller = Callable[..., Awaitable[tuple[Any, str]]]
 
@@ -628,14 +631,9 @@ class AuthorRepairService:
         raw_user = str(user_message.get("content") or "")
         capped, truncated = self._cap_revise_plan_user_content(raw_user, model_override)
         if truncated:
-            await self._emit(
-                {
-                    "type": "warning",
-                    "message": (
-                        "Author revise prompt was truncated to fit the model context window. "
-                        "The plan file in the UI is unchanged; only the LLM prompt was shortened."
-                    ),
-                }
+            _LOG.warning(
+                "Author revise prompt was truncated to fit the model context window. "
+                "The plan file in the UI is unchanged; only the LLM prompt was shortened."
             )
         user_message = {"role": "user", "content": capped}
         payload = await self._call_json_object(

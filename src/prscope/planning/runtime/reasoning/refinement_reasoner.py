@@ -281,7 +281,27 @@ class RefinementReasoner(Reasoner[RefinementDecision]):
         return "chat"
 
     @staticmethod
+    def looks_like_plan_panel_issue_followup(user_message: str) -> bool:
+        """True for composer text seeded from PlanPanel (single issue or Add all to chat).
+
+        These prompts are often long and mention security/architecture in issue copy; they must not
+        be misclassified as broad full-plan rewrites (which would route to full_refine + critic
+        validation_review). Matching here also lets chat_flow skip validation_review for full_refine.
+        """
+        t = user_message.strip()
+        if not t:
+            return False
+        lower = t.lower()
+        if "please update the plan to address these review notes:" in lower:
+            return True
+        if "please update the plan to address" in lower and "tracked issue id" in lower:
+            return True
+        return False
+
+    @staticmethod
     def is_small_request(user_message: str) -> bool:
+        if RefinementReasoner.looks_like_plan_panel_issue_followup(user_message):
+            return True
         normalized = " ".join(user_message.lower().split())
         if not normalized or len(normalized) > 280:
             return False
@@ -615,11 +635,27 @@ class RefinementReasoner(Reasoner[RefinementDecision]):
         explicit_matches = [
             issue["id"] for issue in issues if issue.get("id") and issue["id"].lower() in normalized_message
         ]
+        batch_multi = len(explicit_matches) > 1 and any(
+            hint in normalized_message
+            for hint in (
+                "these review notes",
+                "tracked issue ids",
+                "tracked issue id:",
+            )
+        )
         if len(explicit_matches) == 1:
             return RefinementDecision(
                 route="issue_resolution",
                 confidence=0.9,
                 evidence=[f"explicit_issue_id:{explicit_matches[0]}"],
+                decision_source="refinement_reasoner",
+                issue_resolution=explicit_matches,
+            )
+        if batch_multi:
+            return RefinementDecision(
+                route="issue_resolution",
+                confidence=0.88,
+                evidence=[f"explicit_issue_ids:{','.join(explicit_matches)}"],
                 decision_source="refinement_reasoner",
                 issue_resolution=explicit_matches,
             )

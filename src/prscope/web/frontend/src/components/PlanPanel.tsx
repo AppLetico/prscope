@@ -1,11 +1,13 @@
-import { useState, useEffect, useRef } from "react";
+import { useState, useEffect, useRef, useLayoutEffect, useCallback, type CSSProperties } from "react";
+import { createPortal } from "react-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { FileText, Copy, Check, Download, AlertCircle, Clock } from "lucide-react";
 import { clsx } from "clsx";
 import { Tooltip } from "./ui/Tooltip";
 import { IssuePanel } from "./IssuePanel";
-import { getPressuredDecisions, getRelatedDecisionSummaries, getTopPressureSummary } from "../lib/impactView";
+import { dedupeOpenIssueNodesByDescription } from "../lib/issueDedupe";
+import { getRelatedDecisionSummaries } from "../lib/impactView";
 import { preprocessPlanMarkdown } from "../lib/markdown";
 import { planMarkdownComponents } from "../lib/markdownComponents";
 import { augmentPlanMarkdownWithDecisionGraph } from "../lib/decisionGraphRender";
@@ -44,14 +46,47 @@ export function PlanPanel({
   const [copied, setCopied] = useState(false);
   const [showIssuesPopup, setShowIssuesPopup] = useState(false);
   const [activeIssueTab, setActiveIssueTab] = useState<"issues" | "violations" | "resolved">("issues");
-  const issuesPopupRef = useRef<HTMLDivElement>(null);
+  /** Anchor for fixed positioning of the portaled IssuePanel (must match the review-notes control). */
+  const issuesTriggerRef = useRef<HTMLDivElement>(null);
+  const issuePanelRef = useRef<HTMLDivElement>(null);
+  const [issuePanelFloatStyle, setIssuePanelFloatStyle] = useState<CSSProperties>({});
   const toolbarRef = useRef<HTMLDivElement>(null);
+
+  const positionIssuePanel = useCallback(() => {
+    const el = issuesTriggerRef.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    const margin = 12;
+    const maxW = Math.min(560, window.innerWidth - margin * 2);
+    const left = Math.min(Math.max(margin, r.left), window.innerWidth - maxW - margin);
+    setIssuePanelFloatStyle({
+      position: "fixed",
+      top: r.bottom + margin,
+      left,
+      width: maxW,
+      maxHeight: "min(600px, calc(100vh - 24px))",
+      zIndex: 500,
+    });
+  }, []);
+
+  useLayoutEffect(() => {
+    if (!showIssuesPopup) return;
+    positionIssuePanel();
+    const onScrollOrResize = () => positionIssuePanel();
+    window.addEventListener("resize", onScrollOrResize);
+    document.addEventListener("scroll", onScrollOrResize, true);
+    return () => {
+      window.removeEventListener("resize", onScrollOrResize);
+      document.removeEventListener("scroll", onScrollOrResize, true);
+    };
+  }, [showIssuesPopup, positionIssuePanel]);
 
   useEffect(() => {
     function handleClickOutside(event: MouseEvent) {
-      if (toolbarRef.current && !toolbarRef.current.contains(event.target as Node)) {
-        setShowIssuesPopup(false);
-      }
+      const target = event.target as Node;
+      if (toolbarRef.current?.contains(target)) return;
+      if (issuePanelRef.current?.contains(target)) return;
+      setShowIssuesPopup(false);
     }
     document.addEventListener("mousedown", handleClickOutside);
     return () => document.removeEventListener("mousedown", handleClickOutside);
@@ -78,7 +113,8 @@ export function PlanPanel({
     }
   };
 
-  const openIssues = (health?.issueGraph?.nodes?.filter((node) => node.status === "open") ?? []) as IssueGraphNode[];
+  const openIssuesRaw = (health?.issueGraph?.nodes?.filter((node) => node.status === "open") ?? []) as IssueGraphNode[];
+  const openIssues = dedupeOpenIssueNodesByDescription(openIssuesRaw, 0.5);
   const resolvedIssues = (health?.issueGraph?.nodes?.filter((node) => node.status === "resolved") ?? [])
     .slice()
     .sort((a, b) => a.id.localeCompare(b.id)) as IssueGraphNode[];
@@ -97,9 +133,6 @@ export function PlanPanel({
   const constraintViolationsCount = health?.constraintViolationsCount ?? 0;
   const reviewItemsCount = (health?.openIssuesCount ?? 0) + constraintViolationsCount;
   const reviewLabel = reviewItemsCount > 0 ? `${reviewItemsCount} review notes` : "Review notes";
-  const pressuredDecisions = getPressuredDecisions(impactView);
-  const pressuredDecisionCount = pressuredDecisions.length;
-  const topPressureSummary = getTopPressureSummary(impactView, decisionGraph);
   const planCharacterCount = content.trim().length;
   const planWordCount = content.trim() ? content.trim().split(/\s+/).length : 0;
   const renderedContent = preprocessPlanMarkdown(augmentPlanMarkdownWithDecisionGraph(content, decisionGraph));
@@ -165,7 +198,7 @@ export function PlanPanel({
         <div className="flex items-center justify-between gap-4 px-6 py-4 border-b border-zinc-800/40">
           {health ? (
             <div className="flex items-center gap-3 text-[11px] text-zinc-400 flex-wrap" ref={toolbarRef}>
-              <div className="relative" ref={issuesPopupRef}>
+              <div className="relative" ref={issuesTriggerRef}>
                 <Tooltip content="Open review notes, issues, and violations">
                   <button 
                     type="button"
@@ -191,46 +224,52 @@ export function PlanPanel({
                     <span className="font-medium">{reviewLabel}</span>
                   </button>
                 </Tooltip>
-
-                {showIssuesPopup && (
-                  <IssuePanel
-                    openIssues={openIssues}
-                    rootIssueIds={rootIssueIds}
-                    resolvedIssues={resolvedIssues}
-                    constraintViolations={health.constraintViolations ?? []}
-                    decisionGraph={decisionGraph}
-                    impactView={impactView}
-                    onAppendIssue={appendIssuePrompt}
-                    onAppendAllIssues={appendAllIssuesPrompt}
-                    onClose={() => setShowIssuesPopup(false)}
-                    className="left-0 right-auto origin-top-left w-[560px] max-w-[calc(100vw-2rem)]"
-                    initialTab={activeIssueTab}
-                  />
-                )}
               </div>
 
-              {pressuredDecisionCount > 0 ? (
-                <Tooltip content="Architectural decisions currently under pressure from review findings">
-                  <div className="flex items-center gap-2 px-3 py-1.5 rounded-full border border-indigo-500/20 bg-indigo-500/10 text-indigo-300">
-                    <AlertCircle className="w-3.5 h-3.5" />
-                    <span className="font-medium">
-                      {pressuredDecisionCount} decision{pressuredDecisionCount === 1 ? "" : "s"} under pressure
-                    </span>
-                  </div>
-                </Tooltip>
-              ) : null}
+              {showIssuesPopup
+                ? createPortal(
+                    <IssuePanel
+                      ref={issuePanelRef}
+                      portaled
+                      floatingStyle={issuePanelFloatStyle}
+                      openIssues={openIssues}
+                      rootIssueIds={rootIssueIds}
+                      resolvedIssues={resolvedIssues}
+                      constraintViolations={health.constraintViolations ?? []}
+                      decisionGraph={decisionGraph}
+                      impactView={impactView}
+                      onAppendIssue={appendIssuePrompt}
+                      onAppendAllIssues={appendAllIssuesPrompt}
+                      onClose={() => setShowIssuesPopup(false)}
+                      initialTab={activeIssueTab}
+                    />,
+                    document.body,
+                  )
+                : null}
 
-              {health.snapshotUpdatedAt ? (
-                <Tooltip content={`Last updated: ${new Date(health.snapshotUpdatedAt).toLocaleString()}`}>
-                  <div className="flex items-center gap-1.5 px-2 py-1 text-zinc-600">
-                    <Clock className="w-3.5 h-3.5" />
-                    <span>{new Date(health.snapshotUpdatedAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}</span>
-                  </div>
-                </Tooltip>
-              ) : null}
-              <Tooltip content={`Plan length: ${planWordCount.toLocaleString()} words, ${planCharacterCount.toLocaleString()} characters`}>
+              <Tooltip
+                content={
+                  health.snapshotUpdatedAt
+                    ? `Last updated: ${new Date(health.snapshotUpdatedAt).toLocaleString()} · ${planWordCount.toLocaleString()} words`
+                    : `Plan length: ${planWordCount.toLocaleString()} words, ${planCharacterCount.toLocaleString()} characters`
+                }
+              >
                 <div className="flex items-center gap-1.5 px-2 py-1 text-zinc-600">
-                  <FileText className="w-3.5 h-3.5" />
+                  {health.snapshotUpdatedAt ? (
+                    <>
+                      <Clock className="w-3.5 h-3.5 shrink-0" />
+                      <span>
+                        {new Date(health.snapshotUpdatedAt).toLocaleTimeString([], {
+                          hour: "2-digit",
+                          minute: "2-digit",
+                        })}
+                      </span>
+                      <span className="text-zinc-700" aria-hidden>
+                        ·
+                      </span>
+                    </>
+                  ) : null}
+                  <FileText className="w-3.5 h-3.5 shrink-0" />
                   <span>{planSizeLabel}</span>
                 </div>
               </Tooltip>
@@ -268,22 +307,6 @@ export function PlanPanel({
             </Tooltip>
           </div>
         </div>
-        {topPressureSummary ? (
-          <div className="border-b border-zinc-800/30 bg-indigo-500/5 px-6 py-3">
-            <div className="flex flex-wrap items-center gap-2 text-xs text-indigo-200">
-              <span className="font-semibold uppercase tracking-wider text-indigo-300">Top pressure</span>
-              <span className="rounded-full border border-indigo-500/20 bg-indigo-500/10 px-2 py-0.5">
-                {topPressureSummary.label}
-              </span>
-              {topPressureSummary.dominantCluster ? (
-                <>
-                  <span className="text-zinc-400">Root cause: {topPressureSummary.dominantCluster.rootIssue}</span>
-                  <span className="text-zinc-500">Action: {topPressureSummary.dominantCluster.suggestedAction}</span>
-                </>
-              ) : null}
-            </div>
-          </div>
-        ) : null}
         <div className="pb-12">
           <div className="max-w-3xl mx-auto pt-6 py-12 px-4 md:px-8">
             <article className="prose prose-zinc prose-invert max-w-none">

@@ -70,7 +70,7 @@ describe("augmentPlanMarkdownWithDecisionGraph", () => {
     expect(matches).toHaveLength(1);
   });
 
-  it("injects Decision map (auto) mermaid when graph has edges and no existing mermaid in Architecture", () => {
+  it("does not inject Decision map (auto) mermaid into the plan draft view", () => {
     const graph: DecisionGraph = {
       nodes: {
         a: {
@@ -94,27 +94,8 @@ describe("augmentPlanMarkdownWithDecisionGraph", () => {
       graph,
     );
 
-    expect(rendered).toContain("### Decision map (auto)");
-    expect(rendered).toContain("```mermaid");
-    expect(rendered).toContain("flowchart LR");
-    expect(rendered).toContain("calls");
-  });
-
-  it("does not inject auto mermaid when Architecture already has a mermaid fence", () => {
-    const graph: DecisionGraph = {
-      nodes: {
-        a: { id: "a", description: "A", section: "architecture", value: "v" },
-        b: { id: "b", description: "B", section: "architecture", value: "v" },
-      },
-      edges: [{ source: "a", target: "b", relation: "r" }],
-    };
-
-    const rendered = augmentPlanMarkdownWithDecisionGraph(
-      "# Plan\n\n## Architecture\n```mermaid\nflowchart LR\n  X-->Y\n```\n",
-      graph,
-    );
-
-    expect(rendered).not.toContain("Decision map (auto)");
+    expect(rendered).not.toContain("### Decision map (auto)");
+    expect(rendered).not.toContain("flowchart LR");
   });
 });
 

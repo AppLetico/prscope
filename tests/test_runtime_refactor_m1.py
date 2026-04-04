@@ -93,6 +93,44 @@ def test_issue_similarity_lexical_fallback(tmp_path):
     assert duplicate == "issue_1"
 
 
+def test_issue_similarity_lexical_narrow_paraphrase_merges_performance_monitoring(tmp_path):
+    del tmp_path
+    service = IssueSimilarityService(
+        IssueDedupeConfig(
+            embeddings_enabled="false",
+            embedding_model="unused",
+            similarity_threshold=0.9,
+            fallback_mode="lexical",
+        )
+    )
+    duplicate = service.find_duplicate(
+        "Lack of specific performance monitoring strategy for middleware.",
+        [
+            ("issue_17", "Performance monitoring strategy is still vague and lacks detail."),
+        ],
+    )
+    assert duplicate == "issue_17"
+
+
+def test_issue_similarity_lexical_does_not_merge_distinct_error_handling_notes(tmp_path):
+    del tmp_path
+    service = IssueSimilarityService(
+        IssueDedupeConfig(
+            embeddings_enabled="false",
+            embedding_model="unused",
+            similarity_threshold=0.9,
+            fallback_mode="lexical",
+        )
+    )
+    duplicate = service.find_duplicate(
+        "Lack of clear error handling for failed health checks could lead to misleading health statuses.",
+        [
+            ("issue_2", "Lack of a clear strategy for error handling in the new health checks."),
+        ],
+    )
+    assert duplicate is None
+
+
 def test_issue_similarity_embeddings_primary_path(tmp_path, monkeypatch):
     del tmp_path
 
@@ -118,6 +156,118 @@ def test_issue_similarity_embeddings_primary_path(tmp_path, monkeypatch):
     )
     duplicate = service.find_duplicate("candidate issue", [("issue_1", "existing issue")])
     assert duplicate == "issue_1"
+
+
+def test_issue_similarity_embedding_lexical_tiebreak_below_threshold(tmp_path, monkeypatch):
+    """Embedding similarity in 0.75–threshold band merges when lexical says duplicate."""
+
+    del tmp_path
+
+    class FakeLiteLLM:
+        @staticmethod
+        def embedding(model, input):  # type: ignore[no-untyped-def]
+            del model
+            text = input[0]
+            # Cosine similarity ~0.77 between candidate and existing (below default 0.82 threshold).
+            if "Lack of specific performance" in text:
+                vector = [1.0, 0.0, 0.0]
+            else:
+                vector = [0.77, 0.637394, 0.0]
+            return type("Resp", (), {"data": [{"embedding": vector}]})
+
+    monkeypatch.setitem(__import__("sys").modules, "litellm", FakeLiteLLM)
+    service = IssueSimilarityService(
+        IssueDedupeConfig(
+            embeddings_enabled="true",
+            embedding_model="text-embedding-004",
+            similarity_threshold=0.82,
+            fallback_mode="none",
+        )
+    )
+    duplicate = service.find_duplicate(
+        "Lack of specific performance monitoring strategy for middleware.",
+        [
+            ("issue_17", "Performance monitoring strategy is still vague and lacks detail."),
+        ],
+    )
+    assert duplicate == "issue_17"
+
+
+def test_issue_similarity_embedding_tiebreak_does_not_merge_distinct_issues(tmp_path, monkeypatch):
+    """Inconclusive embedding band must not merge when lexical says distinct."""
+
+    del tmp_path
+
+    class FakeLiteLLM:
+        @staticmethod
+        def embedding(model, input):  # type: ignore[no-untyped-def]
+            del model
+            text = input[0]
+            if "error handling for failed health" in text:
+                vector = [1.0, 0.0, 0.0]
+            else:
+                vector = [0.77, 0.637394, 0.0]
+            return type("Resp", (), {"data": [{"embedding": vector}]})
+
+    monkeypatch.setitem(__import__("sys").modules, "litellm", FakeLiteLLM)
+    service = IssueSimilarityService(
+        IssueDedupeConfig(
+            embeddings_enabled="true",
+            embedding_model="text-embedding-004",
+            similarity_threshold=0.82,
+            fallback_mode="none",
+        )
+    )
+    duplicate = service.find_duplicate(
+        "Lack of clear error handling for failed health checks could lead to misleading health statuses.",
+        [
+            ("issue_2", "Lack of a clear strategy for error handling in the new health checks."),
+        ],
+    )
+    assert duplicate is None
+
+
+def test_issue_similarity_sequence_merges_near_identical_prose(tmp_path):
+    """Token Jaccard can miss long near-identical sentences; sequence ratio catches them."""
+    del tmp_path
+    service = IssueSimilarityService(
+        IssueDedupeConfig(
+            embeddings_enabled="false",
+            embedding_model="unused",
+            similarity_threshold=0.9,
+            fallback_mode="lexical",
+        )
+    )
+    existing = (
+        "The plan should explicitly reference how the new middleware layer coordinates "
+        "with existing authentication flows and failure handling."
+    )
+    incoming = (
+        "The plan should explicitly reference how new middleware coordinates with "
+        "existing authentication flows and failure handling."
+    )
+    assert service.find_duplicate(incoming, [("issue_1", existing)]) == "issue_1"
+
+
+def test_issue_similarity_substring_containment_merges_expanded_wording(tmp_path):
+    del tmp_path
+    service = IssueSimilarityService(
+        IssueDedupeConfig(
+            embeddings_enabled="false",
+            embedding_model="unused",
+            similarity_threshold=0.9,
+            fallback_mode="lexical",
+        )
+    )
+    core = (
+        "Architecture violates layering boundaries between modules and should be clarified "
+        "in the files changed section."
+    )
+    wrapped = (
+        "We should note that architecture violates layering boundaries between modules and "
+        "should be clarified in the files changed section before implementation."
+    )
+    assert service.find_duplicate(wrapped, [("issue_1", core)]) == "issue_1"
 
 
 @pytest.mark.asyncio

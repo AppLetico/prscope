@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any
@@ -16,6 +17,8 @@ from ..llm_retry import (
 )
 from ..telemetry import completion_telemetry
 from ..tools import CODEBASE_TOOLS
+
+_LOG = logging.getLogger(__name__)
 
 
 @dataclass
@@ -214,19 +217,8 @@ class AuthorLLMClient:
             telemetry = completion_telemetry(response, model=model)
             context_window = MODEL_CONTEXT_WINDOWS.get(model)
             if model not in MODEL_CONTEXT_WINDOWS:
-                await self._emit(
-                    {
-                        "type": "warning",
-                        "message": f"Unknown model '{model}' - context window tracking disabled",
-                    }
-                )
-            if model not in MODEL_CONTEXT_WINDOWS:
-                await self._emit(
-                    {
-                        "type": "warning",
-                        "message": f"Unknown model '{model}' - cost tracking disabled for this call",
-                    }
-                )
+                _LOG.warning("Unknown model '%s' - context window tracking disabled", model)
+                _LOG.warning("Unknown model '%s' - cost tracking disabled for this call", model)
             await self._emit(
                 {
                     "type": "token_usage",
@@ -246,14 +238,11 @@ class AuthorLLMClient:
                 }
             )
             if context_window and telemetry.usage.prompt_tokens > int(context_window * 0.75):
-                await self._emit(
-                    {
-                        "type": "warning",
-                        "message": (
-                            f"Prompt tokens {telemetry.usage.prompt_tokens} exceed "
-                            f"75% of context window ({context_window}) for {model}"
-                        ),
-                    }
+                _LOG.warning(
+                    "Prompt tokens %s exceed 75%% of context window (%s) for %s",
+                    telemetry.usage.prompt_tokens,
+                    context_window,
+                    model,
                 )
             return chat_like, model
 
@@ -274,19 +263,8 @@ class AuthorLLMClient:
         telemetry = completion_telemetry(response, model=model)
         context_window = MODEL_CONTEXT_WINDOWS.get(model)
         if model not in MODEL_CONTEXT_WINDOWS:
-            await self._emit(
-                {
-                    "type": "warning",
-                    "message": f"Unknown model '{model}' - context window tracking disabled",
-                }
-            )
-        if model not in MODEL_CONTEXT_WINDOWS:
-            await self._emit(
-                {
-                    "type": "warning",
-                    "message": f"Unknown model '{model}' - cost tracking disabled for this call",
-                }
-            )
+            _LOG.warning("Unknown model '%s' - context window tracking disabled", model)
+            _LOG.warning("Unknown model '%s' - cost tracking disabled for this call", model)
         await self._emit(
             {
                 "type": "token_usage",
@@ -306,14 +284,11 @@ class AuthorLLMClient:
             }
         )
         if context_window and telemetry.usage.prompt_tokens > int(context_window * 0.75):
-            await self._emit(
-                {
-                    "type": "warning",
-                    "message": (
-                        f"Prompt tokens {telemetry.usage.prompt_tokens} exceed "
-                        f"75% of context window ({context_window}) for {model}"
-                    ),
-                }
+            _LOG.warning(
+                "Prompt tokens %s exceed 75%% of context window (%s) for %s",
+                telemetry.usage.prompt_tokens,
+                context_window,
+                model,
             )
         return response, model
 
@@ -384,14 +359,11 @@ class AuthorLLMClient:
                         )
                         await async_sleep(delay)
                         continue
-                    await self._emit(
-                        {
-                            "type": "warning",
-                            "message": (
-                                f"Author call timeout on {model} after {per_call_timeout_seconds}s"
-                                + ("; trying fallback model." if idx < len(models_to_try) - 1 else ".")
-                            ),
-                        }
+                    _LOG.warning(
+                        "Author call timeout on %s after %ss%s",
+                        model,
+                        per_call_timeout_seconds,
+                        "; trying fallback model." if idx < len(models_to_try) - 1 else ".",
                     )
                     if idx == len(models_to_try) - 1:
                         raise RuntimeError(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from dataclasses import asdict
 from typing import Any
@@ -25,6 +26,8 @@ from ..reasoning import (
 )
 from ..review import build_impact_view
 from ..tools import extract_file_references
+
+_LOG = logging.getLogger(__name__)
 
 
 class RuntimeChatFlow:
@@ -176,14 +179,15 @@ class RuntimeChatFlow:
             )
         )
         resolved_ids = list(decision.issue_resolution)
-        if len(resolved_ids) != 1:
+        if len(resolved_ids) < 1:
             return None
-        tracker.resolve_issue(
-            resolved_ids[0],
-            round_number,
-            propagate_causes=False,
-            resolution_source="lightweight",
-        )
+        for rid in resolved_ids:
+            tracker.resolve_issue(
+                rid,
+                round_number,
+                propagate_causes=False,
+                resolution_source="lightweight",
+            )
         return resolved_ids[0]
 
     @staticmethod
@@ -486,7 +490,6 @@ class RuntimeChatFlow:
                 raise ValueError("Lightweight edit produced no material section changes")
             updated_markdown = render_markdown(updated_plan)
 
-            core.add_turn("user", user_message, round_number=round_number)
             version = core.save_plan_version(
                 updated_markdown,
                 round_number=round_number,
@@ -511,6 +514,10 @@ class RuntimeChatFlow:
             state.architecture_change_rounds.append(architecture_changed)
             if len(state.architecture_change_rounds) > 8:
                 state.architecture_change_rounds = state.architecture_change_rounds[-8:]
+            # Record the user turn only after the plan save succeeds. If we added it earlier and a
+            # later step failed, handle_refinement_message would fall back to a full adversarial
+            # round and append the same user message twice in the transcript.
+            core.add_turn("user", user_message, round_number=round_number)
             reply = str(payload.get("assistant_reply", "")).strip() or (
                 f"Applied your requested plan edit. Updated sections: {', '.join(changed_sections)}."
             )
@@ -991,6 +998,7 @@ class RuntimeChatFlow:
         event_callback: Any | None = None,
     ) -> tuple[str, str | None]:
         """Route refinement chat to either conversational reply or plan update round."""
+        skip_issue_followup_validation = RefinementReasoner.looks_like_plan_panel_issue_followup(user_message)
         core = self._runtime._core(session_id)
         current_plan = core.get_current_plan()
         recent_turns = core.get_conversation()[-8:]
@@ -1089,6 +1097,7 @@ class RuntimeChatFlow:
                     author_model_override=author_model_override,
                     critic_model_override=critic_model_override,
                     event_callback=event_callback,
+                    skip_validation_review=skip_issue_followup_validation,
                 )
             return ("refine_round", None)
         if chosen_route == "full_refine":
@@ -1104,14 +1113,7 @@ class RuntimeChatFlow:
                         event_callback=event_callback,
                     )
                 except Exception as exc:  # noqa: BLE001
-                    await self._runtime._emit_event(
-                        event_callback,
-                        {
-                            "type": "warning",
-                            "message": f"Refinement evidence refresh failed; continuing without it: {exc}",
-                        },
-                        session_id,
-                    )
+                    _LOG.warning("Refinement evidence refresh failed; continuing without it: %s", exc)
             await self._emit_routing_decision(
                 event_callback=event_callback,
                 session_id=session_id,
@@ -1132,6 +1134,7 @@ class RuntimeChatFlow:
                 author_model_override=author_model_override,
                 critic_model_override=critic_model_override,
                 event_callback=event_callback,
+                skip_validation_review=skip_issue_followup_validation,
             )
             return ("refine_round", None)
         await self._emit_routing_decision(

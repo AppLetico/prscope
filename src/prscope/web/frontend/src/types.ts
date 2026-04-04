@@ -28,6 +28,8 @@ export interface PlanningSession {
   /** Present on GET session when max_prompt_tokens and models allow derivation (peak prompt / context window). */
   context_window_tokens?: number | null;
   context_usage_ratio?: number | null;
+  /** 1 when design review finished but author revision not yet applied (split review UX). */
+  critique_pending_apply?: number | boolean;
 }
 
 export interface DraftTimingDiagnostics {

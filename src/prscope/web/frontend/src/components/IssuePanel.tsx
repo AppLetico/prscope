@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useMemo, type ComponentType } from "react";
+import { useState, useEffect, useMemo, forwardRef, type ComponentType, type CSSProperties } from "react";
 import { AlertCircle, ShieldAlert, X, MessageSquarePlus, CheckCircle2 } from "lucide-react";
 import { clsx } from "clsx";
 import { getRelatedDecisionSummaries } from "../lib/impactView";
@@ -16,25 +16,36 @@ interface IssuePanelProps {
   onClose: () => void;
   className?: string;
   initialTab?: Tab;
+  /**
+   * When true, render as `position: fixed` with `floatingStyle` (used with `createPortal` to `document.body`).
+   * Required for correct stacking above the chat column: sibling panels paint in DOM order, so z-index inside
+   * the plan column cannot sit above the chat UI.
+   */
+  portaled?: boolean;
+  floatingStyle?: CSSProperties;
 }
 
 type Tab = "issues" | "violations" | "resolved";
 
-export function IssuePanel({
-  openIssues,
-  rootIssueIds = [],
-  resolvedIssues,
-  constraintViolations,
-  decisionGraph = null,
-  impactView = null,
-  onAppendIssue,
-  onAppendAllIssues,
-  onClose,
-  className,
-  initialTab = "issues",
-}: IssuePanelProps) {
+export const IssuePanel = forwardRef<HTMLDivElement, IssuePanelProps>(function IssuePanel(
+  {
+    openIssues,
+    rootIssueIds = [],
+    resolvedIssues,
+    constraintViolations,
+    decisionGraph = null,
+    impactView = null,
+    onAppendIssue,
+    onAppendAllIssues,
+    onClose,
+    className,
+    initialTab = "issues",
+    portaled = false,
+    floatingStyle,
+  },
+  ref,
+) {
   const [activeTab, setActiveTab] = useState<Tab>(initialTab);
-  const panelRef = useRef<HTMLDivElement>(null);
   const rootIssueIdSet = useMemo(() => new Set(rootIssueIds), [rootIssueIds]);
   const sortedOpenIssues = useMemo(
     () =>
@@ -53,14 +64,17 @@ export function IssuePanel({
 
   return (
     <div 
-      ref={panelRef}
+      ref={ref}
       className={clsx(
-        "absolute top-full mt-3 right-0 z-50 w-[480px] max-h-[600px] flex flex-col",
-        "bg-zinc-900/95 backdrop-blur-xl border border-zinc-800",
+        "flex flex-col bg-zinc-900/95 backdrop-blur-xl border border-zinc-800",
         "rounded-xl shadow-2xl shadow-black/50 ring-1 ring-white/10",
-        "origin-top-right animate-in fade-in zoom-in-95 duration-200",
+        portaled
+          ? "origin-top-left animate-in fade-in zoom-in-95 duration-200"
+          : "absolute top-full right-0 z-[100] mt-3 w-[480px] max-h-[600px] origin-top-right animate-in fade-in zoom-in-95 duration-200",
+        !portaled && "max-h-[600px]",
         className
       )}
+      style={portaled ? floatingStyle : undefined}
     >
       {/* Header */}
       <div className="flex items-center justify-between px-5 py-4 border-b border-zinc-800/50">
@@ -68,7 +82,8 @@ export function IssuePanel({
           <div className="w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]" />
           Review Notes
         </h3>
-        <button 
+        <button
+          type="button"
           onClick={onClose}
           className="text-zinc-500 hover:text-zinc-300 transition-colors p-1 hover:bg-zinc-800 rounded-md"
         >
@@ -115,7 +130,12 @@ export function IssuePanel({
                     {sortedOpenIssues.length} Open issues
                   </span>
                   <button
-                    onClick={onAppendAllIssues}
+                    type="button"
+                    onClick={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      onAppendAllIssues();
+                    }}
                     className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-indigo-500/10 border border-indigo-500/20 text-indigo-400 hover:bg-indigo-500/20 hover:text-indigo-300 transition-all text-xs font-medium group"
                   >
                     <MessageSquarePlus className="w-3.5 h-3.5 group-hover:scale-110 transition-transform" />
@@ -213,7 +233,9 @@ export function IssuePanel({
       </div>
     </div>
   );
-}
+});
+
+IssuePanel.displayName = "IssuePanel";
 
 function TabButton({ 
   active, 
@@ -238,6 +260,7 @@ function TabButton({
 
   return (
     <button
+      type="button"
       onClick={onClick}
       className={clsx(
         "flex h-11 shrink-0 items-center gap-2 px-4 py-2.5 text-sm font-medium border-b-2 transition-all justify-center whitespace-nowrap",
@@ -282,9 +305,14 @@ function IssueCard({
   provenanceLabel?: string;
   provenanceTone?: "review" | "lightweight";
 }) {
+  const isResolvedCard = statusTone === "resolved";
   const displaySeverity = getDisplaySeverity(issue);
   const relatedDecisions = getRelatedDecisionSummaries(issue, impactView, decisionGraph);
   const topRelatedDecision = relatedDecisions[0];
+  const resolvedSummary =
+    isResolvedCard && (statusLabel || provenanceLabel)
+      ? [statusLabel, provenanceLabel].filter(Boolean).join(" · ")
+      : null;
   const severityColors = {
     must_fix: "bg-red-500/10 text-red-400 border-red-500/20",
     needs_attention: "bg-amber-500/10 text-amber-400 border-amber-500/20",
@@ -302,43 +330,56 @@ function IssueCard({
   return (
     <div className="group relative p-4 rounded-lg bg-zinc-900 border border-zinc-800 hover:border-zinc-700 hover:bg-zinc-800/30 transition-all duration-200">
       <div className="flex items-start justify-between gap-3 mb-2">
-        <div className="flex items-center gap-2">
-          <span className="font-mono text-xs text-zinc-500 bg-zinc-800/50 px-1.5 py-0.5 rounded">
+        <div className="flex flex-wrap items-center gap-2">
+          <span
+            className={clsx(
+              "font-mono text-[10px] tabular-nums",
+              isResolvedCard ? "text-zinc-500" : "text-zinc-500 bg-zinc-800/50 px-1.5 py-0.5 rounded",
+            )}
+          >
             {issue.id}
           </span>
-          <span className={clsx(
-            "text-[10px] px-2 py-0.5 rounded-full uppercase tracking-wider font-semibold border",
-            severityColors[severity]
-          )}>
-            {severityLabel[severity]}
-          </span>
-          {isRootCause ? (
-            <span className="text-[10px] px-2 py-0.5 rounded-full uppercase tracking-wider font-semibold border bg-indigo-500/10 text-indigo-300 border-indigo-500/20">
-              Root cause
-            </span>
-          ) : null}
-          {statusLabel ? (
-            <span
-              className={clsx(
-                "text-[10px] px-2 py-0.5 rounded-full uppercase tracking-wider font-semibold border",
-                statusTone === "resolved"
-                  ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
-                  : "bg-zinc-800 text-zinc-400 border-zinc-700",
-              )}
-            >
-              {statusLabel}
-            </span>
-          ) : null}
-          {provenanceLabel ? (
-            <span
-              className={clsx(
-                "text-[10px] px-2 py-0.5 rounded-full uppercase tracking-wider font-semibold border",
-                provenanceTone === "lightweight"
-                  ? "bg-amber-500/10 text-amber-400 border-amber-500/20"
-                  : "bg-emerald-500/10 text-emerald-400 border-emerald-500/20",
-              )}
-            >
-              {provenanceLabel}
+          {!isResolvedCard ? (
+            <>
+              <span
+                className={clsx(
+                  "text-[10px] px-2 py-0.5 rounded-full uppercase tracking-wider font-semibold border",
+                  severityColors[severity],
+                )}
+              >
+                {severityLabel[severity]}
+              </span>
+              {isRootCause ? (
+                <span className="text-[10px] px-2 py-0.5 rounded-full uppercase tracking-wider font-semibold border bg-indigo-500/10 text-indigo-300 border-indigo-500/20">
+                  Root cause
+                </span>
+              ) : null}
+              {statusLabel ? (
+                <span
+                  className={clsx(
+                    "text-[10px] px-2 py-0.5 rounded-full uppercase tracking-wider font-semibold border",
+                    "bg-zinc-800 text-zinc-400 border-zinc-700",
+                  )}
+                >
+                  {statusLabel}
+                </span>
+              ) : null}
+              {provenanceLabel ? (
+                <span
+                  className={clsx(
+                    "text-[10px] px-2 py-0.5 rounded-full uppercase tracking-wider font-semibold border",
+                    provenanceTone === "lightweight"
+                      ? "bg-amber-500/10 text-amber-400 border-amber-500/20"
+                      : "bg-emerald-500/10 text-emerald-400 border-emerald-500/20",
+                  )}
+                >
+                  {provenanceLabel}
+                </span>
+              ) : null}
+            </>
+          ) : resolvedSummary ? (
+            <span className="text-[10px] px-2 py-0.5 rounded-full font-medium border border-emerald-500/25 bg-emerald-500/10 text-emerald-300">
+              {resolvedSummary}
             </span>
           ) : null}
         </div>
@@ -385,7 +426,9 @@ function IssueCard({
       {canAdd ? (
         <div className="flex items-center justify-end pt-2 border-t border-zinc-800/50 mt-2">
           <button
+            type="button"
             onClick={(e) => {
+              e.preventDefault();
               e.stopPropagation();
               onAdd();
             }}

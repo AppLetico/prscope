@@ -5,6 +5,8 @@ import { humanizePlanValidationError } from "../utils/planValidationCopy";
 
 type PlanValidationToastProps = {
   rawMessage: string;
+  /** True when the failure happened while applying a critique to the plan (user-initiated). */
+  fromApplyRevision?: boolean;
   onDismiss: () => void;
 };
 
@@ -12,7 +14,11 @@ type PlanValidationToastProps = {
  * Center-screen overlay (modal-style): persistent until dismissed. Humanized copy
  * with optional raw detail; does not auto-dismiss.
  */
-export function PlanValidationToast({ rawMessage, onDismiss }: PlanValidationToastProps) {
+export function PlanValidationToast({
+  rawMessage,
+  fromApplyRevision = false,
+  onDismiss,
+}: PlanValidationToastProps) {
   const [detailsOpen, setDetailsOpen] = useState(false);
   const friendly = humanizePlanValidationError(rawMessage);
   const detailsId = useId();
@@ -69,7 +75,9 @@ export function PlanValidationToast({ rawMessage, onDismiss }: PlanValidationToa
           </div>
 
           <p className="text-xs leading-relaxed text-zinc-500">
-            The last critic review in the thread is unchanged—only this draft update was blocked.
+            {fromApplyRevision
+              ? "The critique in the thread is unchanged—only updating the plan draft was blocked. Fix the issue above, then try Apply revision again."
+              : "The last critic review in the thread is unchanged—only this draft update was blocked."}
           </p>
 
           <div className="border-t border-zinc-800/80 pt-3">

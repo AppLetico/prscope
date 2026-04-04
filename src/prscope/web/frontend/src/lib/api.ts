@@ -207,6 +207,36 @@ export function runRound(
   });
 }
 
+export function runCritique(
+  sessionId: string,
+  models?: { author_model?: string; critic_model?: string },
+) {
+  const command_id = crypto.randomUUID();
+  return request<{
+    status: string;
+    allowed_commands?: string[];
+    idempotent_replay?: boolean;
+  }>(`/api/sessions/${sessionId}/command`, {
+    method: "POST",
+    body: JSON.stringify({ command: "run_critique", command_id, ...models }),
+  });
+}
+
+export function applyCritique(
+  sessionId: string,
+  models?: { author_model?: string; critic_model?: string },
+) {
+  const command_id = crypto.randomUUID();
+  return request<{
+    status: string;
+    allowed_commands?: string[];
+    idempotent_replay?: boolean;
+  }>(`/api/sessions/${sessionId}/command`, {
+    method: "POST",
+    body: JSON.stringify({ command: "apply_critique", command_id, ...models }),
+  });
+}
+
 export function listModels() {
   return request<{ items: ModelCatalogItem[] }>(withRepoQuery("/api/models"));
 }

@@ -19,12 +19,14 @@ import {
   getSessionSnapshot,
   listModels,
   getSession,
-  runRound,
+  runCritique,
+  applyCritique,
   sendDiscoveryMessage,
   setStoredModelSelection,
   stopSession,
   submitClarification,
 } from "../lib/api";
+import { dedupeOpenIssueNodesByDescription, dedupeSimilarCriticIssues } from "../lib/issueDedupe";
 import { cleanPlanTitle } from "../lib/planTitle";
 import type {
   ClarificationPrompt,
@@ -91,7 +93,9 @@ function parseCriticTurn(turn: PlanningTurn): {
     }
   }
 
-  const issues: IssueGraphNode[] = issueTexts.map((issue, index) => ({
+  const deduped = dedupeSimilarCriticIssues(issueTexts);
+
+  const issues: IssueGraphNode[] = deduped.map((issue, index) => ({
     id: `fallback_issue_r${turn.round}_${index + 1}`,
     description: issue.text,
     status: "open",
@@ -136,20 +140,19 @@ function deriveFallbackReviewData(turns: PlanningTurn[]): {
   }
 
   const metricsByRound = new Map<number, RoundMetric>();
-  const nodesByDescription = new Map<string, IssueGraphNode>();
+  const collected: IssueGraphNode[] = [];
   for (const item of parsed) {
     metricsByRound.set(item.roundMetric.round, item.roundMetric);
     for (const issue of item.issues) {
-      if (!nodesByDescription.has(issue.description)) {
-        nodesByDescription.set(issue.description, {
-          ...issue,
-          id: `fallback_issue_${nodesByDescription.size + 1}`,
-        });
-      }
+      collected.push(issue);
     }
   }
 
-  const nodes = [...nodesByDescription.values()];
+  const deduped = dedupeOpenIssueNodesByDescription(collected, 0.5);
+  const nodes = deduped.map((issue, index) => ({
+    ...issue,
+    id: `fallback_issue_${index + 1}`,
+  }));
   return {
     roundMetrics: [...metricsByRound.values()].sort((a, b) => a.round - b.round),
     issueGraph: {
@@ -200,11 +203,16 @@ export function PlanningViewPage() {
   const [chatInputAppendRequest, setChatInputAppendRequest] = useState<{ id: number; text: string } | null>(null);
   /** Plan draft failed validation (distinct from critic chat turns); shown next to composer, not top banner. */
   const [planValidationBlock, setPlanValidationBlock] = useState<string | null>(null);
+  const [planValidationFromApply, setPlanValidationFromApply] = useState(false);
+  const [applyCritiquePending, setApplyCritiquePending] = useState(false);
+  const [focusChatNonce, setFocusChatNonce] = useState(0);
   const [latestResponseMode, setLatestResponseMode] = useState<"author_chat" | "refine_round" | null>(null);
   const lastEventAtMs = useRef<number>(0);
   const lastRefetchAtMs = useRef<number>(0);
   const lastContextNoticeAtMs = useRef<number>(0);
   const lastVersionSeen = useRef<number>(0);
+  /** Tracks SSE session_state processing flag so we refetch after work completes (plan + impact_view + snapshot). */
+  const sessionWasProcessingRef = useRef(false);
   const queryClient = useQueryClient();
 
   useEffect(() => {
@@ -286,12 +294,15 @@ export function PlanningViewPage() {
   const phaseMessage = sessionState?.phase_message
     ? normalizeActivityText(sessionState.phase_message)
     : null;
-  const isProcessing = sessionState?.is_processing ?? false;
+  /** OR of REST + SSE: either can lag the other; using both avoids enabling Review/Send while the server still holds a processing lock. */
+  const isProcessing =
+    Boolean(session?.is_processing) || Boolean(sessionState?.is_processing);
   const effectiveStatus = sessionState?.status ?? session?.status;
   const effectiveRound = sessionState?.current_round ?? session?.current_round ?? 0;
 
   useEffect(() => {
     if (!session) return;
+    sessionWasProcessingRef.current = Boolean(session.is_processing);
     setSessionState({
       status: session.status,
       current_round: session.current_round,
@@ -361,9 +372,10 @@ export function PlanningViewPage() {
     setError(message);
   }, []);
 
-  const showConflictBanner = useCallback((err: ConflictError) => {
+  const showConflictBanner = useCallback((err: ConflictError, opts?: { validationFromApply?: boolean }) => {
     if (err.reason === "command_failed") {
       setPlanValidationBlock(err.message);
+      setPlanValidationFromApply(opts?.validationFromApply ?? false);
       setError(null);
       return;
     }
@@ -392,6 +404,17 @@ export function PlanningViewPage() {
       // versioned events, ignore unversioned snapshots to avoid stale rewinds.
       if (typeof event.session_version !== "number" && lastVersionSeen.current > 0) {
         return;
+      }
+      if (event.is_processing) {
+        sessionWasProcessingRef.current = true;
+      } else if (sessionWasProcessingRef.current) {
+        sessionWasProcessingRef.current = false;
+        const now = Date.now();
+        if (now - lastRefetchAtMs.current >= 400) {
+          lastRefetchAtMs.current = now;
+          void refetchSession();
+          void queryClient.invalidateQueries({ queryKey: ["session-snapshot", id] });
+        }
       }
       setSessionState({
         status: event.status,
@@ -511,7 +534,10 @@ export function PlanningViewPage() {
         || normalized.includes("grounding validation")
         || normalized.includes("fallback plan")
         || normalized.includes("fallback draft")
-        || normalized.includes("fallback content");
+        || normalized.includes("fallback content")
+        || normalized.includes("design record update failed")
+        || normalized.includes("refinement evidence refresh failed")
+        || normalized.includes("manifesto check violations");
       if (isInternalGate) return;
       const looksLikeContextSummary = normalized.includes("context compaction enabled")
         || normalized.includes("chat context summarized")
@@ -632,6 +658,7 @@ export function PlanningViewPage() {
         await sendDiscoveryMessage(id, text, models);
         setLatestResponseMode(null);
         const refreshed = await sessionQuery.refetch();
+        void queryClient.invalidateQueries({ queryKey: ["session-snapshot", id] });
         if (!refreshed.data?.session.is_processing) {
           setThinkingMessage(null);
         }
@@ -643,6 +670,7 @@ export function PlanningViewPage() {
           setLatestResponseMode(null);
         }
         const refreshed = await sessionQuery.refetch();
+        void queryClient.invalidateQueries({ queryKey: ["session-snapshot", id] });
         if (!refreshed.data?.session.is_processing) {
           setThinkingMessage(null);
         }
@@ -718,6 +746,7 @@ export function PlanningViewPage() {
     try {
       setError(null);
       setErrorTone("error");
+      setPlanValidationFromApply(false);
       setShowCritiquePrompt(false);
       setLiveActivities(() =>
         upsertLiveActivity([], {
@@ -728,7 +757,7 @@ export function PlanningViewPage() {
           created_at: new Date().toISOString(),
         }),
       );
-      await runRound(id, undefined, {
+      await runCritique(id, {
         author_model: selectedAuthorModel || undefined,
         critic_model: selectedCriticModel || undefined,
       });
@@ -739,6 +768,37 @@ export function PlanningViewPage() {
         showBanner(String(err));
       }
     } finally {
+      await sessionQuery.refetch();
+    }
+  };
+
+  const onApplyCritique = async () => {
+    try {
+      setError(null);
+      setErrorTone("error");
+      setApplyCritiquePending(true);
+      setLiveActivities(() =>
+        upsertLiveActivity([], {
+          id: COMPOSER_PENDING_ACTIVITY_ID,
+          kind: "update",
+          message: "Applying critique to plan…",
+          status: "running",
+          created_at: new Date().toISOString(),
+        }),
+      );
+      await applyCritique(id, {
+        author_model: selectedAuthorModel || undefined,
+        critic_model: selectedCriticModel || undefined,
+      });
+      setPlanValidationFromApply(false);
+    } catch (err) {
+      if (err instanceof ConflictError) {
+        showConflictBanner(err, { validationFromApply: true });
+      } else {
+        showBanner(String(err));
+      }
+    } finally {
+      setApplyCritiquePending(false);
       await sessionQuery.refetch();
     }
   };
@@ -825,9 +885,14 @@ export function PlanningViewPage() {
     const byRound = new Map(fallback.map((m) => [m.round, m]));
     return api.map((m) => {
       const fill = byRound.get(m.round);
+      // convergence_score is keyed off plan_versions (often unset). Fall back to critic_confidence
+      // (per-round validation design-quality, 0–1) so the history table shows a bar/score when available.
+      const fromVersion = m.convergence_score ?? null;
+      const fromParse = fill?.convergence_score ?? null;
+      const fromMetrics = m.critic_confidence ?? null;
       return {
         ...m,
-        convergence_score: m.convergence_score ?? fill?.convergence_score ?? null,
+        convergence_score: fromVersion ?? fromParse ?? fromMetrics ?? null,
         critic_confidence: m.critic_confidence ?? fill?.critic_confidence ?? null,
         major_issues: m.major_issues ?? fill?.major_issues ?? null,
         minor_issues: m.minor_issues ?? fill?.minor_issues ?? null,
@@ -987,7 +1052,7 @@ export function PlanningViewPage() {
             title={versionedTitle}
             round={effectiveRound}
             status={effectiveStatus ?? session.status}
-            isProcessing={sessionState?.is_processing ?? false}
+            isProcessing={isProcessing}
             convergenceScore={sessionQuery.data?.current_plan?.convergence_score ?? undefined}
             sessionCostUsd={sessionCostUsd}
             maxPromptTokens={maxPromptTokens}
@@ -1022,7 +1087,11 @@ export function PlanningViewPage() {
           {planValidationBlock && (
             <PlanValidationToast
               rawMessage={planValidationBlock}
-              onDismiss={() => setPlanValidationBlock(null)}
+              fromApplyRevision={planValidationFromApply}
+              onDismiss={() => {
+                setPlanValidationBlock(null);
+                setPlanValidationFromApply(false);
+              }}
             />
           )}
 
@@ -1034,7 +1103,7 @@ export function PlanningViewPage() {
                   decisionGraph={sessionQuery.data?.current_plan?.decision_graph ?? null}
                   impactView={sessionQuery.data?.impact_view ?? null}
                   status={effectiveStatus ?? session.status}
-                  isProcessing={sessionState?.is_processing ?? false}
+                  isProcessing={isProcessing}
                   canExport={Boolean(sessionQuery.data?.current_plan)}
                   onExport={() => void onExport()}
                   onAppendIssuePrompt={(text) => {
@@ -1085,11 +1154,19 @@ export function PlanningViewPage() {
                   }}
                   canCritique={!isProcessing && (effectiveStatus === "refining" || effectiveStatus === "converged")}
                   canApprove={!isProcessing && effectiveStatus === "converged"}
+                  showCriticModelSelector={
+                    effectiveStatus === "refining" || effectiveStatus === "converged"
+                  }
                   critiquePending={showCritiquePrompt}
                   contextPercent={contextPercent}
                   maxPromptTokens={maxPromptTokens}
                   contextWindowTokens={contextWindowTokens}
                   onCritique={() => void onCritique()}
+                  onApplyCritique={() => void onApplyCritique()}
+                  critiquePendingApply={Boolean(session?.critique_pending_apply)}
+                  applyCritiquePending={applyCritiquePending}
+                  focusChatNonce={focusChatNonce}
+                  onDiscussFirst={() => setFocusChatNonce((n) => n + 1)}
                   onApprove={() => void onApprove()}
                   onStop={() => void onStop()}
                   onSubmit={submitMessage}

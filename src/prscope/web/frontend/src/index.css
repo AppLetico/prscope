@@ -251,6 +251,8 @@ body,
   min-height: 100%;
   margin: 0;
   padding: 0;
+  /* Reduces accidental browser Back/Forward from two-finger horizontal swipes (trackpad). */
+  overscroll-behavior-x: none;
 }
 
 body {

@@ -85,8 +85,16 @@ class PlanningCore:
     }
     VALID_COMMANDS: dict[str, set[str]] = {
         "draft": {"message", "export"},
-        "refining": {"message", "followup_answer", "run_round", "export"},
-        "converged": {"message", "followup_answer", "run_round", "approve", "export"},
+        "refining": {"message", "followup_answer", "run_round", "run_critique", "apply_critique", "export"},
+        "converged": {
+            "message",
+            "followup_answer",
+            "run_round",
+            "run_critique",
+            "apply_critique",
+            "approve",
+            "export",
+        },
         "approved": {"export"},
         "error": {"reset"},
     }

@@ -130,12 +130,12 @@ The frontend handles `409` responses gracefully — they indicate the session is
 ### Decision Graph Rendering
 
 - `PlanPanel` receives `current_plan.decision_graph` from the backend and augments markdown before rendering.
-- `decisionGraphRender.ts` injects graph-backed architecture decisions and unresolved questions that may not yet be reflected in prose.
-- When the graph has edges (or at least two nodes) and the Architecture section does not already contain a ` ```mermaid ` fence, a **Decision map (auto)** subsection is appended with deterministic Mermaid from `decision_graph` (no LLM).
+- `decisionGraphRender.ts` injects graph-backed **Decision State** (resolved architecture nodes) and appended **Open Questions** where helpful; it does **not** inject an auto-generated Mermaid decision map into the draft (Mermaid in the plan must come from authored markdown).
+- `decisionGraphToMermaid()` remains available for tests or future UI if a separate surface needs a diagram from `decision_graph`.
 
 ### Persisted plan vs live UI
 
-- **Live `PlanPanel`** runs `augmentPlanMarkdownWithDecisionGraph()` on the persisted plan body so reviewers see **Decision State**, optional **Decision map (auto)** Mermaid, and appended **Open Questions** that are derived from structured `decision_graph` data.
+- **Live `PlanPanel`** runs `augmentPlanMarkdownWithDecisionGraph()` on the persisted plan body so reviewers see **Decision State** and appended **Open Questions** derived from structured `decision_graph` data.
 - **Exported artifacts** (for example `render_prd()` in `src/prscope/planning/render.py` and the `plan.md.j2` template) use **stored** `plan_content` (and related JSON) from the database. They do **not** automatically include those client-side augmentations unless the export path is extended to mirror them server-side.
 - Treat **persisted markdown + artifacts** as the canonical text for commits and benchmarks; treat **UI-only injections** as a read-time projection for clarity.
 
@@ -149,7 +149,7 @@ The frontend handles `409` responses gracefully — they indicate the session is
 ### Impact View Rendering
 
 - `GET /api/sessions/{id}` now includes an additive `impact_view` payload derived from `current_plan.decision_graph` and snapshot `issue_graph`.
-- `PlanPanel` uses `impact_view` to render an aggregate `decisions under pressure` badge plus a top-pressure summary.
+- `PlanPanel` does not surface a separate “decisions under pressure” badge; pressure context appears in `IssuePanel` where relevant.
 - `IssuePanel` resolves `related_decision_ids` into visible decision chips and shows dominant cluster context such as root cause and suggested action.
 - `impact_view` is a read model for UI and agent prompts. The frontend must not treat it as canonical planning state or write it back.
 

@@ -1082,7 +1082,8 @@ def test_validate_draft_result_normalizes_reason_codes_and_retryability(tmp_path
     assert result.failure_count >= 2
 
 
-def test_validate_refinement_result_flags_under_scoped_localized_refinement(tmp_path: Path) -> None:
+def test_validate_refinement_result_skips_under_scoped_when_extra_refs_are_verified(tmp_path: Path) -> None:
+    """Citing a verified test path outside Files Changed must not trigger under-scoped (Apply harness)."""
     agent = _make_agent(tmp_path)
     repo_understanding = RepoUnderstanding(
         entrypoints=["src/prscope/web/frontend/src/pages/PlanningView.tsx"],
@@ -1125,12 +1126,37 @@ def test_validate_refinement_result_flags_under_scoped_localized_refinement(tmp_
     )
 
     assert not result.ok
-    assert "missing_sections" in result.reason_codes
     assert "grounding_failure" in result.reason_codes
-    assert "under-scoped draft: one file in Files Changed but multiple referenced files" in result.failure_messages
+    assert "under-scoped draft: one file in Files Changed but multiple referenced files" not in result.failure_messages
     assert (
         "Files Changed entries missing from Implementation Steps: src/prscope/web/frontend/src/components/PlanPanel.tsx"
     ) in result.failure_messages
+
+
+def test_validate_refinement_result_flags_under_scoped_when_extra_path_not_verified(tmp_path: Path) -> None:
+    agent = _make_agent(tmp_path)
+    repo_understanding = RepoUnderstanding(
+        entrypoints=["src/only.py"],
+        core_modules=["src/only.py"],
+        relevant_modules=["src/only.py"],
+        relevant_tests=[],
+        architecture_summary="x",
+        risks=[],
+        file_contents={"src/only.py": "x"},
+        from_mental_model=False,
+    )
+    result = agent.validate_refinement_result(
+        plan_content=(
+            "# Plan\n\n## Goals\n- x\n\n## Non-Goals\n- y\n\n## Files Changed\n"
+            "- `src/only.py`\n\n"
+            "## Architecture\nAlso review `src/other.py`.\n\n"
+            "## Implementation Steps\n1. Edit `src/only.py`.\n\n"
+            "## Test Strategy\n- t\n\n## Rollback Plan\n- r\n"
+        ),
+        repo_understanding=repo_understanding,
+        requirements_text="Change only.py",
+    )
+    assert "under-scoped draft: one file in Files Changed but multiple referenced files" in result.failure_messages
 
 
 def test_strip_localized_scope_drift_lines_removes_conditional_backend_contract_hedges() -> None:
@@ -3492,3 +3518,21 @@ async def test_author_repair_service_falls_back_after_google_json_contract_failu
 
     assert repair.problem_understanding == "Need tighter scope"
     assert calls == ["gemini-2.5-flash", "gemini-2.5-flash", "gpt-4o-mini"]
+
+
+def test_reason_code_localized_ui_api_draft_prefixes_are_retryable() -> None:
+    """Localized refinement failures must map to retryable codes so autofix can supplement."""
+    for msg in (
+        "localized UI/API draft introduced frontend state or polling abstractions not present in requirements; x",
+        "localized UI/API draft leaves export-state ownership ambiguous between `PlanningView.tsx` and `PlanPanel.tsx`; y",
+        "localized UI/API draft shifts established export-state ownership into `PlanPanel.tsx` even though the request says to preserve current PlanPanel behavior; z",
+        "localized UI/API draft turned a simple result-display request into speculative formatting open questions; q",
+    ):
+        assert AuthorValidationService._reason_code_for_failure(msg) == "localized_scope_drift"
+
+
+def test_reason_code_revision_unverified_refs_is_retryable() -> None:
+    assert (
+        AuthorValidationService._reason_code_for_failure("revision introduced unverified file references: src/foo.py")
+        == "unknown_file_reference"
+    )
