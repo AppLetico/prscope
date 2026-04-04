@@ -82,6 +82,8 @@ Do not skip this step. Hallucinating project structure is worse than asking.
 If the request mentions endpoints/routes/APIs, inspect backend route handlers (not only frontend files) before asking.
 Infer languages and stack from repository evidence (for example `pyproject.toml`, `package.json`, `go.mod`, root listings). Do not assume Go/Gin unless `.go` sources or Go manifests appear in the repo.
 
+**Large files and grep hits:** Do not rely only on reading from line 1 with `max_lines`. After `grep_code` returns matches with line numbers, follow up with `read_file` using **`around_line`** (the match line) and **`radius`** (for example 60–120 lines) to capture route tables, `create_app`, middleware/CORS, and streaming/SSE handlers in context. If a tool result says the payload was stored at a repo-relative artifact path (for example under `.prscope/tool-results/`), call `read_file` on that path when you need the full prior JSON before citing it.
+
 **Step 2 — Ask only what code can't tell you:**
 After scanning, ask ONLY 2-3 questions that require a human decision:
 - Priorities and trade-offs

@@ -50,6 +50,8 @@ src/
     ├── api.ts                 ← HTTP client (fetch wrappers for all endpoints)
     ├── markdown.ts            ← markdown rendering utilities
     ├── markdownComponents.tsx ← custom markdown component overrides
+    ├── MermaidBlock.tsx       ← per-block Mermaid render + error fallback
+    ├── mermaidRender.ts       ← lazy Mermaid init + run helper
     ├── decisionGraphRender.ts ← graph-backed plan augmentation helpers
     └── planTitle.ts           ← plan title extraction/cleaning
 ```
@@ -129,6 +131,12 @@ The frontend handles `409` responses gracefully — they indicate the session is
 
 - `PlanPanel` receives `current_plan.decision_graph` from the backend and augments markdown before rendering.
 - `decisionGraphRender.ts` injects graph-backed architecture decisions and unresolved questions that may not yet be reflected in prose.
+- When the graph has edges (or at least two nodes) and the Architecture section does not already contain a ` ```mermaid ` fence, a **Decision map (auto)** subsection is appended with deterministic Mermaid from `decision_graph` (no LLM).
+
+### Mermaid diagrams in plans
+
+- Plan markdown uses **Mermaid** (lazy-loaded in [`mermaidRender.ts`](src/prscope/web/frontend/src/lib/mermaidRender.ts)) with `securityLevel: "loose"` because plan text is session-local/trusted in normal use; do not treat as safe for untrusted multi-tenant HTML.
+- Each diagram is rendered in [`MermaidBlock.tsx`](src/prscope/web/frontend/src/lib/MermaidBlock.tsx): debounced `mermaid.run`, and on syntax/runtime failure users see an **error callout** plus collapsible **Mermaid source** instead of a blank diagram.
 - Follow-up prompts rendered in `ChatPanel` come from persisted follow-up artifacts derived from the same decision graph.
 - The frontend never infers or mutates decision state locally; graph state is server-authoritative just like session state.
 

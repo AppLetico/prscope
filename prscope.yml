@@ -82,7 +82,13 @@ planning:
   #   ripgrep_max_columns: 500
   #   ripgrep_respect_ignore_files: true
   #   glob_max_results: 100
-  #   tool_result_max_chars: 8000    # per-tool JSON cap before artifact offload
+  #   read_file_fast_path_max_bytes: 10485760   # <= this size: load whole file in memory; larger: streaming line read (see docs/agent-harness.md)
+  #   read_file_max_file_bytes: 1073741824      # refuse read_file above this size (narrow window or use grep_code)
+  #   read_file_max_output_chars: 256000        # cap returned read_file content after line windowing (huge single lines)
+  #   tool_result_max_chars: 8000    # per-tool JSON cap before artifact offload (.prscope/tool-results/); raise if discovery loses too much inline context
+  #   # tool_result_max_chars_by_tool:          # optional overrides (tool name -> chars, min 1024 each)
+  #   #   grep_code: 12000
+  #   #   read_file: 8000
   #   # Optional: repo-relative path prefixes per tool (omit a tool = no extra restriction)
   #   path_allowlist:
   #     read_file: [src/, tests/]
@@ -94,3 +100,5 @@ planning:
   # context_tool_overhead_tokens: 1000
   # token_budget_estimator: heuristic   # heuristic | tiktoken (optional package)
   # discovery_conversation_max_chars: 120000
+  # discovery_conversation_max_input_tokens: 0   # omit or 0 = off; set >0 to trim by estimated input tokens
+  # discovery_compaction_failure_max: 0           # 0 = unlimited; >0 aborts after N discovery transcript compactions

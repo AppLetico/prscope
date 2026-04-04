@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from prscope.config import PlanningToolsConfig
-from prscope.planning.runtime.tools import ToolExecutor, ToolSafetyError
+from prscope.planning.runtime.tools import CODEBASE_TOOLS, ToolExecutor, ToolSafetyError
 
 
 def test_path_allowlist_allows_matching_prefix(tmp_path: Path) -> None:
@@ -48,3 +48,11 @@ def test_no_allowlist_unchanged(tmp_path: Path) -> None:
     (tmp_path / "b.txt").write_text("z", encoding="utf-8")
     ex = ToolExecutor(tmp_path, tools_config=PlanningToolsConfig())
     assert ex.read_file(path="b.txt")["path"] == "b.txt"
+
+
+def test_read_file_tool_schema_describes_windowed_reads() -> None:
+    read_tool = next(t for t in CODEBASE_TOOLS if t["function"]["name"] == "read_file")
+    desc = read_tool["function"]["description"]
+    assert "around_line" in desc
+    assert "radius" in desc
+    assert "start_line" in desc

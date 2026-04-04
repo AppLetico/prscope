@@ -15,6 +15,24 @@ from typing import Any
 import yaml
 
 
+def _parse_tool_result_max_chars_by_tool(raw: Any) -> dict[str, int]:
+    """Parse planning.tools.tool_result_max_chars_by_tool from YAML."""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, int] = {}
+    for k, v in raw.items():
+        key = str(k).strip()
+        if not key:
+            continue
+        try:
+            n = int(v)
+            if n > 0:
+                out[key] = n
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 @dataclass
 class UpstreamRepo:
     """Configuration for an upstream repository to monitor."""
@@ -127,8 +145,16 @@ class PlanningToolsConfig:
     ripgrep_max_columns: int = 500
     ripgrep_respect_ignore_files: bool = True
     glob_max_results: int = 100
+    # Files at or below this size use read_text + splitlines; larger files use a streaming line reader (bounded RAM).
+    read_file_fast_path_max_bytes: int = 10 * 1024 * 1024
+    # Refuse read_file entirely above this on-disk size (use grep_code / windowed reads elsewhere).
+    read_file_max_file_bytes: int = 1024 * 1024 * 1024
+    # Max characters returned in read_file "content" after line windowing (guards huge single lines).
+    read_file_max_output_chars: int = 256_000
     # Max JSON size for a single tool result before artifact offload (grep/read_file payloads)
     tool_result_max_chars: int = 8000
+    # Optional per-tool override for artifact threshold (tool name -> max chars, min 1024 applied at runtime).
+    tool_result_max_chars_by_tool: dict[str, int] = field(default_factory=dict)
     # Optional per-tool path prefixes (repo-relative). Omitted tool names = no extra restriction.
     # Empty list for a tool = deny all paths for that tool.
     path_allowlist: dict[str, list[str]] = field(default_factory=dict)
@@ -192,6 +218,10 @@ class PlanningConfig:
     token_budget_estimator: str = "heuristic"
     # Cap discovery tool-loop transcript before each LLM call (system + user + tool history)
     discovery_conversation_max_chars: int = 120_000
+    # Optional: also trim when estimated input tokens exceed this (None = char cap only)
+    discovery_conversation_max_input_tokens: int | None = None
+    # Abort discovery tool loop after this many context_compaction emissions (0 = unlimited)
+    discovery_compaction_failure_max: int = 0
     # Prior-critique compaction (adversarial refinement helpers)
     critique_compress_max_recent_chars: int = 5000
     critique_compress_max_summary_chars: int = 1200
@@ -482,7 +512,13 @@ class PrscopeConfig:
             ripgrep_max_columns=max(8, int(tools_raw.get("ripgrep_max_columns", 500))),
             ripgrep_respect_ignore_files=bool(tools_raw.get("ripgrep_respect_ignore_files", True)),
             glob_max_results=max(1, int(tools_raw.get("glob_max_results", 100))),
+            read_file_fast_path_max_bytes=max(1, int(tools_raw.get("read_file_fast_path_max_bytes", 10 * 1024 * 1024))),
+            read_file_max_file_bytes=max(1, int(tools_raw.get("read_file_max_file_bytes", 1024 * 1024 * 1024))),
+            read_file_max_output_chars=max(1, int(tools_raw.get("read_file_max_output_chars", 256_000))),
             tool_result_max_chars=max(1024, int(tools_raw.get("tool_result_max_chars", 8000))),
+            tool_result_max_chars_by_tool=_parse_tool_result_max_chars_by_tool(
+                tools_raw.get("tool_result_max_chars_by_tool")
+            ),
             path_allowlist=path_allowlist,
         )
         lr_raw = planning_data.get("llm_retry")
@@ -499,6 +535,12 @@ class PrscopeConfig:
             llm_retry_cfg = LlmRetryConfig()
         author_model = planning_data.get("author_model", "gpt-4o-mini")
         memory_model = planning_data.get("memory_model", author_model)
+        discovery_raw_max_input_tok = planning_data.get("discovery_conversation_max_input_tokens")
+        if discovery_raw_max_input_tok is None:
+            discovery_max_input_tokens: int | None = None
+        else:
+            _v_discovery_tok = int(discovery_raw_max_input_tok)
+            discovery_max_input_tokens = None if _v_discovery_tok <= 0 else _v_discovery_tok
         config.planning = PlanningConfig(
             author_model=author_model,
             critic_model=planning_data.get("critic_model", "gpt-4o-mini"),
@@ -563,6 +605,8 @@ class PrscopeConfig:
                 8_192,
                 int(planning_data.get("discovery_conversation_max_chars", 120_000)),
             ),
+            discovery_conversation_max_input_tokens=discovery_max_input_tokens,
+            discovery_compaction_failure_max=max(0, int(planning_data.get("discovery_compaction_failure_max", 0))),
             critique_compress_max_recent_chars=max(
                 500,
                 int(planning_data.get("critique_compress_max_recent_chars", 5000)),

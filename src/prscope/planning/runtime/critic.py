@@ -217,6 +217,8 @@ Gatekeeper standards:
 - Missing or non-actionable test strategy → blocking; use blocking_categories "testability" when applicable.
 - Architectural or behavioral claims without evidence (backtick file paths, constraints, manifesto, decision graph) → blocking; use "evidence".
 - Bare filenames alone (for example a lone `api.py`) are weak evidence unless tied to a verified repo-relative path from exploration or the decision graph; prefer concrete paths seen in tool history.
+- If the plan names a module as an HTTP client to the web server (benchmarks, CLI, tests), require evidence tying it to real `fetch`/`httpx`/`TestClient`/`request.get` usage; otherwise blocking with "evidence" when the citation looks invented.
+- When a 'Repository paths explored this session' section is present, treat those paths as the session's primary file-evidence set for grounding checks (in addition to the plan text and memory blocks).
 - Prefer false positives over silent misses.
 - Never downgrade a serious gap to "architectural_concern" to avoid conflict.
 
@@ -972,6 +974,7 @@ class CriticAgent:
         round_number: int = 0,
         mode: Literal["initial", "validation", "stabilization", "implementability"] = "initial",
         open_tracked_issues_block: str | None = None,
+        exploration_paths_block: str | None = None,
     ) -> ReviewResult | ImplementabilityResult:
         try:
             import litellm  # noqa: F401
@@ -988,6 +991,11 @@ class CriticAgent:
             else "- (none)"
         )
         manifesto_excerpt = (manifesto or "").strip()[:4000]
+        exploration_section = ""
+        if exploration_paths_block and str(exploration_paths_block).strip():
+            exploration_section = (
+                f"## Repository paths explored this session (from tools)\n{str(exploration_paths_block).strip()}\n\n"
+            )
         context_blob = (
             f"## Mode\n{mode}\n\n"
             f"{self._mode_prompt(mode)}\n\n"
@@ -1000,6 +1008,7 @@ class CriticAgent:
             f"## Patterns\n{patterns}\n\n"
             f"## Prior Review\n{prior_critique_blob}\n\n"
             f"{open_issues_section}"
+            f"{exploration_section}"
             f"## Current Plan\n{plan_content}\n\n"
             "Evaluate constraints explicitly in your JSON output.\n"
         )

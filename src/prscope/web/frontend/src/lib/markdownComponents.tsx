@@ -10,6 +10,7 @@ import type { ReactNode } from "react";
 import type { Components } from "react-markdown";
 import { Prism as SyntaxHighlighter } from "react-syntax-highlighter";
 import { vscDarkPlus } from "react-syntax-highlighter/dist/esm/styles/prism";
+import { MermaidBlock } from "./MermaidBlock";
 
 // Mermaid diagram detection (plan panel only — chat can ignore these)
 const MERMAID_PREFIXES = [
@@ -76,11 +77,7 @@ export function buildMarkdownComponents({ variant = "chat", mermaid: enableMerma
       }
 
       if (isMermaidBlock) {
-        return (
-          <div className="mermaid flex justify-center py-4">
-            {codeString}
-          </div>
-        );
+        return <MermaidBlock codeString={codeString} />;
       }
 
       const fontSize = variant === "plan" ? "13px" : "12.5px";

@@ -15,7 +15,15 @@ from pathlib import Path
 from typing import Any, Callable
 
 from ...config import PlanningToolsConfig
+from .read_file_range import read_file_slice
 from .ripgrep_search import grep_code_python, grep_code_ripgrep, resolve_grep_backend
+from .tool_arg_coerce import (
+    clamp_int,
+    coerce_bool,
+    coerce_int_optional,
+    coerce_non_negative_int,
+    coerce_positive_int,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -97,7 +105,12 @@ CODEBASE_TOOLS = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read a text file in the repository",
+            "description": (
+                "Read a text file in the repository. By default reads from the start of the file for up to "
+                "`max_lines` (default 200). For large files, prefer windowed reads: set `around_line` to a line "
+                "number of interest (e.g. from grep) and `radius` for lines before/after; or set `start_line` "
+                "with `max_lines` to read sequential chunks."
+            ),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -120,7 +133,9 @@ CODEBASE_TOOLS = [
                 "(planning.tools.grep_backend) for speed and .gitignore-aware matching; "
                 "falls back to a Python scan otherwise. "
                 "Use output_mode 'files_with_matches' to list only paths (smaller payload); "
-                "default 'content' returns matching lines for evidence."
+                "default 'content' returns matching lines for evidence. "
+                "Optional 'context' adds lines before/after each match (ripgrep only). "
+                "Optional 'offset' skips the first N rows for pagination."
             ),
             "parameters": {
                 "type": "object",
@@ -141,6 +156,14 @@ CODEBASE_TOOLS = [
                     "output_mode": {
                         "type": "string",
                         "enum": ["content", "files_with_matches"],
+                    },
+                    "context": {
+                        "type": "integer",
+                        "description": "Lines of context before/after each match (ripgrep -C). Python fallback ignores context.",
+                    },
+                    "offset": {
+                        "type": "integer",
+                        "description": "Skip the first N result rows (matches + context lines) before applying head_limit/max_results.",
                     },
                 },
                 "required": ["pattern"],
@@ -332,37 +355,53 @@ class ToolExecutor:
             raise ToolSafetyError(f"File not found: {path}")
         if safe.suffix.lower() in BINARY_EXTENSIONS:
             raise ToolSafetyError(f"Binary file not readable as text: {path}")
-        raw_text = safe.read_text(encoding="utf-8", errors="ignore")
-        lines = raw_text.splitlines()
-        if around_line is not None:
-            focus = max(1, int(around_line))
-            win = max(1, int(radius))
-            start_idx = max(0, focus - win - 1)
-            end_idx = min(len(lines), focus + win)
-        elif start_line is not None:
-            start_idx = max(0, int(start_line) - 1)
-            end_idx = min(len(lines), start_idx + max(1, int(max_lines)))
-        else:
-            start_idx = 0
-            end_idx = min(len(lines), max(1, int(max_lines)))
-        snippet = lines[start_idx:end_idx]
+        st = safe.stat()
+        if st.st_size > int(self.tools_config.read_file_max_file_bytes):
+            raise ToolSafetyError(
+                f"File too large ({st.st_size} bytes; max planning.tools.read_file_max_file_bytes="
+                f"{self.tools_config.read_file_max_file_bytes}). "
+                "Use start_line or around_line for a window, or grep_code to locate content."
+            )
         rel = str(safe.relative_to(self.repo_root))
-        file_size_bytes = len(raw_text.encode("utf-8"))
+        result = read_file_slice(
+            safe,
+            max_lines=max_lines,
+            start_line=start_line,
+            around_line=around_line,
+            radius=radius,
+            fast_path_max_bytes=int(self.tools_config.read_file_fast_path_max_bytes),
+        )
+        cap = max(1, int(self.tools_config.read_file_max_output_chars))
+        content = result.content
+        content_truncated = False
+        note: str | None = None
+        if len(content) > cap:
+            content = self._smart_truncate(content, cap)
+            content_truncated = True
+            note = (
+                "content was truncated to read_file_max_output_chars; narrow max_lines/radius or use grep_code "
+                "for very long single lines."
+            )
         with self._access_lock:
             self.accessed_paths.add(rel)
             self.read_history[rel] = {
-                "line_count": len(lines),
-                "file_size_bytes": file_size_bytes,
+                "line_count": result.line_count,
+                "file_size_bytes": result.file_size_bytes,
             }
-        return {
+        out: dict[str, Any] = {
             "path": rel,
-            "truncated": start_idx > 0 or end_idx < len(lines),
-            "line_count": len(lines),
-            "file_size_bytes": file_size_bytes,
-            "start_line": start_idx + 1,
-            "end_line": end_idx,
-            "content": "\n".join(snippet),
+            "truncated": result.truncated,
+            "line_count": result.line_count,
+            "file_size_bytes": result.file_size_bytes,
+            "start_line": result.start_line,
+            "end_line": result.end_line,
+            "content": content,
         }
+        if content_truncated:
+            out["content_truncated"] = True
+        if note:
+            out["note"] = note
+        return out
 
     def glob_files(
         self,
@@ -425,12 +464,16 @@ class ToolExecutor:
         type_tag: str | None = None,
         case_insensitive: bool = False,
         output_mode: str = "content",
+        context: int | None = None,
+        offset: int = 0,
     ) -> dict[str, Any]:
         if output_mode not in {"content", "files_with_matches"}:
             raise ToolSafetyError(f"Invalid output_mode: {output_mode}")
         limit = int(head_limit) if head_limit is not None else int(max_results)
         if limit < 1:
             limit = 1
+        ctx = max(0, int(context)) if context is not None else 0
+        off = max(0, int(offset))
 
         root = self._safe_path(path)
         self._enforce_path_allowlist("grep_code", self._repo_rel_posix(root))
@@ -440,6 +483,10 @@ class ToolExecutor:
         matches: list[dict[str, Any]] = []
         used_backend = backend
         rg_note: str | None = None
+        result_truncated = False
+        # Python scan: content mode needs enough rows for offset+page; path mode needs many rows before dedupe.
+        _py_match_cap = min(off + limit + 1, 100_000)
+        _py_path_collect_cap = 100_000
 
         def _as_files_with_matches(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             seen: set[str] = set()
@@ -452,7 +499,7 @@ class ToolExecutor:
             return slim
 
         if backend == "ripgrep":
-            results, err = grep_code_ripgrep(
+            results, err, truncated_rg = grep_code_ripgrep(
                 repo_root=self.repo_root,
                 search_root=root,
                 pattern=pattern,
@@ -465,49 +512,87 @@ class ToolExecutor:
                 glob=glob,
                 type_tag=type_tag,
                 case_insensitive=case_insensitive,
+                context_lines=ctx,
+                offset=off,
             )
             if err:
                 logger.warning("grep_code ripgrep: %s — using Python fallback", err)
                 rg_note = err
                 used_backend = "python"
                 try:
-                    matches = grep_code_python(
-                        repo_root=self.repo_root,
-                        search_root=root,
-                        pattern=pattern,
-                        max_results=limit,
-                        ignored_dir_parts=frozenset(IGNORED_DIRS),
-                        binary_suffixes=frozenset(BINARY_EXTENSIONS),
-                        case_insensitive=case_insensitive,
-                    )
+                    if output_mode == "files_with_matches":
+                        matches_full = grep_code_python(
+                            repo_root=self.repo_root,
+                            search_root=root,
+                            pattern=pattern,
+                            max_results=_py_path_collect_cap,
+                            ignored_dir_parts=frozenset(IGNORED_DIRS),
+                            binary_suffixes=frozenset(BINARY_EXTENSIONS),
+                            case_insensitive=case_insensitive,
+                        )
+                        matches_full = _as_files_with_matches(matches_full)
+                        result_truncated = len(matches_full) > off + limit or len(matches_full) >= _py_path_collect_cap
+                    else:
+                        matches_full = grep_code_python(
+                            repo_root=self.repo_root,
+                            search_root=root,
+                            pattern=pattern,
+                            max_results=_py_match_cap,
+                            ignored_dir_parts=frozenset(IGNORED_DIRS),
+                            binary_suffixes=frozenset(BINARY_EXTENSIONS),
+                            case_insensitive=case_insensitive,
+                        )
+                        result_truncated = len(matches_full) >= _py_match_cap
                 except ValueError as exc:
                     raise ToolSafetyError(str(exc)) from exc
-                if output_mode == "files_with_matches":
-                    matches = _as_files_with_matches(matches)
+                matches = matches_full[off : off + limit]
+                if ctx > 0 or off > 0:
+                    extra = (
+                        "Python fallback: 'context' is ignored; "
+                        "see docs for offset semantics (content vs files_with_matches)."
+                    )
+                    rg_note = f"{rg_note} {extra}" if rg_note else extra
                 if glob or type_tag:
                     extra = "Python fallback ignores glob/type filters."
                     rg_note = f"{rg_note} {extra}" if rg_note else extra
             else:
                 matches = results
+                result_truncated = truncated_rg
         else:
             if glob or type_tag:
                 rg_note = (
                     "Python grep ignores glob/type filters; install ripgrep or set planning.tools.grep_backend=ripgrep."
                 )
             try:
-                matches = grep_code_python(
-                    repo_root=self.repo_root,
-                    search_root=root,
-                    pattern=pattern,
-                    max_results=limit,
-                    ignored_dir_parts=frozenset(IGNORED_DIRS),
-                    binary_suffixes=frozenset(BINARY_EXTENSIONS),
-                    case_insensitive=case_insensitive,
-                )
+                if output_mode == "files_with_matches":
+                    matches_full = grep_code_python(
+                        repo_root=self.repo_root,
+                        search_root=root,
+                        pattern=pattern,
+                        max_results=_py_path_collect_cap,
+                        ignored_dir_parts=frozenset(IGNORED_DIRS),
+                        binary_suffixes=frozenset(BINARY_EXTENSIONS),
+                        case_insensitive=case_insensitive,
+                    )
+                    matches_full = _as_files_with_matches(matches_full)
+                    result_truncated = len(matches_full) > off + limit or len(matches_full) >= _py_path_collect_cap
+                else:
+                    matches_full = grep_code_python(
+                        repo_root=self.repo_root,
+                        search_root=root,
+                        pattern=pattern,
+                        max_results=_py_match_cap,
+                        ignored_dir_parts=frozenset(IGNORED_DIRS),
+                        binary_suffixes=frozenset(BINARY_EXTENSIONS),
+                        case_insensitive=case_insensitive,
+                    )
+                    result_truncated = len(matches_full) >= _py_match_cap
             except ValueError as exc:
                 raise ToolSafetyError(str(exc)) from exc
-            if output_mode == "files_with_matches":
-                matches = _as_files_with_matches(matches)
+            matches = matches_full[off : off + limit]
+            if ctx > 0:
+                extra = "Python grep ignores 'context' (use ripgrep for -C)."
+                rg_note = f"{rg_note} {extra}" if rg_note else extra
 
         with self._access_lock:
             for item in matches:
@@ -522,6 +607,8 @@ class ToolExecutor:
             "count": len(matches),
             "grep_backend": used_backend,
         }
+        if result_truncated:
+            payload["truncated"] = True
         if rg_note:
             payload["note"] = rg_note
         return payload
@@ -548,21 +635,17 @@ class ToolExecutor:
         if parsed.name == "list_files":
             result = self.list_files(
                 path=parsed.arguments.get("path"),
-                max_entries=int(parsed.arguments.get("max_entries", 200)),
+                max_entries=coerce_positive_int(parsed.arguments.get("max_entries"), default=200),
             )
         elif parsed.name == "read_file":
+            rad = coerce_positive_int(parsed.arguments.get("radius"), default=80, minimum=1)
+            rad = clamp_int(rad, 1, 500)
             result = self.read_file(
                 path=str(parsed.arguments.get("path", "")),
-                max_lines=int(parsed.arguments.get("max_lines", 200)),
-                start_line=(
-                    int(parsed.arguments.get("start_line")) if parsed.arguments.get("start_line") is not None else None
-                ),
-                around_line=(
-                    int(parsed.arguments.get("around_line"))
-                    if parsed.arguments.get("around_line") is not None
-                    else None
-                ),
-                radius=int(parsed.arguments.get("radius", 80)),
+                max_lines=coerce_positive_int(parsed.arguments.get("max_lines"), default=200, minimum=1),
+                start_line=coerce_int_optional(parsed.arguments.get("start_line")),
+                around_line=coerce_int_optional(parsed.arguments.get("around_line")),
+                radius=rad,
             )
         elif parsed.name == "grep_code":
             args = parsed.arguments
@@ -570,22 +653,33 @@ class ToolExecutor:
             om = str(args.get("output_mode") or "content").strip().lower()
             if om not in {"content", "files_with_matches"}:
                 om = "content"
+            ctx = args.get("context")
+            ctx_i = coerce_int_optional(ctx)
+            if ctx_i is not None:
+                ctx_i = clamp_int(ctx_i, 0, 200)
+            ofs = coerce_non_negative_int(args.get("offset"), default=0)
             result = self.grep_code(
                 pattern=str(args.get("pattern", "")),
                 path=args.get("path"),
-                max_results=int(args.get("max_results", 40)),
-                head_limit=int(hl) if hl is not None else None,
+                max_results=coerce_positive_int(args.get("max_results"), default=40, minimum=1),
+                head_limit=coerce_int_optional(hl),
                 glob=str(args.get("glob") or "").strip() or None,
                 type_tag=str(args.get("type") or "").strip() or None,
-                case_insensitive=bool(args.get("case_insensitive", False)),
+                case_insensitive=coerce_bool(args.get("case_insensitive"), default=False),
                 output_mode=om,
+                context=ctx_i,
+                offset=ofs,
             )
         elif parsed.name == "glob_files":
             gr = parsed.arguments.get("max_results")
+            if gr is None:
+                gr_coerced: int | None = None
+            else:
+                gr_coerced = coerce_int_optional(gr)
             result = self.glob_files(
                 pattern=str(parsed.arguments.get("pattern", "")),
                 path=parsed.arguments.get("path"),
-                max_results=int(gr) if gr is not None else None,
+                max_results=gr_coerced,
             )
         elif parsed.name == "ask_clarification":
             question = str(parsed.arguments.get("question", "")).strip()
@@ -670,9 +764,15 @@ class ToolExecutor:
                 summary["top_matches"] = [str(p) for p in results[:5]]
         return summary
 
+    def _effective_tool_result_max_chars(self, tool_name: str) -> int:
+        override = self.tools_config.tool_result_max_chars_by_tool.get(tool_name)
+        if override is not None:
+            return max(1024, int(override))
+        return max(1024, int(self.tools_config.tool_result_max_chars))
+
     def _format_result_payload(self, call_id: str, tool_name: str, payload: dict[str, Any]) -> dict[str, Any]:
         encoded = json.dumps(payload, ensure_ascii=False)
-        max_chars = max(1024, int(self.tools_config.tool_result_max_chars))
+        max_chars = self._effective_tool_result_max_chars(tool_name)
         if len(encoded) <= max_chars:
             return {
                 "result": payload,

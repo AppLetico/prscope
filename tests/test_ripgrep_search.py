@@ -78,7 +78,7 @@ def test_grep_code_ripgrep_parses_json(tmp_path: Path) -> None:
     with patch("prscope.planning.runtime.ripgrep_search.subprocess.run") as run_mock:
         run_mock.return_value = type("R", (), {"returncode": 0, "stdout": fake_stdout, "stderr": ""})()
 
-        rows, err = grep_code_ripgrep(
+        rows, err, truncated = grep_code_ripgrep(
             repo_root=repo,
             search_root=repo,
             pattern=r"x\s*=",
@@ -93,9 +93,53 @@ def test_grep_code_ripgrep_parses_json(tmp_path: Path) -> None:
             case_insensitive=False,
         )
         assert err is None
+        assert not truncated
         assert len(rows) == 1
         assert rows[0]["path"] == "sample.py"
         assert rows[0]["line"] == 1
+
+
+def test_grep_code_ripgrep_offset_skips_rows(tmp_path: Path) -> None:
+    repo = tmp_path
+    lines = []
+    for i in range(3):
+        lines.append(
+            json.dumps(
+                {
+                    "type": "match",
+                    "data": {
+                        "path": {"text": "a.py"},
+                        "lines": {"text": f"line{i}\n"},
+                        "line_number": i + 1,
+                        "submatches": [],
+                    },
+                }
+            )
+        )
+    fake_stdout = "\n".join(lines)
+
+    with patch("prscope.planning.runtime.ripgrep_search.subprocess.run") as run_mock:
+        run_mock.return_value = type("R", (), {"returncode": 0, "stdout": fake_stdout, "stderr": ""})()
+
+        rows, err, truncated = grep_code_ripgrep(
+            repo_root=repo,
+            search_root=repo,
+            pattern=r"line",
+            max_results=10,
+            command="rg",
+            timeout_seconds=5.0,
+            max_columns=500,
+            respect_ignore_files=True,
+            output_mode="content",
+            glob=None,
+            type_tag=None,
+            case_insensitive=False,
+            offset=1,
+        )
+        assert err is None
+        assert not truncated
+        assert len(rows) == 2
+        assert rows[0]["text"] == "line1"
 
 
 def test_tool_executor_glob_files(tmp_path: Path) -> None:

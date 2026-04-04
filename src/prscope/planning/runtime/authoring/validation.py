@@ -24,6 +24,7 @@ _RETRYABLE_REASON_CODES = frozenset(
         "missing_helper_reuse",
         "localized_scope_drift",
         "missing_localized_backend_grounding",
+        "files_changed_evidence",
     }
 )
 
@@ -48,6 +49,7 @@ _SECTION_FAILURE_NAMES = frozenset(
         "mermaid_content",
         "example_code_fence",
         "ordered_todos",
+        "phased_approach",
     }
 )
 
@@ -74,6 +76,86 @@ def localized_request_explicit_payload_change(requirements_text: str | None) -> 
 class AuthorValidationService:
     def __init__(self, tool_executor: Any) -> None:
         self.tool_executor = tool_executor
+
+    @staticmethod
+    def paths_mentioned_in_requirements(requirements_text: str | None) -> set[str]:
+        """Paths the user explicitly named (backticks or plain repo-relative filenames)."""
+        text = str(requirements_text or "")
+        out = set(extract_file_references(text))
+        for match in re.finditer(
+            r"\b([A-Za-z0-9_./-]+\.(?:md|py|ts|tsx|yml|yaml|json|toml|js|jsx|rs|go))\b",
+            text,
+            flags=re.IGNORECASE,
+        ):
+            p = match.group(1).strip()
+            if not p:
+                continue
+            if "/" in p or p in {"AGENTS.md", "README.md", "CONTRIBUTING.md"} or p.startswith(".prscope"):
+                out.add(p)
+        return out
+
+    @staticmethod
+    def build_files_changed_evidence_allowlist(
+        *,
+        relevant_files: tuple[str, ...],
+        test_targets: tuple[str, ...],
+        related_modules: tuple[str, ...],
+        http_client_hints: tuple[str, ...],
+        grounding_paths: set[str] | None,
+        requirements_text: str | None = None,
+    ) -> set[str] | None:
+        """Paths the planner may list under Files Changed (evidence-first + seeds + optional HTTP hints)."""
+        paths: set[str] = set()
+        for group in (relevant_files, test_targets, related_modules, http_client_hints):
+            for raw in group:
+                p = str(raw).strip()
+                if p:
+                    paths.add(p)
+        for raw in grounding_paths or set():
+            p = str(raw).strip()
+            if p:
+                paths.add(p)
+        paths |= AuthorValidationService.paths_mentioned_in_requirements(requirements_text)
+        if len(paths) < 2:
+            return None
+        return paths
+
+    @staticmethod
+    def build_files_changed_allowlist_from_repo_understanding(
+        repo_understanding: Any,
+        *,
+        http_client_hints: tuple[str, ...] = (),
+        requirements_text: str | None = None,
+    ) -> set[str] | None:
+        """Refinement-phase allowlist from prioritized modules + tests + optional caller hints."""
+        modules = list(getattr(repo_understanding, "relevant_modules", None) or [])[:16]
+        tests = list(getattr(repo_understanding, "relevant_tests", None) or [])
+        paths: set[str] = set()
+        for raw in modules + tests:
+            p = str(raw).strip()
+            if p:
+                paths.add(p)
+        for raw in http_client_hints:
+            p = str(raw).strip()
+            if p:
+                paths.add(p)
+        paths |= AuthorValidationService.paths_mentioned_in_requirements(requirements_text)
+        if len(paths) < 2:
+            return None
+        return paths
+
+    @staticmethod
+    def files_changed_subset_failures(plan_content: str, allowlist: set[str] | None) -> list[str]:
+        if not allowlist or len(allowlist) < 2:
+            return []
+        section = AuthorValidationService.extract_section(plan_content, "Files Changed")
+        refs = extract_file_references(section)
+        if not refs:
+            return []
+        bad = sorted(refs - allowlist)
+        if not bad:
+            return []
+        return [f"Files Changed paths outside evidence allowlist: {', '.join(bad[:8])}"]
 
     @staticmethod
     def _suggest_verified_path(unverified_path: str, verified_paths: set[str]) -> str | None:
@@ -231,9 +313,6 @@ class AuthorValidationService:
         if draft_phase != "planner":
             return []
         failures: list[str] = []
-        fence_count = len(re.findall(r"```", plan_content))
-        if fence_count > 2:
-            failures.append("planner draft has too many code fences")
         if re.search(r"^##\s+Implementation\s+Steps\b", plan_content, re.IGNORECASE | re.MULTILINE):
             failures.append("planner draft must not include Implementation Steps section")
         if re.search(r"^##\s+Test\s+Strategy\b", plan_content, re.IGNORECASE | re.MULTILINE):
@@ -659,7 +738,11 @@ class AuthorValidationService:
         return missing
 
     @staticmethod
-    def missing_required_sections(plan_content: str, draft_phase: Literal["planner", "refiner"]) -> list[str]:
+    def missing_required_sections(
+        plan_content: str,
+        draft_phase: Literal["planner", "refiner"],
+        planner_complexity: str | None = None,
+    ) -> list[str]:
         missing: list[str] = []
         section_patterns = {
             "title": r"^#\s+.+",
@@ -675,17 +758,31 @@ class AuthorValidationService:
             "test_strategy": r"^##\s+test\s+strategy\b",
             "rollback_plan": r"^##\s+rollback\s+plan\b",
             "example_code_snippets": r"^##\s+example\s+code\s+snippets\b",
+            "phased_approach": r"^##\s+phased\s+approach\b",
             "open_questions": r"^##\s+open\s+questions\b",
             "design_decision_records": r"^##\s+design\s+decision\s+records\b",
             "user_stories": r"^##\s+user\s+stories\b",
         }
         if draft_phase == "planner":
             planner_required = {"title", "goals", "non_goals", "files_changed", "architecture"}
+            if planner_complexity is not None:
+                planner_required = planner_required | {"example_code_snippets"}
             for section_name, pattern in section_patterns.items():
                 if section_name not in planner_required:
                     continue
                 if not re.search(pattern, plan_content, re.IGNORECASE | re.MULTILINE):
                     missing.append(section_name)
+            if planner_complexity is not None:
+                normalized = str(planner_complexity).strip().lower()
+                if normalized in ("moderate", "complex"):
+                    if not re.search(section_patterns["phased_approach"], plan_content, re.IGNORECASE | re.MULTILINE):
+                        missing.append("phased_approach")
+                snippet_body = AuthorValidationService.extract_section(plan_content, "Example Code Snippets")
+                if "example_code_snippets" not in missing:
+                    if not snippet_body.strip():
+                        missing.append("example_code_snippets")
+                    elif not re.search(r"```[a-zA-Z0-9_-]*\n", snippet_body):
+                        missing.append("example_code_fence")
             return missing
         for section_name, pattern in section_patterns.items():
             if not re.search(pattern, plan_content, re.IGNORECASE | re.MULTILINE):
@@ -716,6 +813,8 @@ class AuthorValidationService:
         min_grounding_ratio: float | None = None,
         verified_paths_extra: set[str] | None = None,
         requirements_text: str | None = None,
+        files_changed_allowlist: set[str] | None = None,
+        planner_complexity: str | None = None,
     ) -> list[str]:
         return list(
             self.validate_draft_result(
@@ -725,6 +824,8 @@ class AuthorValidationService:
                 min_grounding_ratio=min_grounding_ratio,
                 verified_paths_extra=verified_paths_extra,
                 requirements_text=requirements_text,
+                files_changed_allowlist=files_changed_allowlist,
+                planner_complexity=planner_complexity,
             ).failure_messages
         )
 
@@ -762,14 +863,14 @@ class AuthorValidationService:
             return "missing_sections"
         if "planner draft must not include" in normalized:
             return "missing_sections"
-        if "planner draft has too many code fences" in normalized:
-            return "missing_sections"
         if "planner draft contains detailed implementation step list" in normalized:
             return "missing_sections"
         if normalized.startswith("under-scoped draft:"):
             return "missing_sections"
         if normalized.startswith("files changed entries missing from implementation steps:"):
             return "grounding_failure"
+        if normalized.startswith("files changed paths outside evidence allowlist"):
+            return "files_changed_evidence"
         if "test strategy" in normalized or "missing test" in normalized:
             return "missing_tests"
         if normalized.startswith("localized frontend ui change should reference a frontend regression target;"):
@@ -804,17 +905,27 @@ class AuthorValidationService:
         min_grounding_ratio: float | None = None,
         verified_paths_extra: set[str] | None = None,
         requirements_text: str | None = None,
+        files_changed_allowlist: set[str] | None = None,
+        planner_complexity: str | None = None,
     ) -> ValidationResult:
         failures: list[str] = []
         failures.extend(self.phase_failures(plan_content, draft_phase=draft_phase))
-        failures.extend(self.missing_required_sections(plan_content, draft_phase=draft_phase))
+        failures.extend(
+            self.missing_required_sections(
+                plan_content,
+                draft_phase=draft_phase,
+                planner_complexity=planner_complexity,
+            )
+        )
         if draft_phase == "refiner":
             failures.extend(self.completion_failures(plan_content))
         failures.extend(self.localized_ui_scope_failures(plan_content, requirements_text))
         failures.extend(self.missing_test_target_failures(plan_content, repo_understanding, requirements_text))
         failures.extend(self.missing_helper_reuse_failures(plan_content, repo_understanding, requirements_text))
         failures.extend(self.localized_backend_grounding_failures(plan_content, repo_understanding, requirements_text))
+        failures.extend(self.files_changed_subset_failures(plan_content, files_changed_allowlist))
         if min_grounding_ratio is not None:
+            requirement_paths = AuthorValidationService.paths_mentioned_in_requirements(requirements_text)
             verified_paths = (
                 set(repo_understanding.file_contents.keys())
                 | set(repo_understanding.entrypoints)
@@ -822,6 +933,7 @@ class AuthorValidationService:
                 | set(repo_understanding.relevant_modules)
                 | set(repo_understanding.relevant_tests)
                 | set(verified_paths_extra or set())
+                | requirement_paths
             )
             grounding, _, _ = self.grounding_failures(
                 plan_content=plan_content,
@@ -848,6 +960,7 @@ class AuthorValidationService:
         verified_paths_extra: set[str] | None = None,
         requirements_text: str | None = None,
         min_grounding_ratio: float | None = None,
+        files_changed_allowlist: set[str] | None = None,
     ) -> ValidationResult:
         failures: list[str] = []
         required_non_empty = [
@@ -876,7 +989,9 @@ class AuthorValidationService:
         failures.extend(self.missing_test_target_failures(plan_content, repo_understanding, requirements_text))
         failures.extend(self.missing_helper_reuse_failures(plan_content, repo_understanding, requirements_text))
         failures.extend(self.localized_backend_grounding_failures(plan_content, repo_understanding, requirements_text))
+        failures.extend(self.files_changed_subset_failures(plan_content, files_changed_allowlist))
         if min_grounding_ratio is not None:
+            requirement_paths = AuthorValidationService.paths_mentioned_in_requirements(requirements_text)
             verified_paths = (
                 set(getattr(repo_understanding, "file_contents", {}).keys())
                 | set(getattr(repo_understanding, "entrypoints", []))
@@ -884,6 +999,7 @@ class AuthorValidationService:
                 | set(getattr(repo_understanding, "relevant_modules", []))
                 | set(getattr(repo_understanding, "relevant_tests", []))
                 | set(verified_paths_extra or set())
+                | requirement_paths
             )
             grounding, _, _ = self.grounding_failures(
                 plan_content=plan_content,

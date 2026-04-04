@@ -137,7 +137,32 @@ Expected behavior:
 - **`grep_code`** searches under the repo sandbox. When `ripgrep` (`rg`) is on `PATH` and `planning.tools.grep_backend` is `auto` (default) or `ripgrep`, searches use **ripgrep** for speed and `.gitignore`-aware exclusions (configurable via `planning.tools.ripgrep_respect_ignore_files`). If `rg` is missing or ripgrep errors, execution falls back to the built-in Python line scan.
 - Use **`output_mode: content`** (default) when you need matching lines for evidence (discovery and feature verification). Use **`output_mode: files_with_matches`** to list only file paths and save tokens when you only need to know where a pattern appears before opening files with `read_file`.
 - Optional **`glob`**, **`type`**, and **`case_insensitive`** apply to the ripgrep path; the Python fallback ignores `glob`/`type` (a note is included in the tool result).
+- Optional **`context`** (integer) adds lines before/after each match via ripgrep `-C`; results include `line_kind` of `match` or `context` in content mode. The Python fallback **ignores** `context` (a note is included).
+- Optional **`offset`** skips the first N result rows before applying `head_limit` / `max_results`. For **content** mode this is match rows (and context rows when `context` is set); for **`files_with_matches`** it is the path list. The Python fallback applies offset after collecting matches (see tool notes).
 - **`glob_files`** finds paths by wildcard under a directory (for example `**/*.py`). It uses **Python** `glob` semantics: **bash-style brace expansion is not supported** (patterns such as `**/*.{py,go}` typically match nothing). Use one extension per pattern or issue separate `glob_files` calls. Prefer **`list_files`** for a single directory listing; use **`glob_files`** for recursive filename patterns.
+
+### `read_file`: line windows vs full-file reads
+
+- Default behavior reads from the beginning of the file for up to `max_lines` (tool default 200). For large files, discovery and authoring should prefer **windowed** reads: `around_line` + `radius` after `grep_code` reports line numbers, or `start_line` + `max_lines` for sequential chunks. This avoids loading only the file header when the relevant code (routes, `create_app`, middleware) lives thousands of lines in.
+
+### `read_file`: fast path vs streaming (large files on disk)
+
+- Files whose **on-disk size** is at most `planning.tools.read_file_fast_path_max_bytes` (default **10 MiB**, similar to Claude Code’s fast path) are read with `read_text` + `splitlines` in memory.
+- **Larger files** use a **streaming** line reader: only the requested line window is held in memory, so peak RAM does not scale with file size. Accurate `line_count` still requires scanning the entire file once (I/O cost, not a giant in-memory buffer).
+- Reads are **refused** when `stat().st_size` exceeds `planning.tools.read_file_max_file_bytes` (default **1 GiB**). Use `grep_code`, smaller windows, or raise the cap in `prscope.yml` if you intentionally work with very large text artifacts.
+
+### `tool_result_max_chars` and artifact offload
+
+- Each tool result is JSON-encoded; if its size exceeds `max(1024, planning.tools.tool_result_max_chars)` (default **8000**), the runtime writes the full payload under `.prscope/tool-results/...` and returns a short summary plus `stored_at`. Models are instructed to call `read_file` on that path when they need the full payload. If discovery often hits artifact offload and loses inline context, **raise** `planning.tools.tool_result_max_chars` in `prscope.yml` (trades larger prompts for fewer artifacts).
+- **Per-tool overrides:** `planning.tools.tool_result_max_chars_by_tool` is an optional map of tool name → max chars (each value is still clamped to at least **1024**). For example, allow a larger inline `grep_code` payload without raising the global cap for every tool.
+
+### `read_file_max_output_chars` (post-window)
+
+- After line-windowing, the returned `content` string is capped at `planning.tools.read_file_max_output_chars` (default **256000**). If truncated, the payload includes `content_truncated: true` and a `note`. This guards against huge single lines (minified JSON, etc.) that would otherwise dominate the prompt.
+
+### Planner draft diagnostics: `author_self_review_used`
+
+- **`author_self_review_used` is not an optional “quality second pass.”** It becomes true only when the **initial draft planner** had a **failed validation** on an attempt and `self_review_draft` produced **revision hints** for a subsequent redraft. When the first planner draft passes validation, this flag stays **false** and log lines such as `self_review=False` are **expected** — they mean no failure-path hint pass ran, not that a review was skipped.
 
 ### Prompt context budgeting
 
@@ -145,7 +170,7 @@ Expected behavior:
 - **Synthetic exploration tool updates**: `planning.synthetic_initial_draft_tool_updates` (default on) makes the planner pipeline emit bounded `tool_update` events after deterministic `explore_repo` so the UI can mirror agent-style activity. Each payload includes `synthetic: true` on the tool object so it is distinguishable from real LLM tool calls. Set to `false` in `prscope.yml` to disable.
 - **Reserved space**: `planning.context_tool_overhead_tokens` is subtracted from the prompt budget to leave room for tool definitions, system wrappers, and completion (`planning.author_prompt_completion_reserve_tokens`). The budget targets what we assemble in the user message, not the full wire prompt to the provider.
 - **Token estimates**: `planning.token_budget_estimator` is `heuristic` (default, char-based) or `tiktoken` when the optional `tiktoken` package is installed (better for OpenAI-style tokenization).
-- **Discovery tool loops**: `planning.discovery_conversation_max_chars` caps the transcript before each LLM call (drops oldest `tool` messages first). `planning.tools.tool_result_max_chars` caps a single tool payload before artifact offload; discovery may further wrap oversized JSON with a truncated preview.
+- **Discovery tool loops**: `planning.discovery_conversation_max_chars` caps the transcript before each LLM call (drops oldest `tool` messages first). `planning.tools.tool_result_max_chars` caps a single tool payload before artifact offload; discovery may further wrap oversized JSON with a truncated preview. See **`tool_result_max_chars` and artifact offload** above for tuning when tool results are often stored as artifacts.
 
 ## Refinement Behavior Contract
 
@@ -353,6 +378,8 @@ Each path below is **independent**; see `PlanningConfig` in `src/prscope/config.
 
 - **Where:** [`DiscoveryLLMClient.llm_call_with_tools`](src/prscope/planning/runtime/discovery_support/llm.py) calls `trim_discovery_messages_for_budget` before **each** LiteLLM completion inside the discovery tool loop.
 - **Config:** `planning.discovery_conversation_max_chars` (runtime enforces a minimum of 8192 characters). Tool results are also capped per round (`per_tool_cap = max(4096, max_conv // 8)`).
+- **Optional token cap:** `planning.discovery_conversation_max_input_tokens` (omit or `0` = disabled). When set, the serialized discovery message list is estimated with `planning.token_budget_estimator` (`heuristic` = `len/3.5`, or `tiktoken` when installed for OpenAI-style models). Trimming runs until **both** the character cap and the token cap (when enabled) are satisfied—characters remain a hard backstop.
+- **Compaction circuit breaker:** `planning.discovery_compaction_failure_max` (default `0` = unlimited). When `> 0`, each `context_compaction` emission for `discovery_transcript_trim` increments a counter; if it exceeds this limit, discovery aborts with a user-visible message and SSE `discovery_circuit_breaker` (`reason: compaction_emit_limit`).
 - **What survives:** Recent messages and tool-output text within the budget; older content is dropped by the trim helper.
 - **SSE:** `context_compaction` with `reason: "discovery_transcript_trim"` and `session_stage: "discovery"`.
 

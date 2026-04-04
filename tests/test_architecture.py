@@ -91,6 +91,8 @@ INTELLIGENCE = {
     "planning.runtime.tools",
     "planning.runtime.llm_retry",
     "planning.runtime.ripgrep_search",
+    "planning.runtime.read_file_range",
+    "planning.runtime.tool_arg_coerce",
     "planning.runtime.budget",
     "planning.runtime.telemetry",
     "planning.runtime.clarification",
@@ -145,6 +147,8 @@ APPROVED_LEAF_HELPERS = {
     "planning.runtime.telemetry",
     "planning.runtime.events.analytics_emitter",
     "planning.runtime.ripgrep_search",
+    "planning.runtime.read_file_range",
+    "planning.runtime.tool_arg_coerce",
     "planning.runtime.llm_retry",
 }
 

@@ -19,8 +19,12 @@ from ..acceptance_contract import (
     verify_convergence_postcondition,
 )
 from ..author import PlanDocument, RepairPlan, RepoUnderstanding, RevisionResult, apply_section_updates, render_markdown
-from ..authoring.discovery import is_localized_frontend_request
-from ..authoring.validation import patch_plan_document_localized_backend_grounding
+from ..authoring.discovery import (
+    PRSCOPE_HTTP_CLIENT_HINTS,
+    is_localized_frontend_request,
+    requirements_imply_http_client_call_sites,
+)
+from ..authoring.validation import AuthorValidationService, patch_plan_document_localized_backend_grounding
 from ..critic import ImplementabilityResult, ReviewResult
 from ..elapsed_ping import run_with_elapsed_thinking
 from ..followups import decision_graph_from_json, decision_graph_from_plan, merge_decision_graphs
@@ -98,6 +102,28 @@ class PlanningStages:
         self._review_reasoner = ReviewReasoner()
         self._convergence_reasoner = ConvergenceReasoner()
         self._refinement_reasoner = RefinementReasoner()
+
+    @staticmethod
+    def _exploration_paths_block(accessed_paths: set[str] | None) -> str | None:
+        """Bullet list of repo-relative paths read via tools this session (critic grounding)."""
+        if not accessed_paths:
+            return None
+        paths = sorted({str(p).strip() for p in accessed_paths if str(p).strip()})[:48]
+        if not paths:
+            return None
+        return "\n".join(f"- `{p}`" for p in paths)
+
+    @staticmethod
+    def _refinement_files_changed_allowlist(
+        requirements: str,
+        revision_repo_understanding: RepoUnderstanding,
+    ) -> set[str] | None:
+        hints = PRSCOPE_HTTP_CLIENT_HINTS if requirements_imply_http_client_call_sites(requirements) else ()
+        return AuthorValidationService.build_files_changed_allowlist_from_repo_understanding(
+            revision_repo_understanding,
+            http_client_hints=hints,
+            requirements_text=requirements,
+        )
 
     def _convergence_signals(
         self,
@@ -1435,6 +1461,9 @@ class PlanningStages:
                 repo_understanding=revision_repo_understanding,
                 verified_paths_extra=verified_paths,
                 requirements_text=ctx.requirements,
+                files_changed_allowlist=self._refinement_files_changed_allowlist(
+                    ctx.requirements, revision_repo_understanding
+                ),
             )
             if not val.failure_messages:
                 rr = self._merge_revision_result_with_plan(rr, current_plan_doc, plan)
@@ -1508,6 +1537,7 @@ class PlanningStages:
                 session_id=ctx.session_id,
                 round_number=ctx.round_number,
                 mode=review_mode,
+                exploration_paths_block=self._exploration_paths_block(ctx.state.accessed_paths),
             ),
             emit=_emit_thinking,
             first_after_s=float(cfg.long_phase_ping_first_after_seconds),
@@ -1773,11 +1803,15 @@ class PlanningStages:
             verified_paths=verified_paths,
             previous_plan_content=previous_plan_content,
         )
+        refinement_fc_allowlist = self._refinement_files_changed_allowlist(
+            ctx.requirements, revision_repo_understanding
+        )
         current_refinement_validation = self._author.validate_refinement_result(
             plan_content=render_markdown(current_plan_doc),
             repo_understanding=revision_repo_understanding,
             verified_paths_extra=verified_paths,
             requirements_text=ctx.requirements,
+            files_changed_allowlist=refinement_fc_allowlist,
         )
         missing_section_failures = [
             failure
@@ -1839,6 +1873,9 @@ class PlanningStages:
                     revision_repo_understanding = self._revision_repo_understanding(
                         verified_paths=verified_paths,
                         previous_plan_content=previous_plan_content,
+                    )
+                    refinement_fc_allowlist = self._refinement_files_changed_allowlist(
+                        ctx.requirements, revision_repo_understanding
                     )
                     query_summary = ", ".join(
                         supplemental_evidence_result.anchor_paths[:2] or supplemental_evidence_result.read_paths[:2]
@@ -1904,6 +1941,7 @@ class PlanningStages:
                 repo_understanding=revision_repo_understanding,
                 verified_paths_extra=verified_paths,
                 requirements_text=ctx.requirements,
+                files_changed_allowlist=refinement_fc_allowlist,
             )
             retryable_failures = [*grounding_failures, *list(revision_validation.failure_messages)]
             if retryable_failures:
@@ -1919,6 +1957,7 @@ class PlanningStages:
                     repo_understanding=revision_repo_understanding,
                     verified_paths_extra=verified_paths,
                     requirements_text=ctx.requirements,
+                    files_changed_allowlist=refinement_fc_allowlist,
                 )
                 if supplemented_validation.failure_messages:
                     supplemented_plan = self._supplement_refinement_plan(
@@ -1932,6 +1971,7 @@ class PlanningStages:
                         repo_understanding=revision_repo_understanding,
                         verified_paths_extra=verified_paths,
                         requirements_text=ctx.requirements,
+                        files_changed_allowlist=refinement_fc_allowlist,
                     )
                 if not supplemented_validation.failure_messages:
                     revision_result = RevisionResult(
@@ -2113,6 +2153,7 @@ class PlanningStages:
             round_number=ctx.round_number,
             mode="validation",
             open_tracked_issues_block=self._open_tracked_issues_block_for_validation(ctx.issue_tracker),
+            exploration_paths_block=self._exploration_paths_block(ctx.state.accessed_paths),
         )
         if not isinstance(validation_payload, ReviewResult):
             raise RuntimeError("Expected ReviewResult from validation phase")
@@ -2231,6 +2272,7 @@ class PlanningStages:
                 session_id=ctx.session_id,
                 round_number=ctx.round_number,
                 mode="implementability",
+                exploration_paths_block=self._exploration_paths_block(ctx.state.accessed_paths),
             )
             if isinstance(impl_payload, ImplementabilityResult):
                 implementability = impl_payload

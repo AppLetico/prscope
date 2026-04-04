@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -51,8 +52,78 @@ def test_trim_discovery_messages_drops_old_tools() -> None:
         {"role": "assistant", "content": ""},
         {"role": "tool", "content": "b" * 5000},
     ]
-    out = trim_discovery_messages_for_budget(msgs, max_chars=2000)
+    out, _removed = trim_discovery_messages_for_budget(msgs, max_chars=2000)
     assert len(out) < len(msgs) or sum(len(str(m.get("content", ""))) for m in out) <= 2500
+
+
+def test_trim_discovery_respects_token_cap_when_chars_allow() -> None:
+    msgs = [
+        {"role": "system", "content": "x" * 100},
+        {"role": "user", "content": "hi"},
+        {"role": "tool", "content": "z" * 15_000},
+    ]
+    out, removed = trim_discovery_messages_for_budget(
+        msgs,
+        max_chars=500_000,
+        max_input_tokens=100,
+        model_id="gpt-4o",
+        token_estimator="heuristic",
+    )
+    assert removed
+    assert len(out) < len(msgs)
+
+
+@pytest.mark.asyncio
+async def test_discovery_compaction_circuit_breaker_emits_after_limit() -> None:
+    events: list[dict[str, Any]] = []
+
+    async def capture(ev: dict[str, Any]) -> None:
+        events.append(ev)
+
+    mgr = MagicMock()
+    mgr.config = PlanningConfig(
+        author_model="gpt-4o-mini",
+        critic_model="gpt-4o-mini",
+        discovery_compaction_failure_max=2,
+        token_budget_estimator="heuristic",
+    )
+    mgr._emit = AsyncMock(side_effect=capture)
+    mgr._normalize_roles.side_effect = lambda m: m
+    mgr._extract_feature_intent.return_value = None
+    mgr._latest_user_message.return_value = ""
+    mgr._active_discovery_session_id = "s1"
+    mgr.tool_executor.execute = MagicMock(
+        return_value={"tool_call_id": "1", "name": "list_files", "result": {"ok": True}}
+    )
+    mgr._ingest_feature_evidence_from_tool = AsyncMock()
+
+    client = DiscoveryLLMClient(mgr)
+
+    async def fake_safe(*args: Any, **kwargs: Any) -> Any:
+        r = MagicMock()
+        r.choices = [MagicMock()]
+        r.choices[0].message.content = ""
+        tc = MagicMock()
+        tc.id = "x"
+        tc.function.name = "list_files"
+        tc.function.arguments = "{}"
+        r.choices[0].message.tool_calls = [tc]
+        return r
+
+    def always_trim(msgs: list, *a: Any, **k: Any) -> tuple[list, bool]:
+        return list(msgs), True
+
+    with patch(
+        "prscope.planning.runtime.discovery_support.llm.trim_discovery_messages_for_budget",
+        side_effect=always_trim,
+    ):
+        client.safe_completion_call = fake_safe
+        out = await client.llm_call_with_tools(
+            [{"role": "user", "content": "hi"}],
+            max_tool_rounds=10,
+        )
+    assert "Discovery paused" in out
+    assert any(e.get("type") == "discovery_circuit_breaker" for e in events)
 
 
 @pytest.mark.asyncio
@@ -144,10 +215,11 @@ async def test_summarize_critiques_for_compaction_heuristic_emits_event(tmp_path
 @pytest.mark.asyncio
 async def test_discovery_llm_emits_context_compaction_on_trim() -> None:
     mgr = MagicMock()
-    cfg = MagicMock()
-    cfg.author_model = "gpt-4o-mini"
-    cfg.discovery_conversation_max_chars = 800
-    mgr.config = cfg
+    mgr.config = PlanningConfig(
+        author_model="gpt-4o-mini",
+        critic_model="gpt-4o-mini",
+        discovery_conversation_max_chars=800,
+    )
     mgr._emit = AsyncMock()
     mgr._normalize_roles = lambda msgs: msgs  # noqa: E731
     mgr._extract_feature_intent = MagicMock(return_value=None)

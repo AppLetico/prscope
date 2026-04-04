@@ -11,6 +11,7 @@ import pytest
 from prscope.planning.runtime.discovery import (
     BOOTSTRAP_ROUTE_REGEX,
     CODE_SIGNALS,
+    DISCOVERY_SYSTEM_PROMPT,
     FRAMEWORKS,
     DiscoveryManager,
     Evidence,
@@ -461,6 +462,12 @@ def test_framework_registry_has_valid_patterns() -> None:
         assert framework.file_patterns
         for pattern in framework.route_patterns:
             assert isinstance(pattern, re.Pattern)
+
+
+def test_discovery_system_prompt_covers_windowed_reads_and_artifacts() -> None:
+    assert "around_line" in DISCOVERY_SYSTEM_PROMPT
+    assert "radius" in DISCOVERY_SYSTEM_PROMPT
+    assert ".prscope/tool-results/" in DISCOVERY_SYSTEM_PROMPT
 
 
 def test_bootstrap_route_regex_is_compiled() -> None:

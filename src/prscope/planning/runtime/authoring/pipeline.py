@@ -8,8 +8,11 @@ from typing import Any
 
 from ..tools import extract_file_references
 from .discovery import (
+    PRSCOPE_HTTP_CLIENT_HINTS,
     exploration_budget_for_requirements,
     is_localized_frontend_request,
+    is_server_api_or_auth_request,
+    requirements_imply_http_client_call_sites,
     requirements_imply_web_stack_exploration,
 )
 from .models import (
@@ -19,7 +22,7 @@ from .models import (
     RepoUnderstanding,
     ValidationResult,
 )
-from .validation import localized_request_explicit_payload_change
+from .validation import AuthorValidationService, localized_request_explicit_payload_change
 
 logger = logging.getLogger(__name__)
 
@@ -250,6 +253,9 @@ class AuthorPlannerPipeline:
                 "address how authenticated HTTP and live event streams stay consistent (cookies, query token, or "
                 "fetch-based streaming)."
             )
+        http_client_hints: list[str] = []
+        if requirements_imply_http_client_call_sites(lower_requirements):
+            http_client_hints.extend(PRSCOPE_HTTP_CLIENT_HINTS)
         return EvidenceBundle(
             relevant_files=tuple(relevant_files[:12]),
             existing_components=tuple(existing_components[:12]),
@@ -257,6 +263,7 @@ class AuthorPlannerPipeline:
             related_modules=tuple(related_modules[:8]),
             existing_routes_or_helpers=tuple(existing_routes_or_helpers[:12]),
             evidence_notes=tuple(evidence_notes[:6]),
+            http_client_hints=tuple(http_client_hints),
         )
 
     @staticmethod
@@ -391,6 +398,8 @@ class AuthorPlannerPipeline:
         evidence_bundle: EvidenceBundle,
         requirements: str,
     ) -> tuple[str, ...]:
+        if is_server_api_or_auth_request(requirements):
+            return ()
         if not is_localized_frontend_request(requirements):
             return ()
         preferred: list[str] = []
@@ -401,21 +410,18 @@ class AuthorPlannerPipeline:
                 preferred.append(path)
 
         lower_requirements = str(requirements or "").lower()
-        if "planning" in lower_requirements:
+        if (
+            "planningview" in lower_requirements
+            or "planning page" in lower_requirements
+            or "planning ui" in lower_requirements
+        ):
             _append_if_present("src/prscope/web/frontend/src/pages/PlanningView.tsx")
         if "planpanel" in lower_requirements:
             _append_if_present("src/prscope/web/frontend/src/components/PlanPanel.tsx")
+        if "actionbar" in lower_requirements:
+            _append_if_present("src/prscope/web/frontend/src/components/ActionBar.tsx")
         if any(token in lower_requirements for token in ("export", "download", "snapshot")):
             _append_if_present("src/prscope/web/frontend/src/lib/api.ts")
-
-        for path in relevant_files:
-            lowered = path.lower()
-            if "/frontend/" not in lowered or re.search(r"\.test\.(?:[jt]sx?)$", lowered):
-                continue
-            if path not in preferred:
-                preferred.append(path)
-            if len(preferred) >= 3:
-                break
         return tuple(preferred[:3])
 
     @staticmethod
@@ -517,6 +523,8 @@ class AuthorPlannerPipeline:
         min_grounding_ratio: float,
         grounding_paths: set[str],
         requirements: str,
+        files_changed_allowlist: set[str] | None,
+        planner_complexity: str,
     ) -> tuple[str, ValidationResult]:
         repaired = plan_content
         if "missing_tests" in validation_result.reason_codes and evidence_bundle.test_targets:
@@ -548,21 +556,23 @@ class AuthorPlannerPipeline:
             "src/prscope/web/frontend/src/components/PlanPanel.tsx": (
                 "Preserve existing PlanPanel export and health behavior while wiring the localized UI change."
             ),
+            "src/prscope/web/frontend/src/components/ActionBar.tsx": (
+                "Keep ActionBar changes limited to the existing component when the requirements name it."
+            ),
             "src/prscope/web/frontend/src/lib/api.ts": (
                 "Preserve the existing frontend API helper wiring for the reused export/snapshot helpers."
             ),
         }
         for path in self._localized_frontend_owner_paths(evidence_bundle, requirements):
-            repaired = self._insert_path_into_files_changed(
-                repaired,
-                path,
-                localized_owner_rationales.get(
-                    path, "Keep the localized UI change anchored to the verified existing frontend owner."
-                ),
-            )
+            rationale = localized_owner_rationales.get(path)
+            if not rationale:
+                continue
+            repaired = self._insert_path_into_files_changed(repaired, path, rationale)
         planpanel_path = "src/prscope/web/frontend/src/components/PlanPanel.tsx"
         if (
-            "planpanel" in requirements.lower()
+            not is_server_api_or_auth_request(requirements)
+            and is_localized_frontend_request(requirements)
+            and "planpanel" in requirements.lower()
             and "PlanPanel" in repaired
             and planpanel_path in evidence_bundle.relevant_files
         ):
@@ -574,7 +584,8 @@ class AuthorPlannerPipeline:
         helper_owner_path = "src/prscope/web/frontend/src/lib/api.ts"
         helper_tokens = ("exportSession", "downloadFile", "getSessionSnapshot")
         if (
-            helper_owner_path in evidence_bundle.relevant_files
+            not is_server_api_or_auth_request(requirements)
+            and helper_owner_path in evidence_bundle.relevant_files
             and helper_owner_path not in repaired
             and any(token in repaired for token in helper_tokens)
         ):
@@ -592,6 +603,8 @@ class AuthorPlannerPipeline:
             min_grounding_ratio=min_grounding_ratio,
             verified_paths_extra=grounding_paths,
             requirements_text=requirements,
+            files_changed_allowlist=files_changed_allowlist,
+            planner_complexity=planner_complexity,
         )
         if repaired_validation.failure_count <= validation_result.failure_count:
             return repaired, repaired_validation
@@ -698,6 +711,14 @@ class AuthorPlannerPipeline:
         )
         t3 = time.perf_counter()
         evidence_bundle = self._build_evidence_bundle(repo_understanding, requirements)
+        files_changed_allowlist = AuthorValidationService.build_files_changed_evidence_allowlist(
+            relevant_files=evidence_bundle.relevant_files,
+            test_targets=evidence_bundle.test_targets,
+            related_modules=evidence_bundle.related_modules,
+            http_client_hints=evidence_bundle.http_client_hints,
+            grounding_paths=set(grounding_paths or set()),
+            requirements_text=requirements,
+        )
 
         await self._emit_progress(
             stage="planner_draft",
@@ -750,6 +771,7 @@ class AuthorPlannerPipeline:
                     revision_hints=list(revision_hints),
                     timeout_seconds_override=timeout_seconds_override,
                     initial_draft_context=initial_draft_context,
+                    planner_complexity=complexity,
                 )
             except Exception as exc:  # noqa: BLE001
                 if best_plan_content:
@@ -770,6 +792,8 @@ class AuthorPlannerPipeline:
                     min_grounding_ratio=min_grounding_ratio,
                     verified_paths_extra=set(grounding_paths or set()),
                     requirements_text=requirements,
+                    files_changed_allowlist=files_changed_allowlist,
+                    planner_complexity=complexity,
                 )
             )
             final_validation_result = validation_result
@@ -836,6 +860,8 @@ class AuthorPlannerPipeline:
             min_grounding_ratio=min_grounding_ratio,
             grounding_paths=grounding_paths or set(),
             requirements=requirements,
+            files_changed_allowlist=files_changed_allowlist,
+            planner_complexity=complexity,
         )
         if final_validation_result.failure_messages:
             rejection_reasons.append(

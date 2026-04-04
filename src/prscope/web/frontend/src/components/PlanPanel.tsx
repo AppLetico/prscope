@@ -3,7 +3,6 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { FileText, Copy, Check, Download, AlertCircle, Clock } from "lucide-react";
 import { clsx } from "clsx";
-import mermaid from "mermaid";
 import { Tooltip } from "./ui/Tooltip";
 import { IssuePanel } from "./IssuePanel";
 import { getPressuredDecisions, getRelatedDecisionSummaries, getTopPressureSummary } from "../lib/impactView";
@@ -47,7 +46,6 @@ export function PlanPanel({
   const [activeIssueTab, setActiveIssueTab] = useState<"issues" | "violations" | "resolved">("issues");
   const issuesPopupRef = useRef<HTMLDivElement>(null);
   const toolbarRef = useRef<HTMLDivElement>(null);
-  const mermaidRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
     function handleClickOutside(event: MouseEvent) {
@@ -58,24 +56,6 @@ export function PlanPanel({
     document.addEventListener("mousedown", handleClickOutside);
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
-
-  useEffect(() => {
-    mermaid.initialize({
-      startOnLoad: false,
-      theme: "dark",
-      securityLevel: "loose",
-      fontFamily: "inherit",
-    });
-  }, []);
-
-  useEffect(() => {
-    if (content && mermaidRef.current) {
-      void mermaid.run({
-        nodes: mermaidRef.current.querySelectorAll(".mermaid"),
-        suppressErrors: true,
-      });
-    }
-  }, [content]);
 
   if (!content) {
     const emptyCopy = getPlanPanelEmptyCopy(isProcessing, status);
@@ -305,7 +285,7 @@ export function PlanPanel({
           </div>
         ) : null}
         <div className="pb-12">
-          <div className="max-w-3xl mx-auto pt-6 py-12 px-4 md:px-8" ref={mermaidRef}>
+          <div className="max-w-3xl mx-auto pt-6 py-12 px-4 md:px-8">
             <article className="prose prose-zinc prose-invert max-w-none">
               <ReactMarkdown
                 remarkPlugins={[remarkGfm]}

@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { augmentPlanMarkdownWithDecisionGraph } from "./decisionGraphRender";
+import {
+  augmentPlanMarkdownWithDecisionGraph,
+  decisionGraphToMermaid,
+  hasMermaidInArchitectureSection,
+  sanitizeMermaidNodeId,
+} from "./decisionGraphRender";
 import type { DecisionGraph } from "../types";
 
 describe("augmentPlanMarkdownWithDecisionGraph", () => {
@@ -63,5 +68,104 @@ describe("augmentPlanMarkdownWithDecisionGraph", () => {
 
     const matches = rendered.match(/Which environment should rollout target first\?/g) ?? [];
     expect(matches).toHaveLength(1);
+  });
+
+  it("injects Decision map (auto) mermaid when graph has edges and no existing mermaid in Architecture", () => {
+    const graph: DecisionGraph = {
+      nodes: {
+        a: {
+          id: "a",
+          description: "Service A",
+          section: "architecture",
+          value: "ok",
+        },
+        b: {
+          id: "b",
+          description: "Service B",
+          section: "architecture",
+          value: "ok",
+        },
+      },
+      edges: [{ source: "a", target: "b", relation: "calls" }],
+    };
+
+    const rendered = augmentPlanMarkdownWithDecisionGraph(
+      "# Plan\n\n## Architecture\nSome prose.\n",
+      graph,
+    );
+
+    expect(rendered).toContain("### Decision map (auto)");
+    expect(rendered).toContain("```mermaid");
+    expect(rendered).toContain("flowchart LR");
+    expect(rendered).toContain("calls");
+  });
+
+  it("does not inject auto mermaid when Architecture already has a mermaid fence", () => {
+    const graph: DecisionGraph = {
+      nodes: {
+        a: { id: "a", description: "A", section: "architecture", value: "v" },
+        b: { id: "b", description: "B", section: "architecture", value: "v" },
+      },
+      edges: [{ source: "a", target: "b", relation: "r" }],
+    };
+
+    const rendered = augmentPlanMarkdownWithDecisionGraph(
+      "# Plan\n\n## Architecture\n```mermaid\nflowchart LR\n  X-->Y\n```\n",
+      graph,
+    );
+
+    expect(rendered).not.toContain("Decision map (auto)");
+  });
+});
+
+describe("decisionGraphToMermaid", () => {
+  it("returns flowchart with edges", () => {
+    const graph: DecisionGraph = {
+      nodes: {
+        n1: { id: "n1", description: "Alpha", section: "architecture" },
+        n2: { id: "n2", description: "Beta", section: "architecture" },
+      },
+      edges: [{ source: "n1", target: "n2", relation: "next" }],
+    };
+    const out = decisionGraphToMermaid(graph);
+    expect(out).toContain("flowchart LR");
+    expect(out).toContain("Alpha");
+    expect(out).toContain("next");
+  });
+
+  it("uses subgraphs when there are no edges and multiple nodes", () => {
+    const graph: DecisionGraph = {
+      nodes: {
+        a: { id: "a", description: "Q1", section: "architecture" },
+        b: { id: "b", description: "Q2", section: "architecture" },
+      },
+    };
+    const out = decisionGraphToMermaid(graph);
+    expect(out).toContain("flowchart TB");
+    expect(out).toContain("subgraph");
+  });
+
+  it("returns null for empty nodes", () => {
+    expect(decisionGraphToMermaid({ nodes: {} })).toBeNull();
+  });
+});
+
+describe("hasMermaidInArchitectureSection", () => {
+  it("detects mermaid fence under Architecture", () => {
+    expect(
+      hasMermaidInArchitectureSection("## Architecture\n\n```mermaid\nx\n```"),
+    ).toBe(true);
+  });
+
+  it("is false when mermaid only outside Architecture", () => {
+    expect(
+      hasMermaidInArchitectureSection("## Summary\n```mermaid\nx\n```\n## Architecture\nText"),
+    ).toBe(false);
+  });
+});
+
+describe("sanitizeMermaidNodeId", () => {
+  it("prefixes leading digits", () => {
+    expect(sanitizeMermaidNodeId("1a")).toMatch(/^n_/);
   });
 });

@@ -47,6 +47,8 @@ class EvidenceBundle:
     related_modules: tuple[str, ...] = ()
     existing_routes_or_helpers: tuple[str, ...] = ()
     evidence_notes: tuple[str, ...] = ()
+    # In-repo modules that call the web HTTP API (benchmark, pytest, e2e) when requirements imply callers.
+    http_client_hints: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)

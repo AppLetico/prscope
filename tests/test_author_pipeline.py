@@ -21,6 +21,7 @@ from prscope.planning.runtime.authoring.models import (
 )
 from prscope.planning.runtime.authoring.pipeline import AuthorPlannerPipeline
 from prscope.planning.runtime.authoring.repair import AuthorRepairService, _max_revise_user_chars_for_window
+from prscope.planning.runtime.authoring.validation import AuthorValidationService
 from prscope.planning.runtime.critic import ReviewResult
 from prscope.planning.runtime.tools import ToolExecutor
 
@@ -1301,6 +1302,14 @@ def test_author_planner_pipeline_deterministically_replaces_unverified_paths() -
         min_grounding_ratio=0.35,
         grounding_paths=set(),
         requirements="Keep the change localized and add focused frontend tests.",
+        files_changed_allowlist=AuthorValidationService.build_files_changed_evidence_allowlist(
+            relevant_files=("src/prscope/web/frontend/src/pages/PlanningView.tsx",),
+            test_targets=("src/prscope/web/frontend/src/pages/PlanningView.test.ts",),
+            related_modules=(),
+            http_client_hints=(),
+            grounding_paths=set(),
+        ),
+        planner_complexity="moderate",
     )
 
     assert repaired_result.ok
@@ -1368,6 +1377,18 @@ def test_author_planner_pipeline_keeps_localized_frontend_owner_paths_in_files_c
             "in progress. Reuse the existing exportSession and downloadFile helpers, preserve current PlanPanel behavior, "
             "and keep the change localized."
         ),
+        files_changed_allowlist=AuthorValidationService.build_files_changed_evidence_allowlist(
+            relevant_files=(
+                "src/prscope/web/frontend/src/pages/PlanningView.tsx",
+                "src/prscope/web/frontend/src/components/PlanPanel.tsx",
+                "src/prscope/web/frontend/src/lib/api.ts",
+            ),
+            test_targets=("src/prscope/web/frontend/src/pages/PlanningView.test.ts",),
+            related_modules=(),
+            http_client_hints=(),
+            grounding_paths=set(),
+        ),
+        planner_complexity="moderate",
     )
 
     assert repaired_result.ok
@@ -3259,6 +3280,12 @@ Add observability to the existing health route.
 ## Architecture
 - Keep the change localized to `prscope/web/api.py`.
 
+## Example Code Snippets
+```python
+async def health() -> dict[str, str]:
+    return {"status": "healthy"}
+```
+
 ## Open Questions
 - None.
 """
@@ -3337,7 +3364,17 @@ async def test_draft_plan_uses_planner_specific_prompt(tmp_path: Path) -> None:
     assert "## Current baseline" in str(messages[0]["content"])
     assert "## Goals" in str(messages[0]["content"])
     assert "## Risks and constraints" in str(messages[0]["content"])
+    assert "## Example Code Snippets" in str(messages[0]["content"])
     assert "EventSource" in str(messages[0]["content"])
+
+    await agent.draft_plan(
+        requirements="Enhance the health endpoint with observability.",
+        repo_understanding=repo_understanding,
+        draft_phase="planner",
+        planner_complexity="moderate",
+    )
+    assert "Planner output constraints" in str(captured["messages"][1]["content"])
+    assert "moderate/complex" in str(captured["messages"][1]["content"])
 
 
 @pytest.mark.asyncio

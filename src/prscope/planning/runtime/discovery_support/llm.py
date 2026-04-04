@@ -7,6 +7,7 @@ from typing import Any
 from ....config import LlmRetryConfig
 from ....model_catalog import litellm_model_name, model_provider
 from ....pricing import context_window_for_model
+from ..context.budget import estimate_tokens
 from ..llm_retry import (
     async_sleep,
     compute_retry_delay_seconds,
@@ -21,26 +22,62 @@ def _discovery_message_chars(messages: list[dict[str, Any]]) -> int:
     return sum(len(str(m.get("content", ""))) for m in messages)
 
 
+def _discovery_message_tokens(
+    messages: list[dict[str, Any]],
+    model_id: str | None,
+    token_estimator: str,
+) -> int:
+    blob = json.dumps(messages, ensure_ascii=False)
+    return estimate_tokens(blob, model_id=model_id, estimator=token_estimator)
+
+
+def _discovery_over_budget(
+    messages: list[dict[str, Any]],
+    max_chars: int,
+    max_input_tokens: int | None,
+    model_id: str | None,
+    token_estimator: str,
+) -> bool:
+    if max_chars > 0 and _discovery_message_chars(messages) > max_chars:
+        return True
+    if max_input_tokens is not None and max_input_tokens > 0:
+        if _discovery_message_tokens(messages, model_id, token_estimator) > max_input_tokens:
+            return True
+    return False
+
+
 def trim_discovery_messages_for_budget(
     messages: list[dict[str, Any]],
     max_chars: int,
-) -> list[dict[str, Any]]:
-    """Drop oldest tool messages until the transcript fits the budget (system + user preserved)."""
-    if max_chars <= 0 or _discovery_message_chars(messages) <= max_chars:
-        return messages
+    *,
+    max_input_tokens: int | None = None,
+    model_id: str | None = None,
+    token_estimator: str = "heuristic",
+) -> tuple[list[dict[str, Any]], bool]:
+    """Drop oldest tool messages until under char and optional token budget. Returns (messages, removed_any)."""
+    if max_chars <= 0:
+        max_chars = 8_192
+    if not _discovery_over_budget(messages, max_chars, max_input_tokens, model_id, token_estimator):
+        return messages, False
     out = list(messages)
     guard = 0
-    while _discovery_message_chars(out) > max_chars and len(out) > 2 and guard < 1000:
+    removed_any = False
+    while (
+        _discovery_over_budget(out, max_chars, max_input_tokens, model_id, token_estimator)
+        and len(out) > 2
+        and guard < 1000
+    ):
         guard += 1
         removed = False
         for i in range(1, len(out)):
             if out[i].get("role") == "tool":
                 del out[i]
                 removed = True
+                removed_any = True
                 break
         if not removed:
             break
-    return out
+    return out, removed_any
 
 
 def _cap_tool_json_content(raw: str, max_chars: int) -> str:
@@ -79,12 +116,23 @@ class DiscoveryLLMClient:
         cfg = self._manager.config
         max_conv = max(8_192, int(getattr(cfg, "discovery_conversation_max_chars", 120_000)))
         per_tool_cap = max(4096, max_conv // 8)
+        model_for_est = model_override or getattr(cfg, "discovery_model", None) or getattr(cfg, "author_model", None)
+        te = str(getattr(cfg, "token_budget_estimator", "heuristic") or "heuristic")
+        max_tok = getattr(cfg, "discovery_conversation_max_input_tokens", None)
+        max_compact_emits = int(getattr(cfg, "discovery_compaction_failure_max", 0) or 0)
+        compaction_emit_count = 0
 
         for _ in range(max_tool_rounds):
             before_len = len(conversation)
             before_chars = _discovery_message_chars(conversation)
-            conversation = trim_discovery_messages_for_budget(conversation, max_conv)
-            if len(conversation) < before_len or _discovery_message_chars(conversation) < before_chars:
+            conversation, trim_removed = trim_discovery_messages_for_budget(
+                conversation,
+                max_conv,
+                max_input_tokens=max_tok,
+                model_id=str(model_for_est) if model_for_est else None,
+                token_estimator=te,
+            )
+            if trim_removed or len(conversation) < before_len or _discovery_message_chars(conversation) < before_chars:
                 await self._manager._emit(
                     {
                         "type": "context_compaction",
@@ -93,6 +141,21 @@ class DiscoveryLLMClient:
                         "session_stage": "discovery",
                     }
                 )
+                if max_compact_emits > 0:
+                    compaction_emit_count += 1
+                    if compaction_emit_count > max_compact_emits:
+                        await self._manager._emit(
+                            {
+                                "type": "discovery_circuit_breaker",
+                                "reason": "compaction_emit_limit",
+                                "session_stage": "discovery",
+                                "limit": max_compact_emits,
+                            }
+                        )
+                        return (
+                            "Discovery paused: transcript compaction limit reached. "
+                            "Raise planning.discovery_compaction_failure_max or reduce context."
+                        )
             response = await self.safe_completion_call(
                 litellm=litellm,
                 messages=self._manager._normalize_roles(conversation),

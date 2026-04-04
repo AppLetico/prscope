@@ -117,20 +117,123 @@ def requirements_keywords(text: str) -> set[str]:
     return {token for token in tokens if len(token) >= 3 and token not in REQUIREMENT_STOPWORDS}
 
 
+# Strong signals for API-boundary / auth / streaming work (avoid matching "FastAPI" alone on localized UI tasks).
+_SERVER_API_AUTH_MARKERS = (
+    "middleware",
+    "api key",
+    "api-key",
+    "bearer",
+    "authenticate",
+    "authentication",
+    "authorization",
+    "unauthorized",
+    "prscope_",
+    "/api/",
+    "eventsource",
+    "sse",
+    "cors",
+    "csrf",
+    "jwt",
+    "oauth",
+    "endpoint security",
+    "route guard",
+)
+# Stack mentions that count as server-first only when paired with boundary/auth context.
+_SERVER_STACK_PAIR_MARKERS = (
+    "fastapi",
+    "uvicorn",
+)
+
+
+def is_server_api_or_auth_request(text: str) -> bool:
+    """True when requirements focus on HTTP API boundary, auth, or streaming — not UI-only tweaks.
+
+    Mentioning FastAPI/uvicorn alone is not enough (localized UI + FastAPI payload tweaks stay localized-frontend).
+    """
+    lowered = str(text or "").lower()
+    if any(marker in lowered for marker in _SERVER_API_AUTH_MARKERS):
+        return True
+    boundary_hint = any(
+        token in lowered
+        for token in (
+            "authorization",
+            "unauthorized",
+            "authenticate",
+            "bearer",
+            "cookie",
+            "jwt",
+            "csrf",
+            "cors",
+            "oauth",
+            "api key",
+            "api-key",
+            "/api/",
+            "middleware",
+            "prscope_",
+        )
+    )
+    if boundary_hint and any(marker in lowered for marker in _SERVER_STACK_PAIR_MARKERS):
+        return True
+    return False
+
+
 def is_localized_frontend_request(text: str) -> bool:
+    """True for UI/component-scoped asks. Server/API/auth-first requests are excluded.
+
+    Avoids substring matches on bare \"ui\" (e.g. \"quick\") and defers to server/auth scope when those dominate.
+    """
+    if is_server_api_or_auth_request(text):
+        return False
     lowered = str(text or "").lower()
     frontend_markers = (
         "frontend",
         "react",
-        "ui",
         "component",
         "button",
         "actionbar",
         "planpanel",
         "planningview",
         "planning page",
+        "user interface",
     )
-    return any(marker in lowered for marker in frontend_markers)
+    if any(marker in lowered for marker in frontend_markers):
+        return True
+    if re.search(r"\bui\b", lowered):
+        return True
+    return False
+
+
+# Typical in-repo callers of the prscope web API (for evidence hints; not exhaustive).
+PRSCOPE_HTTP_CLIENT_HINTS: tuple[str, ...] = (
+    "src/prscope/benchmark.py",
+    "tests/test_web_api_models.py",
+    "src/prscope/web/frontend/e2e/smoke.spec.ts",
+)
+
+
+def requirements_imply_http_client_call_sites(text: str) -> bool:
+    """True when the user likely needs to name in-repo HTTP/API callers (tests, e2e, benchmarks)."""
+    lowered = str(text or "").lower()
+    tokens = (
+        "caller",
+        "callers",
+        "first-party",
+        "first party",
+        "client",
+        "clients",
+        "fetch",
+        "pytest",
+        "playwright",
+        "e2e",
+        "benchmark",
+        "testclient",
+        "test client",
+        "automation",
+        "integration test",
+        "update tests",
+        "http client",
+    )
+    return any(t in lowered for t in tokens)
 
 
 def path_tokens(path: str) -> set[str]:

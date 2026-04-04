@@ -306,14 +306,14 @@ class StageRunner:
 
 PLANNER_SYSTEM_PROMPT = """You are an expert software architect creating the first grounded planning draft.
 
-Your job is to produce a **Cursor-quality** outline: structured, phased, and anchored in the real codebase—whether the user is adding UI, data layer work, performance, tooling, security, or anything else—not a thin file list.
+Your job is to produce a **Cursor-quality** outline: structured, phased when the work is non-trivial, and anchored in the real codebase—whether the user is adding UI, data layer work, performance, tooling, security, or anything else—not a thin file list.
 This planner draft is an intermediate artifact, not the final implementation document.
 
 Non-negotiable rules:
 1. Verify assumptions against the repository evidence already provided.
 2. If an assumption cannot be verified, mark it as an explicit risk or open question.
 3. Reference only concrete file paths in backticks (from Verified File Paths or Structured Evidence).
-4. Keep the draft information-dense; avoid filler. Do not include code fences, example snippets, or mermaid diagrams in this phase.
+4. Keep the draft information-dense; avoid filler. Do not include mermaid diagrams in this phase.
 5. If the repository evidence shows the requested route, feature, or integration point already exists, plan to modify the existing implementation instead of creating a parallel one.
 6. **Current baseline:** In "## Current baseline", summarize what the evidence shows **today** for the *relevant* parts of the system (components, APIs, DB, jobs, config—whatever appears in evidence). Only state facts supported by evidence; say what is unknown if needed. Do not force HTTP/SSE/auth details into a plan that is purely about, e.g., a React component or a migration script unless evidence surfaces them.
 7. **Goals:** In "## Goals", state user-visible outcomes and success criteria for *this* request (feature, refactor, perf, etc.).
@@ -340,19 +340,21 @@ Required markdown sections and order:
 - ## Files Changed
 - ## Critical Files for Implementation
 - ## Architecture
+- ## Example Code Snippets
 - ## Suggested sequencing
 - ## Open Questions
 
 Section guidance:
 - "Critical design forks": the 1–3 decisions that could change the approach **for this request** (e.g. schema migration ordering vs API first; sync vs async; feature flag; SSE vs polling for **only** when streaming is in scope; **or** "None significant" if the work is straightforward).
-- "Phased approach": numbered phases (Phase 0, 1, …) with goals—not low-level implementation steps.
+- "Phased approach": For **simple** scope, a single phase or one short paragraph is enough. For **moderate or complex** scope (multi-area, security, migrations, or many moving parts), use numbered phases (Phase 0, 1, …) with goals—not low-level implementation steps.
 - "Implementation map": a **markdown table** with columns **Area | Work** (e.g. Frontend, Backend, Data, Tests, Docs, Ops—use only areas that apply). Use verified paths in cells where applicable.
+- "Example Code Snippets": include **1–4 fenced code blocks** (```python, ```ts, ```tsx, etc.) showing the **shape** of the change: signatures, route sketches, small call patterns, or before/after fragments **copied or adapted from Repository Understanding / Structured Evidence excerpts**. Keep each block short. Do not invent third-party packages or imports that are not in those excerpts or explicitly named in the requirements (e.g. avoid hypothetical `fastapi_foo` middleware unless evidence shows it).
 - "Suggested sequencing": ordered list of what to decide or build first (examples: lock data model before API; agree on UX before tests; **or** resolve SSE strategy before auth middleware—only when relevant).
 - "Files Changed" must list only verified concrete file paths and a short rationale per file.
 - "Critical Files for Implementation" must list 3–5 paths drawn only from Verified File Paths.
 
 Strict exclusions for this phase:
-- Do NOT include "Implementation Steps", "Test Strategy", "Rollback Plan", "Example Code Snippets", or detailed numbered execution steps.
+- Do NOT include "Implementation Steps", "Test Strategy", "Rollback Plan", or detailed numbered execution steps (numbered phases in "## Phased approach" are allowed; numbered step-by-step implementation lists are not).
 """
 
 
@@ -399,6 +401,7 @@ Additional format requirements:
 - "Example Code Snippets" must contain fenced code blocks that are relevant to planned changes.
 - "Mermaid Diagram" should include a mermaid code block when architecture has meaningful flow/components.
 - If a mermaid diagram is truly unnecessary, explicitly state why in that section.
+- Valid fenced examples (use ```mermaid): a minimal flowchart `flowchart LR\\n  A[Client] --> B[API]` and a minimal sequence `sequenceDiagram\\n  User->>API: Request`.
 
 Implementation Steps quality bar:
 - For each step, specify: what changes, where it changes (exact file paths), why that file is touched, and expected interface/signature impacts.
@@ -667,6 +670,7 @@ class AuthorAgent:
         revision_hints: list[str] | None = None,
         timeout_seconds_override: int | Callable[[], int] | None = None,
         initial_draft_context: str | None = None,
+        planner_complexity: str | None = None,
     ) -> str:
         system_prompt = PLANNER_SYSTEM_PROMPT if draft_phase == "planner" else REFINER_SYSTEM_PROMPT
         prioritized_verified_paths: list[str] = []
@@ -693,6 +697,7 @@ class AuthorAgent:
                 (evidence_bundle.existing_routes_or_helpers if evidence_bundle else ())[:10]
             ),
             "evidence_notes": list((evidence_bundle.evidence_notes if evidence_bundle else ())[:8]),
+            "http_client_hints": list((evidence_bundle.http_client_hints if evidence_bundle else ())[:8]),
         }
         attempt_payload = {
             "attempt_number": attempt_context.attempt_number if attempt_context else 1,
@@ -706,6 +711,25 @@ class AuthorAgent:
                 "## Project instructions (excerpt)\n"
                 f"{_truncate_initial_draft_context_block(str(initial_draft_context))}\n\n"
             )
+        planner_extra = ""
+        if draft_phase == "planner" and planner_complexity is not None:
+            normalized_cx = str(planner_complexity).strip().lower()
+            planner_extra = (
+                "## Planner output constraints\n"
+                "- Include `## Example Code Snippets` with at least one fenced block grounded in evidence (see system prompt).\n"
+            )
+            if normalized_cx in ("moderate", "complex"):
+                planner_extra += (
+                    "- Classified complexity: **moderate/complex** — `## Phased approach` must use numbered phases "
+                    "(Phase 0, 1, …) with phase goals, not low-level steps.\n"
+                )
+            else:
+                planner_extra += "- Classified complexity: **simple** — keep `## Phased approach` short (a single phase or one paragraph).\n"
+            planner_extra += (
+                "- In **Example Code Snippets**, mirror imports and call patterns from the Repository Understanding "
+                "excerpts above, not generic tutorials.\n"
+            )
+
         messages = [
             {"role": "system", "content": system_prompt},
             {
@@ -720,6 +744,7 @@ class AuthorAgent:
                     f"{json.dumps(_repo_understanding_for_draft_prompt(repo_understanding), indent=2)}\n\n"
                     f"## Architecture Design\n{json.dumps(architecture.__dict__, indent=2) if architecture else '(none)'}\n\n"
                     f"## Revision Hints\n{json.dumps(revision_hints or [], indent=2)}\n\n"
+                    f"{planner_extra}"
                     "## Grounding Rules\n"
                     "- Use only exact spellings from Verified File Paths when naming files.\n"
                     "- Do not invent new test filenames or modules.\n"
@@ -735,7 +760,8 @@ class AuthorAgent:
                     "- For localized UI/API work, do not prescribe hook APIs, state variable names, or explicit local-state object shapes (for example `useState`, `useEffect`, `isExporting`, `lastExportResult`, or `{ success: boolean; ... }`) unless verified evidence already shows those exact constructs and the request explicitly depends on them.\n"
                     "- If the requirements only say to keep an existing component behavior intact during rollout, treat that component as a compatibility constraint or test target unless verified evidence shows it must be edited.\n"
                     "- For localized UI/API work, keep file references focused on the owning component/page and existing client helpers already present in Verified File Paths.\n"
-                    "- Do not reference planning runtime or discovery modules for frontend wiring work unless those modules are explicitly part of the verified evidence for the requested behavior.\n\n"
+                    "- Do not reference planning runtime or discovery modules for frontend wiring work unless those modules are explicitly part of the verified evidence for the requested behavior.\n"
+                    '- Under "## Files Changed", only list modules that are task-relevant; do not label a file as an HTTP/API **caller** unless it appears in Structured Evidence `http_client_hints` or Verified File Paths for this attempt, or the user explicitly named it.\n\n'
                     + (
                         "Produce a concise grounded planner draft that satisfies the planner-phase constraints. "
                         "When you reference files, use the exact spellings from Verified File Paths."
@@ -746,11 +772,12 @@ class AuthorAgent:
                 ),
             },
         ]
+        draft_tokens = 3200 if draft_phase == "planner" else 2600
         return await self.stage_runner.run_stage(
             "draft_plan",
             messages,
             allow_tools=False,
-            max_output_tokens=2600,
+            max_output_tokens=draft_tokens,
             model_override=model_override,
             timeout_seconds_override=timeout_seconds_override,
         )
@@ -764,6 +791,8 @@ class AuthorAgent:
         min_grounding_ratio: float | None = None,
         verified_paths_extra: set[str] | None = None,
         requirements_text: str | None = None,
+        files_changed_allowlist: set[str] | None = None,
+        planner_complexity: str | None = None,
     ) -> list[str]:
         return list(
             self.validate_draft_result(
@@ -773,6 +802,8 @@ class AuthorAgent:
                 min_grounding_ratio=min_grounding_ratio,
                 verified_paths_extra=verified_paths_extra,
                 requirements_text=requirements_text,
+                files_changed_allowlist=files_changed_allowlist,
+                planner_complexity=planner_complexity,
             ).failure_messages
         )
 
@@ -785,6 +816,8 @@ class AuthorAgent:
         min_grounding_ratio: float | None = None,
         verified_paths_extra: set[str] | None = None,
         requirements_text: str | None = None,
+        files_changed_allowlist: set[str] | None = None,
+        planner_complexity: str | None = None,
     ) -> ValidationResult:
         return self._validation_service.validate_draft_result(
             plan_content=plan_content,
@@ -793,6 +826,8 @@ class AuthorAgent:
             min_grounding_ratio=min_grounding_ratio,
             verified_paths_extra=verified_paths_extra,
             requirements_text=requirements_text,
+            files_changed_allowlist=files_changed_allowlist,
+            planner_complexity=planner_complexity,
         )
 
     def validate_refinement_result(
@@ -803,6 +838,7 @@ class AuthorAgent:
         verified_paths_extra: set[str] | None = None,
         requirements_text: str | None = None,
         min_grounding_ratio: float | None = None,
+        files_changed_allowlist: set[str] | None = None,
     ) -> ValidationResult:
         return self._validation_service.validate_refinement_result(
             plan_content=plan_content,
@@ -810,6 +846,7 @@ class AuthorAgent:
             verified_paths_extra=verified_paths_extra,
             requirements_text=requirements_text,
             min_grounding_ratio=min_grounding_ratio,
+            files_changed_allowlist=files_changed_allowlist,
         )
 
     @staticmethod

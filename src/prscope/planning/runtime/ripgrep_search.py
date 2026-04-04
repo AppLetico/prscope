@@ -89,6 +89,32 @@ def normalize_repo_relative_path(path: str) -> str:
     return p
 
 
+# Hard cap on parsed JSON rows to avoid OOM on pathological greps.
+_MAX_GREP_RESULT_ROWS = 100_000
+
+
+def _json_row_to_entry(obj: dict[str, Any], max_columns: int) -> dict[str, Any] | None:
+    t = obj.get("type")
+    if t not in ("match", "context"):
+        return None
+    data = obj.get("data") or {}
+    path_raw = data.get("path")
+    rel = normalize_repo_relative_path(_path_text(path_raw))
+    if not rel:
+        return None
+    line_number = int(data.get("line_number") or 0)
+    lines_obj = data.get("lines") or {}
+    text = str(lines_obj.get("text", "") if isinstance(lines_obj, dict) else "").rstrip("\n")
+    if len(text) > max_columns:
+        text = text[:max_columns]
+    return {
+        "path": rel,
+        "line": line_number,
+        "text": text.strip()[:500],
+        "line_kind": str(t),
+    }
+
+
 def grep_code_ripgrep(
     *,
     repo_root: Path,
@@ -103,11 +129,13 @@ def grep_code_ripgrep(
     glob: str | None,
     type_tag: str | None,
     case_insensitive: bool,
-) -> tuple[list[dict[str, Any]], str | None]:
+    context_lines: int = 0,
+    offset: int = 0,
+) -> tuple[list[dict[str, Any]], str | None, bool]:
     """
-    Run ripgrep in the repo sandbox. Returns (results, error_message).
+    Run ripgrep in the repo sandbox.
 
-    error_message is set on timeout or rg failure (non-0/1 exit).
+    Returns (results, error_message, truncated). When error_message is set, truncated is False.
     """
     try:
         rel_root = search_root.resolve().relative_to(repo_root.resolve())
@@ -141,10 +169,15 @@ def grep_code_ripgrep(
     if type_tag:
         args.extend(["--type", type_tag])
 
+    off = max(0, int(offset))
+    lim = max(1, int(max_results))
+
     if output_mode == "files_with_matches":
         args.append("-l")
     else:
         args.append("--json")
+        if context_lines > 0:
+            args.extend(["-C", str(min(int(context_lines), 200))])
 
     if pattern.startswith("-"):
         args.extend(["-e", pattern])
@@ -164,11 +197,11 @@ def grep_code_ripgrep(
             check=False,
         )
     except subprocess.TimeoutExpired:
-        return [], f"ripgrep timed out after {timeout_seconds}s"
+        return [], f"ripgrep timed out after {timeout_seconds}s", False
 
     if proc.returncode not in (0, 1):
         err = (proc.stderr or proc.stdout or "").strip()
-        return [], f"ripgrep failed (exit {proc.returncode}): {err[:500]}"
+        return [], f"ripgrep failed (exit {proc.returncode}): {err[:500]}", False
 
     if output_mode == "files_with_matches":
         results: list[dict[str, Any]] = []
@@ -178,13 +211,16 @@ def grep_code_ripgrep(
                 continue
             rel = normalize_repo_relative_path(line.replace("\\", "/"))
             results.append({"path": rel, "line": 0, "text": ""})
-            if len(results) >= max_results:
-                break
-        return results, None
+        total = len(results)
+        truncated = total > off + lim
+        results = results[off : off + lim]
+        return results, None, truncated
 
-    results = []
+    parsed: list[dict[str, Any]] = []
+    hit_row_cap = False
     for json_line in (proc.stdout or "").splitlines():
-        if len(results) >= max_results:
+        if len(parsed) >= _MAX_GREP_RESULT_ROWS:
+            hit_row_cap = True
             break
         line = json_line.strip()
         if not line:
@@ -193,21 +229,16 @@ def grep_code_ripgrep(
             obj = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if obj.get("type") != "match":
+        if not isinstance(obj, dict):
             continue
-        data = obj.get("data") or {}
-        path_raw = data.get("path")
-        rel = normalize_repo_relative_path(_path_text(path_raw))
-        if not rel:
-            continue
-        line_number = int(data.get("line_number") or 0)
-        lines_obj = data.get("lines") or {}
-        text = str(lines_obj.get("text", "") if isinstance(lines_obj, dict) else "").rstrip("\n")
-        if len(text) > max_columns:
-            text = text[:max_columns]
-        results.append({"path": rel, "line": line_number, "text": text.strip()[:500]})
+        row = _json_row_to_entry(obj, max_columns)
+        if row is not None:
+            parsed.append(row)
 
-    return results, None
+    total = len(parsed)
+    truncated = hit_row_cap or total > off + lim
+    results = parsed[off : off + lim]
+    return results, None, truncated
 
 
 def resolve_grep_backend(requested: str, command: str) -> str:
