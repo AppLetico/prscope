@@ -351,6 +351,25 @@ export function extractFirstJsonObject(
   return null;
 }
 
+/**
+ * Session peak fill (0–1): largest prompt seen this session vs model context window.
+ * Prefer this over per-call `context_usage_ratio` from SSE, which reflects only the latest request.
+ */
+export function peakContextUsageRatio(
+  maxPromptTokens: number | undefined,
+  contextWindowTokens: number | null | undefined,
+): number | null {
+  if (
+    maxPromptTokens === undefined ||
+    maxPromptTokens < 0 ||
+    typeof contextWindowTokens !== "number" ||
+    contextWindowTokens <= 0
+  ) {
+    return null;
+  }
+  return Math.min(1, maxPromptTokens / contextWindowTokens);
+}
+
 /** Tooltip and aria text for the composer context ring (peak prompt vs model window). */
 export function contextGaugeLabels(
   contextPercent: number | null,
@@ -375,12 +394,12 @@ export function contextGaugeLabels(
     const peakStr = peak.toLocaleString();
     const windowStr = window.toLocaleString();
     return {
-      tooltip: `${peakStr} / ${windowStr} tokens (${pct}%). Updates after each LLM call.`,
+      tooltip: `${peakStr} / ${windowStr} tokens (${pct}%). Peak prompt this session vs model window; ring updates after each LLM call.`,
       ariaLabel: `Peak prompt ${peakStr} of ${windowStr} tokens, ${pct} percent of context window`,
     };
   }
   return {
-    tooltip: `${pct}% of model context window. Updates after each LLM call.`,
+    tooltip: `${pct}% of model context window. Peak this session; updates after each LLM call.`,
     ariaLabel: `About ${pct} percent of model context window used`,
   };
 }

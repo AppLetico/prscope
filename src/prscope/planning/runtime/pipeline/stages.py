@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import time
 from collections.abc import Callable
@@ -200,15 +201,76 @@ class PlanningStages:
         return ctx.model_policy.author_refine.first_fallback_model
 
     @staticmethod
+    def _review_scores_stagnant(history: list[float], *, max_delta: float = 0.5) -> bool:
+        if len(history) < 2:
+            return False
+        a, b = float(history[-2]), float(history[-1])
+        return abs(a - b) <= max_delta
+
+    @staticmethod
+    def _compose_previous_review_digest(ctx: PlanningRoundContext) -> str:
+        rev = getattr(ctx.state, "review", None)
+        if rev is None:
+            return ""
+        try:
+            score = float(getattr(rev, "design_quality_score", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            score = 0.0
+        primary = str(getattr(rev, "primary_issue", "") or "").strip()
+        blocking = list(getattr(rev, "blocking_issues", []) or [])
+        lines: list[str] = [
+            "## Previous design review (for comparison only)",
+            f"- design_quality_score (prior round): {score:.1f}/10",
+        ]
+        if primary:
+            lines.append(f"- primary_issue (prior): {primary[:800]}")
+        if blocking:
+            shown = blocking[:8]
+            lines.append("- blocking_issues (prior, truncated):")
+            for item in shown:
+                t = str(item).strip()
+                if t:
+                    lines.append(f"  - {t[:400]}")
+        lines.append(
+            "If ## Current Plan now addresses a prior blocking theme, do not repeat that theme in "
+            "blocking_issues; cite what remains weak or incomplete instead."
+        )
+        return "\n".join(lines) + "\n\n"
+
+    @staticmethod
     def _compose_prior_critique(ctx: PlanningRoundContext) -> str:
+        digest = PlanningStages._compose_previous_review_digest(ctx).strip()
         distilled = ctx.issue_tracker.distilled_context()
         compact = (ctx.state.working_summary or "").strip()
         if not compact:
+            if digest:
+                if distilled and distilled != "(none)":
+                    return f"{digest}\n\n{distilled}"
+                return digest
             return distilled
         block = f"## Prior rounds (compact)\n{compact}"
+        parts: list[str] = []
+        if digest:
+            parts.append(digest)
         if distilled and distilled != "(none)":
-            return f"{distilled}\n\n{block}"
-        return block
+            parts.append(distilled)
+        parts.append(block)
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def _select_design_review_mode(
+        ctx: PlanningRoundContext,
+        current_plan_content: str,
+    ) -> Literal["initial", "stabilization"]:
+        """Prefer initial when the plan changed since last critic; stabilization only when same plan + stagnant scores."""
+        fp = plan_content_fingerprint(current_plan_content)
+        last_fp = str(getattr(ctx.state, "last_critic_turn_plan_fingerprint", "") or "").strip()
+        if not last_fp or fp != last_fp:
+            return "initial"
+        hist = list(getattr(ctx.state, "review_score_history", []) or [])
+        if PlanningStages._review_scores_stagnant(hist):
+            return "stabilization"
+        return "initial"
 
     @staticmethod
     def _open_tracked_issues_block_for_validation(issue_tracker: Any) -> str | None:
@@ -263,6 +325,121 @@ class PlanningStages:
                 head = desc[:120]
                 if head and head in blocking_blob:
                     continue
+            review.resolved_issues.append(iid)
+            existing.add(iid)
+
+    _PLAN_COVER_ISSUE_STOPWORDS = frozenset(
+        {
+            "that",
+            "this",
+            "with",
+            "from",
+            "they",
+            "have",
+            "been",
+            "were",
+            "will",
+            "must",
+            "should",
+            "need",
+            "needs",
+            "into",
+            "than",
+            "when",
+            "what",
+            "which",
+            "while",
+            "about",
+            "after",
+            "before",
+            "through",
+            "under",
+            "there",
+            "their",
+            "these",
+            "those",
+            "some",
+            "such",
+            "only",
+            "each",
+            "other",
+            "more",
+            "most",
+            "also",
+            "just",
+            "like",
+            "make",
+            "based",
+            "using",
+            "used",
+            "being",
+            "ensure",
+            "ensuring",
+            "aligned",
+            "existing",
+            "standards",
+            "regarding",
+            "without",
+            "within",
+            "could",
+            "would",
+            "might",
+            "still",
+            "same",
+        }
+    )
+
+    @classmethod
+    def _keywords_from_issue_description_for_plan_cover(cls, desc: str) -> list[str]:
+        raw = desc.strip().lower()
+        tokens = re.findall(r"[a-z][a-z0-9_]{3,}", raw)
+        return [t for t in tokens if t not in cls._PLAN_COVER_ISSUE_STOPWORDS]
+
+    @classmethod
+    def _plan_text_covers_issue_description(cls, plan_lower: str, desc: str) -> bool:
+        """Heuristic: enough issue-specific tokens appear in the plan draft."""
+        d = desc.strip().lower()
+        if not d:
+            return False
+        if "hard_constraint" in d and "hard_constraint" in plan_lower:
+            return True
+        kws = cls._keywords_from_issue_description_for_plan_cover(desc)
+        if len(kws) < 2:
+            return False
+        hits = sum(1 for k in kws if k in plan_lower)
+        need = max(2, math.ceil(0.65 * len(kws)))
+        return hits >= need
+
+    @staticmethod
+    def _merge_open_issues_when_plan_covers_description(
+        ctx: PlanningRoundContext,
+        review: ReviewResult,
+        updated_markdown: str,
+    ) -> None:
+        """
+        Close tracked issues when the updated plan text already addresses them but the
+        validation JSON omitted `resolved_issues` (common when the critic paraphrases).
+
+        Conservative: same blocking-blob check as explicit merge; require keyword overlap
+        between issue description and plan markdown.
+        """
+        plan_lower = (updated_markdown or "").lower()
+        if not plan_lower.strip():
+            return
+        blocking_blob = "\n".join([*review.blocking_issues, *review.architectural_concerns]).lower()
+        existing = {str(x).strip() for x in review.resolved_issues if str(x).strip()}
+        open_by_id = {issue.id: issue for issue in ctx.issue_tracker.open_issues()}
+        for iid, node in open_by_id.items():
+            if iid in existing:
+                continue
+            desc = (node.description or "").strip()
+            if not desc:
+                continue
+            head = desc[:120].strip().lower()
+            if head and head in blocking_blob:
+                continue
+            if not PlanningStages._plan_text_covers_issue_description(plan_lower, desc):
+                continue
             review.resolved_issues.append(iid)
             existing.add(iid)
 
@@ -1670,12 +1847,7 @@ class PlanningStages:
                 current_round=ctx.round_number,
             )
         await self._emit_event(ctx.event_callback, snapshot, ctx.session_id)
-        review_mode: Literal["initial", "validation", "stabilization", "implementability"] = "initial"
-        architecture_change_count = int(ctx.state.architecture_change_count)
-        if ctx.round_number > 1:
-            review_mode = "stabilization"
-        if ctx.round_number > 0 and architecture_change_count / float(ctx.round_number) > 0.7:
-            review_mode = "stabilization"
+        review_mode = self._select_design_review_mode(ctx, current_plan_content)
         await emit_tool("design_review", "running", stage="reviewer")
         review_started = time.perf_counter()
         blocks = self._repo_memory(ctx.state)
@@ -2336,6 +2508,7 @@ class PlanningStages:
             raise RuntimeError("Expected ReviewResult from validation phase")
         validation_review = validation_payload
         self._merge_explicit_issue_ids_into_validation_resolved(ctx, validation_review)
+        self._merge_open_issues_when_plan_covers_description(ctx, validation_review, updated_markdown)
         validation_review.constraint_violations = self._confirmed_constraint_violations(
             plan_content=updated_markdown,
             constraints=ctx.state.constraints,

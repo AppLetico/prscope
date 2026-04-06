@@ -55,14 +55,19 @@ function deriveFocusPrompt(text: string): FocusPrompt {
     return { label: "Focus", text: "" };
   }
   if (normalized.startsWith("Please fix the following open issues")) {
-    return { label: "Focus: review notes", text: normalized };
+    return { label: "Focus: listed open issues", text: normalized };
   }
   const firstSentence = normalized.split(/\n+/)[0]?.trim() || normalized;
   const compactLabel = firstSentence
     .replace(/^Please update the plan to address\s*/i, "")
     .replace(/^Please fix\s*/i, "")
     .replace(/\.$/, "")
+    .replace(/:+$/, "")
     .trim();
+  // PlanPanel "Add all to chat" leaves only "these review notes" — avoid "Focus: these review notes:".
+  if (/^these review notes$/i.test(compactLabel)) {
+    return { label: "Focus: all open review notes", text: normalized };
+  }
   return {
     label: `Focus: ${compactLabel || "selected issue"}`,
     text: normalized,
@@ -1406,7 +1411,7 @@ export function ChatPanel({
                 <Tooltip
                   content={
                     critiquePendingApply
-                      ? "Run a fresh design critique (replaces the pending one). Separate from automatic validation after Send."
+                      ? "Re-runs the critic at this revision only (same Rev / critique round). Apply revision first to advance the session, then Review counts as the next round."
                       : "Run a full design critique on the current plan. Sending a chat message runs author work plus automatic validation — that is not this button."
                   }
                 >

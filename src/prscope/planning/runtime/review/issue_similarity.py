@@ -50,27 +50,45 @@ class IssueSimilarityService:
     # Avoid trivial substring matches on very short strings.
     _SUBSTRING_MIN_CHARS = 12
 
+    def _find_duplicate_in_pool(self, candidate: str, issues: list[tuple[str, str]]) -> str | None:
+        """Match candidate against one pool (open or resolved) using the same pipeline as before."""
+        if not issues:
+            return None
+        embeddings_on = self._embeddings_enabled()
+        if embeddings_on:
+            duplicate = self._find_embedding_duplicate(candidate, issues)
+            if duplicate is not None:
+                return duplicate
+            if self.config.fallback_mode == "none":
+                return self._find_text_duplicate(candidate, issues)
+            return self._find_lexical_duplicate(candidate, issues)
+
+        # Embeddings off + "none": strict text match only (Jaccard disabled). Old bug: returned None
+        # before any text compare, so identical prose never matched resolved issues.
+        if self.config.fallback_mode == "none":
+            return self._find_text_duplicate(candidate, issues)
+        return self._find_lexical_duplicate(candidate, issues)
+
     def find_duplicate(
         self,
         description: str,
         open_issues: list[tuple[str, str]],
+        resolved_issues: list[tuple[str, str]] | None = None,
     ) -> str | None:
+        """Return a duplicate issue id: **open** matches first, then **resolved** (same text rules).
+
+        Resolved matches prevent spawning a new open issue when the critic repeats prose for an
+        already-closed note.
+        """
         candidate = description.strip()
         if not candidate:
             return None
-
-        embeddings_on = self._embeddings_enabled()
-        if embeddings_on:
-            duplicate = self._find_embedding_duplicate(candidate, open_issues)
-            if duplicate is not None:
-                return duplicate
-            # Embeddings missed but text may still be nearly identical; always run cheap text checks.
-            if self.config.fallback_mode == "none":
-                return self._find_text_duplicate(candidate, open_issues)
-        elif self.config.fallback_mode == "none":
-            return None
-
-        return self._find_lexical_duplicate(candidate, open_issues)
+        resolved = resolved_issues or []
+        for pool in (open_issues, resolved):
+            dup = self._find_duplicate_in_pool(candidate, pool)
+            if dup is not None:
+                return dup
+        return None
 
     @staticmethod
     def _normalize_for_text_compare(text: str) -> str:

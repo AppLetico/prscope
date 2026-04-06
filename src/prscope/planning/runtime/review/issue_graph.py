@@ -100,6 +100,9 @@ class IssueGraphTracker:
         duplicate = self._similarity.find_duplicate(
             description=description,
             open_issues=[(node.id, node.description) for node in self._graph.nodes.values() if node.status == "open"],
+            resolved_issues=[
+                (node.id, node.description) for node in self._graph.nodes.values() if node.status == "resolved"
+            ],
         )
         if duplicate is None:
             return None

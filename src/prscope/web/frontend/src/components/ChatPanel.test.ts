@@ -4,6 +4,7 @@ import {
   collapseTimelineForDisplay,
   compactTimelineToRecentRounds,
   contextGaugeLabels,
+  peakContextUsageRatio,
   getLiveStatusMessage,
   hasRunningToolCalls,
   normalizeChatMessageForDedup,
@@ -40,6 +41,15 @@ describe("contextGaugeLabels", () => {
     const { tooltip } = contextGaugeLabels(50, undefined, 10000);
     expect(tooltip).toContain("5,000");
     expect(tooltip).toContain("10,000");
+  });
+});
+
+describe("peakContextUsageRatio", () => {
+  it("returns peak fill vs window", () => {
+    expect(peakContextUsageRatio(32000, 128000)).toBeCloseTo(0.25);
+  });
+  it("returns null when window missing", () => {
+    expect(peakContextUsageRatio(1000, null)).toBeNull();
   });
 });
 

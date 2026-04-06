@@ -158,6 +158,71 @@ def test_graph_snapshot_includes_duplicate_alias():
     assert snapshot["duplicate_alias"] == {"issue_alias_9": "issue_1"}
 
 
+def test_add_issue_same_text_as_resolved_does_not_reopen_or_spawn_new_open():
+    """Critic repeats prose for an already-resolved note — merge to canonical, no new open id."""
+    # _tracker() uses embeddings off + fallback_mode="none" (common in minimal configs); dedupe must still run.
+    tracker = _tracker()
+    text = "Middleware integration must not disrupt existing API functionality."
+    first = tracker.add_issue(text, 1, preferred_id="issue_1")
+    assert first.id == "issue_1"
+    tracker.resolve_issue("issue_1", 2)
+    assert [i.id for i in tracker.open_issues()] == []
+
+    again = tracker.add_issue(text, 3)
+    assert again.id == "issue_1"
+    assert again.status == "resolved"
+    assert [i.id for i in tracker.open_issues()] == []
+    assert len([n for n in tracker.graph_snapshot()["nodes"] if n["id"] == "issue_1"]) == 1
+
+
+def test_add_issue_resolved_match_picks_correct_canonical_among_two_resolved():
+    tracker = _tracker()
+    tracker.add_issue("Alpha unresolved detail.", 1, preferred_id="issue_1")
+    tracker.add_issue("Beta separate concern.", 1, preferred_id="issue_2")
+    tracker.resolve_issue("issue_1", 2)
+    tracker.resolve_issue("issue_2", 2)
+
+    dup = tracker.add_issue("Alpha unresolved detail.", 3)
+    assert dup.id == "issue_1"
+    assert dup.status == "resolved"
+
+
+def test_issue_similarity_open_pool_wins_before_resolved():
+    service = IssueSimilarityService(
+        IssueDedupeConfig(
+            embeddings_enabled="false",
+            embedding_model="unused",
+            similarity_threshold=0.95,
+            fallback_mode="lexical",
+        )
+    )
+    same = "Shared duplicate text for precedence test."
+    assert (
+        service.find_duplicate(
+            same,
+            [("issue_open", same)],
+            resolved_issues=[("issue_resolved", same)],
+        )
+        == "issue_open"
+    )
+
+
+def test_issue_similarity_matches_resolved_when_no_open_match():
+    service = IssueSimilarityService(
+        IssueDedupeConfig(
+            embeddings_enabled="false",
+            embedding_model="unused",
+            similarity_threshold=0.95,
+            fallback_mode="lexical",
+        )
+    )
+    text = "Resolved-only pool match."
+    open_only = [("issue_a", "different")]
+    resolved_only = [("issue_14", text)]
+    assert service.find_duplicate("unrelated open", open_only, resolved_issues=resolved_only) is None
+    assert service.find_duplicate(text, open_only, resolved_issues=resolved_only) == "issue_14"
+
+
 def test_causality_extractor_adds_causal_edges_with_guardrails():
     tracker = _tracker()
     graph_config = IssueGraphConfig(

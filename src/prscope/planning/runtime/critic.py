@@ -331,8 +331,11 @@ Gatekeeper standards:
 - Bare filenames alone (for example a lone `api.py`) are weak evidence unless tied to a verified repo-relative path from exploration or the decision graph; prefer concrete paths seen in tool history.
 - If the plan names a module as an HTTP client to the web server (benchmarks, CLI, tests), require evidence tying it to real `fetch`/`httpx`/`TestClient`/`request.get` usage; otherwise blocking with "evidence" when the citation looks invented.
 - When a 'Repository paths explored this session' section is present, treat those paths as the session's primary file-evidence set for grounding checks (in addition to the plan text and memory blocks).
-- Prefer false positives over silent misses.
+- Prefer false positives over silent misses on *subtle* gaps, but never claim something is missing when it is plainly present in ## Current Plan (that wastes users' time). Before emitting blocking_issues, scan ## Current Plan for HTTP methods and paths, a test strategy section, and backtick file paths; do not use boilerplate "no endpoints / no tests / no evidence" language if that category of detail already appears — instead cite what is still incomplete, unverifiable, or weakly grounded.
 - Never downgrade a serious gap to "architectural_concern" to avoid conflict.
+
+Plan-text fidelity (mandatory):
+- Read ## Current Plan before writing blocking_issues. If the plan already names concrete routes, tests, or repo paths, your blocking_issues must reflect *remaining* risk (weak linkage, wrong files, missing edge cases), not blanket absence.
 
 Scope drift vs original requirements:
 - Explicitly compare the plan to the user's stated requirements. If the plan adds major work not asked for (unrelated subsystems, broad refactors, extra deliverables) or omits a core part of the ask without evidence-backed justification, call it out in blocking_issues or recommended_changes.
@@ -1033,11 +1036,13 @@ class CriticAgent:
             )
         if mode == "stabilization":
             return (
-                "Stabilization mode:\n"
-                "The design has changed significantly across rounds without improvement.\n"
-                "Focus on stabilizing the architecture and refining the current design.\n"
+                "Stabilization mode (incremental review):\n"
+                "The plan text is unchanged since the last critic pass and prior review scores were stagnant.\n"
+                "Compare ## Current Plan to ## Prior Review and ## Previous design review (if present). Credit fixes "
+                "already reflected in the plan; focus blocking_issues on what still blocks shipping or verification.\n"
                 "Global gatekeeper standards still apply: do not trade honesty for closure.\n"
-                "Prefer incremental closure only when issues are actually resolved—not by reclassifying them as minor."
+                "Do not repeat verbatim blocking themes that the plan text has already addressed unless you explain "
+                "why that text is still insufficient."
             )
         if mode == "implementability":
             return (
@@ -1227,6 +1232,9 @@ class CriticAgent:
                             "blocking_categories contained unknown tokens or was omitted; "
                             "convergence will fail closed until fixed."
                         )
+                    from .review.critic_plan_coherence import coherence_adjust_review
+
+                    parsed = coherence_adjust_review(plan_content, parsed)
                     return self._apply_scope_discipline(requirements, parsed)
                 except CriticParseError as exc:
                     last_parse_error = exc

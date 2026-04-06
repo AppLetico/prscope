@@ -131,6 +131,21 @@ def test_issue_similarity_lexical_does_not_merge_distinct_error_handling_notes(t
     assert duplicate is None
 
 
+def test_issue_similarity_embeddings_off_fallback_none_still_dedupes_resolved(tmp_path):
+    """Regression: fallback_mode=none must not skip all matching when embeddings are disabled."""
+    del tmp_path
+    service = IssueSimilarityService(
+        IssueDedupeConfig(
+            embeddings_enabled="false",
+            embedding_model="unused",
+            similarity_threshold=0.82,
+            fallback_mode="none",
+        )
+    )
+    text = "Middleware integration must be thoroughly tested to ensure no disruption to existing functionality."
+    assert service.find_duplicate(text, [], resolved_issues=[("issue_17", text)]) == "issue_17"
+
+
 def test_issue_similarity_embeddings_primary_path(tmp_path, monkeypatch):
     del tmp_path
 

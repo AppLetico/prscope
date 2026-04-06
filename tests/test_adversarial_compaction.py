@@ -26,6 +26,7 @@ def _issue_tracker() -> IssueGraphTracker:
 
 def test_compose_prior_critique_without_compact() -> None:
     ctx = MagicMock()
+    ctx.state.review = None
     ctx.issue_tracker.distilled_context.return_value = "- a: one"
     ctx.state.working_summary = ""
     assert PlanningStages._compose_prior_critique(ctx) == "- a: one"
@@ -33,6 +34,7 @@ def test_compose_prior_critique_without_compact() -> None:
 
 def test_compose_prior_critique_with_compact() -> None:
     ctx = MagicMock()
+    ctx.state.review = None
     ctx.issue_tracker.distilled_context.return_value = "- a: one"
     ctx.state.working_summary = "WORKING SUMMARY (compact prior rounds)\n\nx"
     out = PlanningStages._compose_prior_critique(ctx)
@@ -43,6 +45,7 @@ def test_compose_prior_critique_with_compact() -> None:
 
 def test_compose_prior_critique_compact_only() -> None:
     ctx = MagicMock()
+    ctx.state.review = None
     ctx.issue_tracker.distilled_context.return_value = "(none)"
     ctx.state.working_summary = "summary only"
     out = PlanningStages._compose_prior_critique(ctx)
@@ -120,6 +123,79 @@ def test_merge_explicit_issue_ids_skips_when_blocking_repeats_description() -> N
     )
     PlanningStages._merge_explicit_issue_ids_into_validation_resolved(ctx, review)
     assert review.resolved_issues == []
+
+
+def test_merge_open_issues_when_plan_covers_logging_constraint() -> None:
+    tracker = _issue_tracker()
+    tracker.add_issue(
+        "Logging must comply with HARD_CONSTRAINT_001 regarding secret handling.",
+        1,
+        preferred_id="issue_26",
+    )
+    ctx = MagicMock()
+    ctx.issue_tracker = tracker
+    plan = (
+        "## Implementation\n"
+        "We will use winston and comply with HARD_CONSTRAINT_001; "
+        "sensitive tokens are never logged.\n"
+    )
+    review = ReviewResult(
+        strengths=[],
+        architectural_concerns=[],
+        risks=[],
+        simplification_opportunities=[],
+        blocking_issues=[],
+        reviewer_questions=[],
+        recommended_changes=[],
+        design_quality_score=6.0,
+        confidence="medium",
+        review_complete=False,
+        simplest_possible_design=None,
+        primary_issue=None,
+        resolved_issues=[],
+        constraint_violations=[],
+        issue_priority=[],
+        prose="",
+    )
+    PlanningStages._merge_open_issues_when_plan_covers_description(ctx, review, plan)
+    assert "issue_26" in review.resolved_issues
+
+
+def test_merge_open_issues_skips_when_blocking_repeats_issue() -> None:
+    tracker = _issue_tracker()
+    desc = "Logging must comply with HARD_CONSTRAINT_001 regarding secret handling."
+    tracker.add_issue(desc, 1, preferred_id="issue_26")
+    ctx = MagicMock()
+    ctx.issue_tracker = tracker
+    plan = "We comply with HARD_CONSTRAINT_001 and never log secrets."
+    review = ReviewResult(
+        strengths=[],
+        architectural_concerns=[],
+        risks=[],
+        simplification_opportunities=[],
+        blocking_issues=[desc[:80]],
+        reviewer_questions=[],
+        recommended_changes=[],
+        design_quality_score=5.0,
+        confidence="medium",
+        review_complete=False,
+        simplest_possible_design=None,
+        primary_issue=None,
+        resolved_issues=[],
+        constraint_violations=[],
+        issue_priority=[],
+        prose="",
+    )
+    PlanningStages._merge_open_issues_when_plan_covers_description(ctx, review, plan)
+    assert review.resolved_issues == []
+
+
+def test_plan_text_covers_issue_description_rate_limiting() -> None:
+    desc = "Rate limiting thresholds need to be aligned with existing standards."
+    plan = (
+        "Implement rate limiting with express-rate-limit; 100 requests per IP per 15-minute window per team standards."
+    )
+    assert PlanningStages._plan_text_covers_issue_description(plan.lower(), desc)
 
 
 @pytest.mark.asyncio

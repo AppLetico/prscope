@@ -44,6 +44,7 @@ import {
   formatPhaseTimingLabel,
   formatToolActivityLabel,
   INITIAL_TIMELINE_STATE,
+  peakContextUsageRatio,
   timelineReducer,
   upsertLiveActivity,
 } from "../components/chatPanelUtils";
@@ -205,6 +206,8 @@ export function PlanningViewPage() {
   const [planValidationBlock, setPlanValidationBlock] = useState<string | null>(null);
   const [planValidationFromApply, setPlanValidationFromApply] = useState(false);
   const [applyCritiquePending, setApplyCritiquePending] = useState(false);
+  /** True until refetch after run_critique / apply_critique — hides Review immediately so first click cannot race server lock. */
+  const [commandOptimisticBusy, setCommandOptimisticBusy] = useState(false);
   const [focusChatNonce, setFocusChatNonce] = useState(0);
   const [latestResponseMode, setLatestResponseMode] = useState<"author_chat" | "refine_round" | null>(null);
   const lastEventAtMs = useRef<number>(0);
@@ -294,9 +297,11 @@ export function PlanningViewPage() {
   const phaseMessage = sessionState?.phase_message
     ? normalizeActivityText(sessionState.phase_message)
     : null;
-  /** OR of REST + SSE: either can lag the other; using both avoids enabling Review/Send while the server still holds a processing lock. */
+  /** OR of REST + SSE + optimistic: any can lag; optimistic covers the gap before SSE/GET reflect run_critique. */
   const isProcessing =
-    Boolean(session?.is_processing) || Boolean(sessionState?.is_processing);
+    Boolean(session?.is_processing)
+    || Boolean(sessionState?.is_processing)
+    || commandOptimisticBusy;
   const effectiveStatus = sessionState?.status ?? session?.status;
   const effectiveRound = sessionState?.current_round ?? session?.current_round ?? 0;
 
@@ -401,8 +406,24 @@ export function PlanningViewPage() {
 
     if (event.type === "session_state") {
       // SSE reconnects emit an initial unversioned snapshot. Once we've seen
-      // versioned events, ignore unversioned snapshots to avoid stale rewinds.
+      // versioned events, ignore unversioned snapshots to avoid stale rewinds — except
+      // is_processing: true, which must never be dropped or the UI looks idle while the
+      // server still holds the command lock (first Review click → 409, second works).
       if (typeof event.session_version !== "number" && lastVersionSeen.current > 0) {
+        if (event.is_processing) {
+          sessionWasProcessingRef.current = true;
+          setSessionState((prev) =>
+            prev
+              ? { ...prev, is_processing: true }
+              : {
+                  status: event.status,
+                  current_round: event.current_round,
+                  pending_questions: event.pending_questions,
+                  phase_message: event.phase_message,
+                  is_processing: true,
+                },
+          );
+        }
         return;
       }
       if (event.is_processing) {
@@ -571,14 +592,18 @@ export function PlanningViewPage() {
     }
     if (event.type === "token_usage") {
       setSessionCostUsd(event.session_total_usd ?? sessionCostUsd);
-      setMaxPromptTokens(event.max_prompt_tokens ?? maxPromptTokens);
+      const nextMax = event.max_prompt_tokens ?? maxPromptTokens;
+      setMaxPromptTokens(nextMax);
+      const nextWindow =
+        event.context_window_tokens !== undefined ? event.context_window_tokens : contextWindowTokens;
       if (event.context_window_tokens !== undefined) {
         setContextWindowTokens(event.context_window_tokens);
       }
-      if (event.context_usage_ratio !== undefined) {
+      const peakRatio = peakContextUsageRatio(nextMax, nextWindow);
+      if (peakRatio !== null) {
+        setContextUsageRatio(peakRatio);
+      } else if (event.context_usage_ratio !== undefined) {
         setContextUsageRatio(event.context_usage_ratio);
-      } else if (event.context_window_tokens && event.max_prompt_tokens) {
-        setContextUsageRatio(event.max_prompt_tokens / event.context_window_tokens);
       }
       return;
     }
@@ -743,6 +768,7 @@ export function PlanningViewPage() {
   };
 
   const onCritique = async () => {
+    setCommandOptimisticBusy(true);
     try {
       setError(null);
       setErrorTone("error");
@@ -769,10 +795,12 @@ export function PlanningViewPage() {
       }
     } finally {
       await sessionQuery.refetch();
+      setCommandOptimisticBusy(false);
     }
   };
 
   const onApplyCritique = async () => {
+    setCommandOptimisticBusy(true);
     try {
       setError(null);
       setErrorTone("error");
@@ -800,6 +828,7 @@ export function PlanningViewPage() {
     } finally {
       setApplyCritiquePending(false);
       await sessionQuery.refetch();
+      setCommandOptimisticBusy(false);
     }
   };
 
@@ -850,6 +879,7 @@ export function PlanningViewPage() {
 
   const onStop = async () => {
     try {
+      setCommandOptimisticBusy(false);
       setError(null);
       setErrorTone("error");
       await stopSession(id);
@@ -879,25 +909,41 @@ export function PlanningViewPage() {
     ? snapshot?.constraint_eval?.constraint_violations.length
     : 0;
   const effectiveRoundMetrics = useMemo((): RoundMetric[] => {
-    const api = sessionQuery.data?.round_metrics;
+    const api = sessionQuery.data?.round_metrics ?? [];
     const fallback = fallbackReviewData.roundMetrics;
-    if (!api || api.length === 0) return fallback;
-    const byRound = new Map(fallback.map((m) => [m.round, m]));
-    return api.map((m) => {
-      const fill = byRound.get(m.round);
-      // convergence_score is keyed off plan_versions (often unset). Fall back to critic_confidence
-      // (per-round validation design-quality, 0–1) so the history table shows a bar/score when available.
+    const byRound = new Map<number, RoundMetric>();
+    for (const m of fallback) {
+      byRound.set(m.round, { ...m });
+    }
+    for (const m of api) {
+      const prev = byRound.get(m.round);
       const fromVersion = m.convergence_score ?? null;
-      const fromParse = fill?.convergence_score ?? null;
+      const fromParse = prev?.convergence_score ?? null;
       const fromMetrics = m.critic_confidence ?? null;
-      return {
+      const apiConf = m.critic_confidence ?? null;
+      const parseConf = prev?.critic_confidence ?? null;
+      const critic_confidence =
+        apiConf == null && parseConf == null ? null : Math.max(apiConf ?? 0, parseConf ?? 0);
+      const apiMajor = m.major_issues ?? null;
+      const parseMajor = prev?.major_issues ?? null;
+      const major_issues =
+        apiMajor == null && parseMajor == null ? null : Math.max(apiMajor ?? 0, parseMajor ?? 0);
+      const apiMinor = m.minor_issues ?? null;
+      const parseMinor = prev?.minor_issues ?? null;
+      const minor_issues =
+        apiMinor == null && parseMinor == null ? null : Math.max(apiMinor ?? 0, parseMinor ?? 0);
+      byRound.set(m.round, {
+        ...(prev ?? {}),
         ...m,
         convergence_score: fromVersion ?? fromParse ?? fromMetrics ?? null,
-        critic_confidence: m.critic_confidence ?? fill?.critic_confidence ?? null,
-        major_issues: m.major_issues ?? fill?.major_issues ?? null,
-        minor_issues: m.minor_issues ?? fill?.minor_issues ?? null,
-      };
-    });
+        critic_confidence,
+        major_issues,
+        minor_issues,
+        call_cost_usd: m.call_cost_usd ?? prev?.call_cost_usd ?? null,
+        issue_graph_summary: m.issue_graph_summary ?? prev?.issue_graph_summary ?? null,
+      });
+    }
+    return [...byRound.values()].sort((a, b) => a.round - b.round);
   }, [sessionQuery.data?.round_metrics, fallbackReviewData.roundMetrics]);
   const versionedTitle = useMemo(() => {
     if (!session) return "";
